@@ -33,6 +33,7 @@ python convert.py --save_path=PATH_TO_SAVE --env=jaco --task=reach_top_left --me
 ```
 # HILP on RND Walker
 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=PATH_TO_DATASET/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000
+PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/cpfs/user/caozhe/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000
 # HILP on RND Cheetah
 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.98 agent.q_loss=False seed=0 task=cheetah_run expl_agent=rnd load_replay_buffer=PATH_TO_DATASET/datasets/cheetah/rnd/replay.pt replay_buffer_episodes=5000
 # HILP on RND Quadruped

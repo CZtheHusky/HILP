@@ -163,3 +163,7 @@ ipynbs/
 .DS_Store
 data/
 exp/
+representation_*/
+logs/
+.*/
+wandb/

@@ -1,0 +1,29 @@
+# 希尔伯特表征训练依赖包
+
+# 核心深度学习框架
+torch>=1.9.0
+torchvision>=0.10.0
+torchaudio>=0.9.0
+
+# 科学计算和数据处理
+numpy>=1.21.0
+scipy>=1.7.0
+pandas>=1.3.0
+
+# 机器学习和可视化
+scikit-learn>=1.0.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# 进度条和工具
+tqdm>=4.62.0
+PyYAML>=5.4.0
+
+# 可选依赖（用于高级功能）
+# opencv-python>=4.5.0  # 如果需要图像处理
+# wandb>=0.12.0         # 如果需要实验跟踪
+# tensorboard>=2.7.0     # 如果需要TensorBoard日志
+
+# 开发工具（可选）
+# jupyter>=1.0.0         # 如果需要Jupyter notebook
+# ipython>=7.0.0         # 如果需要交互式Python
