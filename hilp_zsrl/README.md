@@ -15,6 +15,16 @@ pip install -r requirements.txt
 ```
 
 ## Examples
+```
+CUDA_VISIBLE_DEVICES=6 python train_hilp_feature.py  --data_dir /root/workspace/HugWBC/collected_trajectories_v2  --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50
+
+CUDA_VISIBLE_DEVICES=5 python train_hilp_feature.py  --data_dir /root/workspace/HugWBC/collected_trajectories_v2  --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50 --gamma 0.965
+
+CUDA_VISIBLE_DEVICES=4 python train_hilp_feature.py  --data_dir /root/workspace/HugWBC/collected_trajectories_v2  --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50 --gamma 0.97
+
+CUDA_VISIBLE_DEVICES=7 python train_hilp_feature.py  --load_replay_buffer /root/workspace/exorl/datasets/walker/rnd/replay.pt --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50
+
+```
 
 ### State-Based ExORL
 * Download the ExORL datasets following the instructions at https://github.com/denisyarats/exorl.
@@ -33,6 +43,11 @@ python convert.py --save_path=PATH_TO_SAVE --env=jaco --task=reach_top_left --me
 ```
 # HILP on RND Walker
 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=PATH_TO_DATASET/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000
+
+PYTHONPATH=. python -m debugpy --listen 5678 --wait-for-client  url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000
+
+PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000
+
 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/cpfs/user/caozhe/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000
 # HILP on RND Cheetah
 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.98 agent.q_loss=False seed=0 task=cheetah_run expl_agent=rnd load_replay_buffer=PATH_TO_DATASET/datasets/cheetah/rnd/replay.pt replay_buffer_episodes=5000

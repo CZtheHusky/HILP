@@ -167,3 +167,4 @@ representation_*/
 logs/
 .*/
 wandb/
+exp_local/
