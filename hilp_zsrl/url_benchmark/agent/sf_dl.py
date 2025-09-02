@@ -18,7 +18,8 @@ from url_benchmark.in_memory_replay_buffer import ReplayBuffer
 from .ddpg import MetaDict, make_aug_encoder
 from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, mlp, OnlineCov
 from url_benchmark.dmc import TimeStep
-
+from url_benchmark.hugwbc_policy_network import create_hugwbc_policy
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 @dataclasses.dataclass
 class SFAgentConfig:
     # @package agent
-    _target_: str = "url_benchmark.agent.sf.SFAgent"
+    _target_: str = "url_benchmark.agent.sf_dl.SFAgent"
     name: str = "sf"
     obs_type: str = omegaconf.MISSING  # to be specified later
     image_wh: int = omegaconf.MISSING  # to be specified later
@@ -54,7 +55,7 @@ class SFAgentConfig:
     update_encoder: bool = omegaconf.II("update_encoder")  # ${update_encoder}
     log_std_bounds: tp.Tuple[float, float] = (-5, 2)  # param for DiagGaussianActor
     temp: float = 1  # temperature for DiagGaussianActor
-    boltzmann: bool = True  # set to true for DiagGaussianActor
+    boltzmann: bool = True
     debug: bool = False
     preprocess: bool = True
     num_sf_updates: int = 1
@@ -63,14 +64,22 @@ class SFAgentConfig:
     q_loss: bool = True
     update_cov_every_step: int = 1000
     add_trunk: bool = False
+    # Feature-only training toggle
+    phi_only: bool = False
 
     feature_type: str = 'state'  # 'state', 'diff', 'concat'
     hilp_discount: float = 0.98
     hilp_expectile: float = 0.5
+    
+    # DataLoader specific configs
+    use_dataloader: bool = True
+    dataloader_num_workers: int = 4
+    dataloader_pin_memory: bool = True
+    dataloader_drop_last: bool = True
 
 
 cs = ConfigStore.instance()
-cs.store(group="agent", name="sf", node=SFAgentConfig)
+cs.store(group="agent", name="sf_dl", node=SFAgentConfig)
 
 
 class FeatureLearner(nn.Module):
@@ -195,240 +204,6 @@ class HILP(FeatureLearner):
         }
 
 
-class Laplacian(FeatureLearner):
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
-        del action
-        del future_obs
-        phi = self.feature_net(obs)
-        next_phi = self.feature_net(next_obs)
-        loss = (phi - next_phi).pow(2).mean()
-        Cov = torch.matmul(phi, phi.T)
-        I = torch.eye(*Cov.size(), device=Cov.device)
-        off_diag = ~I.bool()
-        orth_loss_diag = - 2 * Cov.diag().mean()
-        orth_loss_offdiag = Cov[off_diag].pow(2).mean()
-        orth_loss = orth_loss_offdiag + orth_loss_diag
-        loss += orth_loss
-
-        return loss
-
-
-class ContrastiveFeature(FeatureLearner):
-    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
-        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
-        self.mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim, "L2")
-        self.apply(utils.weight_init)
-
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
-        del action
-        del next_obs
-        assert future_obs is not None
-        phi = self.feature_net(obs)
-        future_mu = self.mu_net(future_obs)
-        phi = F.normalize(phi, dim=1)
-        future_mu = F.normalize(future_mu, dim=1)
-        logits = torch.einsum('sd, td-> st', phi, future_mu)  # batch x batch
-        I = torch.eye(*logits.size(), device=logits.device)
-        off_diag = ~I.bool()
-        logits_off_diag = logits[off_diag].reshape(logits.shape[0], logits.shape[0] - 1)
-        loss = - logits.diag() + torch.logsumexp(logits_off_diag, dim=1)
-        loss = loss.mean()
-        return loss
-
-
-class ContrastiveFeaturev2(FeatureLearner):
-    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
-        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
-        self.mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim, "L2")
-        self.apply(utils.weight_init)
-
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
-        del action
-        del next_obs
-        assert future_obs is not None
-        future_phi = self.feature_net(future_obs)
-        mu = self.mu_net(obs)
-        future_phi = F.normalize(future_phi, dim=1)
-        mu = F.normalize(mu, dim=1)
-        logits = torch.einsum('sd, td-> st', mu, future_phi)  # batch x batch
-        I = torch.eye(*logits.size(), device=logits.device)
-        off_diag = ~I.bool()
-        logits_off_diag = logits[off_diag].reshape(logits.shape[0], logits.shape[0] - 1)
-        loss = - logits.diag() + torch.logsumexp(logits_off_diag, dim=1)
-        loss = loss.mean()
-        return loss
-
-
-class ICM(FeatureLearner):
-    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
-        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
-
-        self.inverse_dynamic_net = mlp(2 * z_dim, hidden_dim, 'irelu', hidden_dim, 'irelu', action_dim, 'tanh')
-        self.apply(utils.weight_init)
-
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
-        del future_obs
-        phi = self.feature_net(obs)
-        next_phi = self.feature_net(next_obs)
-        predicted_action = self.inverse_dynamic_net(torch.cat([phi, next_phi], dim=-1))
-        backward_error = (action - predicted_action).pow(2).mean()
-        icm_loss = backward_error
-        return icm_loss
-
-
-class TransitionModel(FeatureLearner):
-    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
-        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
-
-        self.forward_dynamic_net = mlp(z_dim + action_dim, hidden_dim, 'irelu', hidden_dim, 'irelu', obs_dim)
-        self.apply(utils.weight_init)
-
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
-        del future_obs
-        phi = self.feature_net(obs)
-        predicted_next_obs = self.forward_dynamic_net(torch.cat([phi, action], dim=-1))
-        forward_error = (predicted_next_obs - next_obs).pow(2).mean()
-        return forward_error
-
-
-class TransitionLatentModel(FeatureLearner):
-    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
-        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
-
-        self.forward_dynamic_net = mlp(z_dim + action_dim, hidden_dim, 'irelu', hidden_dim, 'irelu', z_dim)
-        self.target_feature_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim, "L2")
-        self.apply(utils.weight_init)
-
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
-        del future_obs
-        phi = self.feature_net(obs)
-        with torch.no_grad():
-            next_phi = self.target_feature_net(next_obs)
-        predicted_next_obs = self.forward_dynamic_net(torch.cat([phi, action], dim=-1))
-        forward_error = (predicted_next_obs - next_phi.detach()).pow(2).mean()
-        utils.soft_update_params(self.feature_net, self.target_feature_net, 0.01)
-
-        return forward_error
-
-
-class AutoEncoder(FeatureLearner):
-    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
-        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
-
-        self.decoder = mlp(z_dim, hidden_dim, 'irelu', hidden_dim, 'irelu', obs_dim)
-        self.apply(utils.weight_init)
-
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
-        del future_obs
-        del next_obs
-        del action
-        phi = self.feature_net(obs)
-        predicted_obs = self.decoder(phi)
-        reconstruction_error = (predicted_obs - obs).pow(2).mean()
-        return reconstruction_error
-
-
-class SVDSR(FeatureLearner):
-    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
-        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
-        self.mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim)
-        self.target_feature_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim, "L2")
-        self.target_mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim)
-        self.apply(utils.weight_init)
-
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
-        del future_obs
-        phi = self.feature_net(obs)
-        mu = self.mu_net(next_obs)
-        SR = torch.einsum("sd, td -> st", phi, mu)
-        with torch.no_grad():
-            target_phi = self.target_feature_net(next_obs)
-            target_mu = self.target_mu_net(next_obs)
-            target_SR = torch.einsum("sd, td -> st", target_phi, target_mu)
-
-        I = torch.eye(*SR.size(), device=SR.device)
-        off_diag = ~I.bool()
-        loss = - 2 * SR.diag().mean() + (SR - 0.99 * target_SR.detach())[off_diag].pow(2).mean()
-
-        # orthonormality loss
-        Cov = torch.matmul(phi, phi.T)
-        I = torch.eye(*Cov.size(), device=Cov.device)
-        off_diag = ~I.bool()
-        orth_loss_diag = - 2 * Cov.diag().mean()
-        orth_loss_offdiag = Cov[off_diag].pow(2).mean()
-        orth_loss = orth_loss_offdiag + orth_loss_diag
-        loss += orth_loss
-
-        utils.soft_update_params(self.feature_net, self.target_feature_net, 0.01)
-        utils.soft_update_params(self.mu_net, self.target_mu_net, 0.01)
-
-        return loss
-
-
-class SVDSRv2(FeatureLearner):
-    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
-        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
-        self.mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim)
-        self.target_feature_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim, "L2")
-        self.target_mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim)
-        self.apply(utils.weight_init)
-
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
-        del future_obs
-        phi = self.feature_net(next_obs)
-        mu = self.mu_net(obs)
-        SR = torch.einsum("sd, td -> st", mu, phi)
-        with torch.no_grad():
-            target_phi = self.target_feature_net(next_obs)
-            target_mu = self.target_mu_net(next_obs)
-            target_SR = torch.einsum("sd, td -> st", target_mu, target_phi)
-
-        I = torch.eye(*SR.size(), device=SR.device)
-        off_diag = ~I.bool()
-        loss = - 2 * SR.diag().mean() + (SR - 0.98 * target_SR.detach())[off_diag].pow(2).mean()
-
-        # orthonormality loss
-        Cov = torch.matmul(phi, phi.T)
-        I = torch.eye(*Cov.size(), device=Cov.device)
-        off_diag = ~I.bool()
-        orth_loss_diag = - 2 * Cov.diag().mean()
-        orth_loss_offdiag = Cov[off_diag].pow(2).mean()
-        orth_loss = orth_loss_offdiag + orth_loss_diag
-        loss += orth_loss
-
-        utils.soft_update_params(self.feature_net, self.target_feature_net, 0.01)
-        utils.soft_update_params(self.mu_net, self.target_mu_net, 0.01)
-
-        return loss
-
-
-class SVDP(FeatureLearner):
-    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
-        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
-        self.mu_net = mlp(obs_dim + action_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim)
-        self.apply(utils.weight_init)
-
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
-        del future_obs
-        phi = self.feature_net(next_obs)
-        mu = self.mu_net(torch.cat([obs, action], dim=1))
-        P = torch.einsum("sd, td -> st", mu, phi)
-        I = torch.eye(*P.size(), device=P.device)
-        off_diag = ~I.bool()
-        loss = - 2 * P.diag().mean() + P[off_diag].pow(2).mean()
-
-        # orthonormality loss
-        Cov = torch.matmul(phi, phi.T)
-        I = torch.eye(*Cov.size(), device=Cov.device)
-        off_diag = ~I.bool()
-        orth_loss_diag = - 2 * Cov.diag().mean()
-        orth_loss_offdiag = Cov[off_diag].pow(2).mean()
-        orth_loss = orth_loss_offdiag + orth_loss_diag
-        loss += orth_loss
-
-        return loss
-
-
 class SFAgent:
 
     def __init__(self, **kwargs: tp.Any):
@@ -449,21 +224,26 @@ class SFAgent:
         if cfg.feature_learner == "identity":
             cfg.z_dim = self.obs_dim
             self.cfg.z_dim = self.obs_dim
-        # create the network
-        if self.cfg.boltzmann:
-            self.actor: nn.Module = DiagGaussianActor(cfg.obs_type, self.obs_dim, cfg.z_dim, self.action_dim,
-                                                      cfg.hidden_dim, cfg.log_std_bounds).to(cfg.device)
+        # create the network (skip actor/SF if phi_only)
+        if not self.cfg.phi_only:
+            if self.cfg.boltzmann:
+                self.actor: nn.Module = DiagGaussianActor(cfg.obs_type, self.obs_dim, cfg.z_dim, self.action_dim,
+                                                          cfg.hidden_dim, cfg.log_std_bounds).to(cfg.device)
+            else:
+                self.actor = Actor(self.obs_dim, cfg.z_dim, self.action_dim,
+                                   cfg.feature_dim, cfg.hidden_dim,
+                                   preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
+            self.successor_net = ForwardMap(self.obs_dim, cfg.z_dim, self.action_dim,
+                                            cfg.feature_dim, cfg.hidden_dim,
+                                            preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
+            # build up the target network
+            self.successor_target_net = ForwardMap(self.obs_dim, cfg.z_dim, self.action_dim,
+                                                   cfg.feature_dim, cfg.hidden_dim,
+                                                   preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
         else:
-            self.actor = Actor(self.obs_dim, cfg.z_dim, self.action_dim,
-                               cfg.feature_dim, cfg.hidden_dim,
-                               preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
-        self.successor_net = ForwardMap(self.obs_dim, cfg.z_dim, self.action_dim,
-                                        cfg.feature_dim, cfg.hidden_dim,
-                                        preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
-        # build up the target network
-        self.successor_target_net = ForwardMap(self.obs_dim, cfg.z_dim, self.action_dim,
-                                               cfg.feature_dim, cfg.hidden_dim,
-                                               preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
+            self.actor = None
+            self.successor_net = None
+            self.successor_target_net = None
 
         learner = dict(icm=ICM, transition=TransitionModel, latent=TransitionLatentModel,
                        contrastive=ContrastiveFeature, autoencoder=AutoEncoder, lap=Laplacian,
@@ -478,25 +258,28 @@ class SFAgent:
         self.feature_learner = learner(self.obs_dim, self.action_dim, cfg.z_dim, cfg.phi_hidden_dim, **extra_kwargs).to(cfg.device)
 
         # load the weights into the target networks
-        self.successor_target_net.load_state_dict(self.successor_net.state_dict())
+        if not self.cfg.phi_only:
+            self.successor_target_net.load_state_dict(self.successor_net.state_dict())
         # optimizers
         self.encoder_opt: tp.Optional[torch.optim.Adam] = None
         if cfg.obs_type == 'pixels':
             self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=cfg.lr)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr)
-        self.sf_opt = torch.optim.Adam(self.successor_net.parameters(), lr=cfg.lr)
+        self.actor_opt = None if self.cfg.phi_only else torch.optim.Adam(self.actor.parameters(), lr=cfg.lr)
+        self.sf_opt = None if self.cfg.phi_only else torch.optim.Adam(self.successor_net.parameters(), lr=cfg.lr)
         self.phi_opt: tp.Optional[torch.optim.Adam] = None
         if cfg.feature_learner not in ["random", "identity"]:
             self.phi_opt = torch.optim.Adam(self.feature_learner.parameters(), lr=cfg.lr_coef * cfg.lr)
         self.train()
-        self.successor_target_net.train()
+        if not self.cfg.phi_only:
+            self.successor_target_net.train()
 
         self.inv_cov = torch.eye(self.cfg.z_dim, dtype=torch.float32, device=self.cfg.device)
 
     def train(self, training: bool = True) -> None:
         self.training = training
-        for net in [self.encoder, self.actor, self.successor_net]:
-            net.train(training)
+        for net in [self.encoder, getattr(self, 'actor', None), getattr(self, 'successor_net', None)]:
+            if net is not None:
+                net.train(training)
         if self.phi_opt is not None:
             self.feature_learner.train()
 
@@ -650,13 +433,6 @@ class SFAgent:
             metrics['phi_norm'] = torch.norm(target_phi, dim=-1).mean().item()
             metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
             metrics['sf_loss'] = sf_loss.item()
-            # 在update_sf方法中添加
-            metrics['F1_norm'] = torch.norm(F1, dim=-1).mean().item()
-            metrics['F2_norm'] = torch.norm(F2, dim=-1).mean().item()  
-            metrics['target_F_norm'] = torch.norm(target_F, dim=-1).mean().item()
-            metrics['next_F_norm'] = torch.norm(next_F, dim=-1).mean().item()
-            metrics['target_F_std'] = target_F.std().item()  # 目标的方差
-            metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
             if phi_loss is not None:
                 metrics['phi_loss'] = phi_loss.item()
 
@@ -715,28 +491,42 @@ class SFAgent:
         obs = self.aug(obs)
         return self.encoder(obs)
 
-    def update(self, replay_loader: ReplayBuffer, step: int) -> tp.Dict[str, float]:
+    def update(self, data_loader: tp.Iterator, step: int) -> tp.Dict[str, float]:
+        """DataLoader版本的update方法"""
         metrics: tp.Dict[str, float] = {}
 
         if step % self.cfg.update_every_steps != 0:
             return metrics
 
         for _ in range(self.cfg.num_sf_updates):
-            batch = replay_loader.sample(self.cfg.batch_size)
-            batch = batch.to(self.cfg.device)
-            obs = batch.obs
-            action = batch.action
-            discount = batch.discount
-            next_obs = batch.next_obs
-            future_obs = batch.future_obs
+            try:
+                batch = next(data_loader)
+            except StopIteration:
+                # 如果DataLoader耗尽，重新开始
+                data_loader = iter(data_loader)
+                batch = next(data_loader)
+            
+            # 将batch移动到设备
+            if hasattr(batch, 'to'):
+                batch = batch.to(self.cfg.device)
+            else:
+                # 如果是字典格式的batch
+                batch = {k: v.to(self.cfg.device) if hasattr(v, 'to') else v for k, v in batch.items()}
+            
+            obs = batch.obs if hasattr(batch, 'obs') else batch['obs']
+            action = batch.action if hasattr(batch, 'action') else batch['action']
+            discount = batch.discount if hasattr(batch, 'discount') else batch['discount']
+            next_obs = batch.next_obs if hasattr(batch, 'next_obs') else batch['next_obs']
+            future_obs = batch.future_obs if hasattr(batch, 'future_obs') else batch.get('future_obs', None)
 
             z = self.sample_z(self.cfg.batch_size).to(self.cfg.device)
             if not z.shape[-1] == self.cfg.z_dim:
                 raise RuntimeError("There's something wrong with the logic here")
 
             obs = self.aug_and_encode(obs)
-            next_obs = self.aug_and_encode(next_obs)
-            future_obs = self.aug_and_encode(future_obs)
+            next_obs = self.aug_and_encode(next_obs).detach()
+            if future_obs is not None:
+                future_obs = self.aug_and_encode(future_obs)
             next_obs = next_obs.detach()
 
             if self.cfg.mix_ratio > 0:
@@ -774,3 +564,229 @@ class SFAgent:
             utils.soft_update_params(self.successor_net, self.successor_target_net, self.cfg.sf_target_tau)
 
         return metrics
+
+
+# 为了兼容性，添加其他FeatureLearner类
+class Laplacian(FeatureLearner):
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
+        del action
+        del future_obs
+        phi = self.feature_net(obs)
+        next_phi = self.feature_net(next_obs)
+        loss = (phi - next_phi).pow(2).mean()
+        Cov = torch.matmul(phi, phi.T)
+        I = torch.eye(*Cov.size(), device=Cov.device)
+        off_diag = ~I.bool()
+        orth_loss_diag = - 2 * Cov.diag().mean()
+        orth_loss_offdiag = Cov[off_diag].pow(2).mean()
+        orth_loss = orth_loss_offdiag + orth_loss_diag
+        loss += orth_loss
+        return loss
+
+
+class ContrastiveFeature(FeatureLearner):
+    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
+        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
+        self.mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim, "L2")
+        self.apply(utils.weight_init)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
+        del action
+        del next_obs
+        assert future_obs is not None
+        phi = self.feature_net(obs)
+        future_mu = self.mu_net(future_obs)
+        phi = F.normalize(phi, dim=1)
+        future_mu = F.normalize(future_mu, dim=1)
+        logits = torch.einsum('sd, td-> st', phi, future_mu)  # batch x batch
+        I = torch.eye(*logits.size(), device=logits.device)
+        off_diag = ~I.bool()
+        logits_off_diag = logits[off_diag].reshape(logits.shape[0], logits.shape[0] - 1)
+        loss = - logits.diag() + torch.logsumexp(logits_off_diag, dim=1)
+        loss = loss.mean()
+        return loss
+
+
+class ContrastiveFeaturev2(FeatureLearner):
+    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
+        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
+        self.mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim, "L2")
+        self.apply(utils.weight_init)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
+        del action
+        del next_obs
+        assert future_obs is not None
+        future_phi = self.feature_net(future_obs)
+        mu = self.mu_net(obs)
+        future_phi = F.normalize(future_phi, dim=1)
+        mu = F.normalize(mu, dim=1)
+        logits = torch.einsum('sd, td-> st', mu, future_phi)  # batch x batch
+        I = torch.eye(*logits.size(), device=logits.device)
+        off_diag = ~I.bool()
+        logits_off_diag = logits[off_diag].reshape(logits.shape[0], logits.shape[0] - 1)
+        loss = - logits.diag() + torch.logsumexp(logits_off_diag, dim=1)
+        loss = loss.mean()
+        return loss
+
+
+class ICM(FeatureLearner):
+    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
+        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
+        self.inverse_dynamic_net = mlp(2 * z_dim, hidden_dim, 'irelu', hidden_dim, 'irelu', action_dim, 'tanh')
+        self.apply(utils.weight_init)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
+        del future_obs
+        phi = self.feature_net(obs)
+        next_phi = self.feature_net(next_obs)
+        predicted_action = self.inverse_dynamic_net(torch.cat([phi, next_phi], dim=-1))
+        backward_error = (action - predicted_action).pow(2).mean()
+        icm_loss = backward_error
+        return icm_loss
+
+
+class TransitionModel(FeatureLearner):
+    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
+        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
+        self.forward_dynamic_net = mlp(z_dim + action_dim, hidden_dim, 'irelu', hidden_dim, 'irelu', obs_dim)
+        self.apply(utils.weight_init)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
+        del future_obs
+        phi = self.feature_net(obs)
+        predicted_next_obs = self.forward_dynamic_net(torch.cat([phi, action], dim=-1))
+        forward_error = (predicted_next_obs - next_obs).pow(2).mean()
+        return forward_error
+
+
+class TransitionLatentModel(FeatureLearner):
+    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
+        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
+        self.forward_dynamic_net = mlp(z_dim + action_dim, hidden_dim, 'irelu', hidden_dim, 'irelu', z_dim)
+        self.target_feature_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim, "L2")
+        self.apply(utils.weight_init)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
+        del future_obs
+        phi = self.feature_net(obs)
+        with torch.no_grad():
+            next_phi = self.target_feature_net(next_obs)
+        predicted_next_obs = self.forward_dynamic_net(torch.cat([phi, action], dim=-1))
+        forward_error = (predicted_next_obs - next_phi.detach()).pow(2).mean()
+        utils.soft_update_params(self.feature_net, self.target_feature_net, 0.01)
+        return forward_error
+
+
+class AutoEncoder(FeatureLearner):
+    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
+        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
+        self.decoder = mlp(z_dim, hidden_dim, 'irelu', hidden_dim, 'irelu', obs_dim)
+        self.apply(utils.weight_init)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
+        del future_obs
+        del next_obs
+        del action
+        phi = self.feature_net(obs)
+        predicted_obs = self.decoder(phi)
+        reconstruction_error = (predicted_obs - obs).pow(2).mean()
+        return reconstruction_error
+
+
+class SVDSR(FeatureLearner):
+    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
+        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
+        self.mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim)
+        self.target_feature_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim, "L2")
+        self.target_mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim)
+        self.apply(utils.weight_init)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
+        del future_obs
+        phi = self.feature_net(obs)
+        mu = self.mu_net(next_obs)
+        SR = torch.einsum("sd, td -> st", phi, mu)
+        with torch.no_grad():
+            target_phi = self.target_feature_net(next_obs)
+            target_mu = self.target_mu_net(next_obs)
+            target_SR = torch.einsum("sd, td -> st", target_phi, target_mu)
+
+        I = torch.eye(*SR.size(), device=SR.device)
+        off_diag = ~I.bool()
+        loss = - 2 * SR.diag().mean() + (SR - 0.99 * target_SR.detach())[off_diag].pow(2).mean()
+
+        # orthonormality loss
+        Cov = torch.matmul(phi, phi.T)
+        I = torch.eye(*Cov.size(), device=Cov.device)
+        off_diag = ~I.bool()
+        orth_loss_diag = - 2 * Cov.diag().mean()
+        orth_loss_offdiag = Cov[off_diag].pow(2).mean()
+        orth_loss = orth_loss_offdiag + orth_loss_diag
+        loss += orth_loss
+
+        utils.soft_update_params(self.feature_net, self.target_feature_net, 0.01)
+        utils.soft_update_params(self.mu_net, self.target_mu_net, 0.01)
+        return loss
+
+
+class SVDSRv2(FeatureLearner):
+    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
+        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
+        self.mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim)
+        self.target_feature_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim, "L2")
+        self.target_mu_net = mlp(obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim)
+        self.apply(utils.weight_init)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
+        del future_obs
+        phi = self.feature_net(next_obs)
+        mu = self.mu_net(obs)
+        SR = torch.einsum("sd, td -> st", mu, phi)
+        with torch.no_grad():
+            target_phi = self.target_feature_net(next_obs)
+            target_mu = self.target_mu_net(next_obs)
+            target_SR = torch.einsum("sd, td -> st", target_mu, target_phi)
+
+        I = torch.eye(*SR.size(), device=SR.device)
+        off_diag = ~I.bool()
+        loss = - 2 * SR.diag().mean() + (SR - 0.98 * target_SR.detach())[off_diag].pow(2).mean()
+
+        # orthonormality loss
+        Cov = torch.matmul(phi, phi.T)
+        I = torch.eye(*Cov.size(), device=Cov.device)
+        off_diag = ~I.bool()
+        orth_loss_diag = - 2 * Cov.diag().mean()
+        orth_loss_offdiag = Cov[off_diag].pow(2).mean()
+        orth_loss = orth_loss_offdiag + orth_loss_diag
+        loss += orth_loss
+
+        utils.soft_update_params(self.feature_net, self.target_feature_net, 0.01)
+        utils.soft_update_params(self.mu_net, self.target_mu_net, 0.01)
+        return loss
+
+
+class SVDP(FeatureLearner):
+    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim) -> None:
+        super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
+        self.mu_net = mlp(obs_dim + action_dim, hidden_dim, "ntanh", hidden_dim, "relu", z_dim)
+        self.apply(utils.weight_init)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
+        del future_obs
+        phi = self.feature_net(next_obs)
+        mu = self.mu_net(torch.cat([obs, action], dim=1))
+        P = torch.einsum("sd, td -> st", mu, phi)
+        I = torch.eye(*P.size(), device=P.device)
+        off_diag = ~I.bool()
+        loss = - 2 * P.diag().mean() + P[off_diag].pow(2).mean()
+
+        # orthonormality loss
+        Cov = torch.matmul(phi, phi.T)
+        I = torch.eye(*Cov.size(), device=Cov.device)
+        off_diag = ~I.bool()
+        orth_loss_diag = - 2 * Cov.diag().mean()
+        orth_loss_offdiag = Cov[off_diag].pow(2).mean()
+        orth_loss = orth_loss_offdiag + orth_loss_diag
+        loss += orth_loss
+        return loss

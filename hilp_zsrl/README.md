@@ -9,8 +9,7 @@ The implementation is based on [Does Zero-Shot Reinforcement Learning Exist?](ht
 
 ## Installation
 ```
-conda create --name=hilp_zsrl python=3.8
-conda activate hilp_zsrl
+conda create --name=hilp_zsrl python=3.8 -y && conda activate hilp_zsrl
 pip install -r requirements.txt
 ```
 

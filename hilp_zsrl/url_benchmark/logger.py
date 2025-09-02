@@ -22,6 +22,20 @@ COMMON_EVAL_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
                       ('episode_reward', 'R', 'float'),
                       ('total_time', 'T', 'time')]
 
+# 为不同层级的eval添加专门的格式化配置
+EVAL_DETAIL_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
+                      ('command', 'CMD', 'str'), ('horizon', 'H', 'float'),
+                      ('env_reward', 'ENV_R', 'float'), ('z_reward', 'Z_R', 'float')]
+
+EVAL_HORIZON_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
+                       ('horizon', 'H', 'float'),
+                       ('mean_env_reward', 'MEAN_ENV_R', 'float'), 
+                       ('mean_z_reward', 'MEAN_Z_R', 'float')]
+
+EVAL_MEAN_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
+                    ('overall_env_reward', 'OVERALL_ENV_R', 'float'),
+                    ('overall_z_reward', 'OVERALL_Z_R', 'float')]
+
 
 pylogger = logging.getLogger(__name__)
 
@@ -54,13 +68,35 @@ class MetersGroup:
     def log(self, key: str, value: float, n: int = 1) -> None:
         self._meters[key].update(value, n)
 
+    @staticmethod
+    def _format(key: str, value: float, ty: str) -> str:
+        if ty == 'int':
+            value = int(value)
+            return f'{key}: {value}'
+        elif ty == 'float':
+            return f'{key}: {value:.04f}'
+        elif ty == 'time':
+            value_ = str(datetime.timedelta(seconds=int(value)))
+            return f'{key}: {value_}'
+        elif ty == 'str':
+            return f'{key}: {value}'
+        raise ValueError(f'invalid format type: {ty}')
+
     def _prime_meters(self) -> Metrics:
         data = {}
         for key, meter in self._meters.items():
+            # 移除前缀，但保留层级信息
             if key.startswith('train'):
                 key = key[len('train') + 1:]
-            else:
+            elif key.startswith('eval_detail'):
+                key = key[len('eval_detail') + 1:]
+            elif key.startswith('eval_horizon'):
+                key = key[len('eval_horizon') + 1:]
+            elif key.startswith('eval_mean'):
+                key = key[len('eval_mean') + 1:]
+            elif key.startswith('eval'):
                 key = key[len('eval') + 1:]
+            
             key = key.replace('/', '_')
             data[key] = meter.value()
         return data
@@ -100,18 +136,6 @@ class MetersGroup:
         self._csv_writer.writerow(data)
         self._csv_file.flush()
 
-    @staticmethod
-    def _format(key: str, value: float, ty: str) -> str:
-        if ty == 'int':
-            value = int(value)
-            return f'{key}: {value}'
-        elif ty == 'float':
-            return f'{key}: {value:.04f}'
-        elif ty == 'time':
-            value_ = str(datetime.timedelta(seconds=int(value)))
-            return f'{key}: {value_}'
-        raise ValueError(f'invalid format type: {ty}')
-
     def _dump_to_console(self, data: Metrics, prefix: str) -> None:
         prefix = colored(prefix, 'yellow' if prefix == 'train' else 'green')
         pieces = [f'| {prefix: <14}']
@@ -139,7 +163,7 @@ class MetersGroup:
 
 class Logger:
     def __init__(self, log_dir: Path, use_tb: bool, use_wandb: bool) -> None:
-        self._log_dir = log_dir
+        self._log_dir = Path(log_dir)
 
         self._train_mg = MetersGroup(log_dir / 'train.csv',
                                      formating=COMMON_TRAIN_FORMAT,
@@ -147,6 +171,18 @@ class Logger:
         self._eval_mg = MetersGroup(log_dir / 'eval.csv',
                                     formating=COMMON_EVAL_FORMAT,
                                     use_wandb=use_wandb)
+        
+        # 添加多层级eval支持
+        self._eval_detail_mg = MetersGroup(log_dir / 'eval_detail.csv',
+                                          formating=EVAL_DETAIL_FORMAT,
+                                          use_wandb=use_wandb)
+        self._eval_horizon_mg = MetersGroup(log_dir / 'eval_horizon.csv',
+                                           formating=EVAL_HORIZON_FORMAT,
+                                           use_wandb=use_wandb)
+        self._eval_mean_mg = MetersGroup(log_dir / 'eval_mean.csv',
+                                        formating=EVAL_MEAN_FORMAT,
+                                        use_wandb=use_wandb)
+        
         self._sw: tp.Optional[SummaryWriter] = None
         if use_tb:
             self._sw = SummaryWriter(str(log_dir / 'tb'))
@@ -161,7 +197,19 @@ class Logger:
         if isinstance(value, torch.Tensor):
             value = value.item()
         self._try_sw_log(key, value, step)
-        mg = self._train_mg if key.startswith('train') else self._eval_mg
+        
+        # 根据key的前缀选择对应的MetersGroup
+        if key.startswith('train'):
+            mg = self._train_mg
+        elif key.startswith('eval_detail'):
+            mg = self._eval_detail_mg
+        elif key.startswith('eval_horizon'):
+            mg = self._eval_horizon_mg
+        elif key.startswith('eval_mean'):
+            mg = self._eval_mean_mg
+        else:
+            mg = self._eval_mg  # 默认eval类型
+            
         mg.log(key, value)
 
     def log_metrics(self, metrics: tp.Dict[str, float], step: int, ty: str) -> None:
@@ -174,8 +222,25 @@ class Logger:
                 self._eval_mg.dump(step, 'eval')
             if ty is None or ty == 'train':
                 self._train_mg.dump(step, 'train')
+            # 添加多层级eval的dump支持
+            if ty is None or ty == 'eval_detail':
+                self._eval_detail_mg.dump(step, 'eval_detail')
+            if ty is None or ty == 'eval_horizon':
+                self._eval_horizon_mg.dump(step, 'eval_horizon')
+            if ty is None or ty == 'eval_mean':
+                self._eval_mean_mg.dump(step, 'eval_mean')
         except ValueError as e:
             pylogger.warning(f"Could not dump metrics: {e}")
+
+    def dump_all_eval(self, step: int) -> None:
+        """一次性dump所有eval层级的数据"""
+        try:
+            self._eval_mg.dump(step, 'eval')
+            self._eval_detail_mg.dump(step, 'eval_detail')
+            self._eval_horizon_mg.dump(step, 'eval_horizon')
+            self._eval_mean_mg.dump(step, 'eval_mean')
+        except ValueError as e:
+            pylogger.warning(f"Could not dump eval metrics: {e}")
 
     def log_and_dump_ctx(self, step: int, ty: str) -> "LogAndDumpCtx":
         return LogAndDumpCtx(self, step, ty)

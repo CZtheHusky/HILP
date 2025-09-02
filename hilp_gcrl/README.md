@@ -10,9 +10,12 @@ The implementation is based on [HIQL: Offline Goal-Conditioned RL with Latent St
 
 ## Installation
 ```
-conda create --name hilp_gcrl python=3.8
-conda activate hilp_gcrl
+conda create --name hilp_gcrl python=3.8 -y && conda activate hilp_gcrl
 pip install -r requirements.txt --no-deps
+pip install -i https://pypi.org/simple \
+  "jax[cuda11_cudnn82]==0.4.3" \
+  -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
 pip install "jax[cuda11_cudnn82]==0.4.3" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 ```
 

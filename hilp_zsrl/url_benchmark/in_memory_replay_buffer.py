@@ -58,6 +58,8 @@ class EpisodeBatch(tp.Generic[T]):
     meta: tp.Dict[str, T] = dataclasses.field(default_factory=dict)
     _physics: tp.Optional[T] = None
     future_obs: tp.Optional[T] = None
+    privileged_obs: tp.Optional[T] = None
+    commands: tp.Optional[T] = None
 
     def __post_init__(self) -> None:
         # some security to be removed later
@@ -206,7 +208,7 @@ class ReplayBuffer:
                 rets.append(self._storage[storage_key][ep_idx, np.maximum(0, step_idx - (self._frame_stack - i - 1))])
             return np.concatenate(rets, axis=1)
 
-    def sample(self, batch_size, custom_reward: tp.Optional[tp.Any] = None, with_physics: bool = False) -> EpisodeBatch:
+    def sample(self, batch_size, custom_reward: tp.Optional[tp.Any] = None, with_physics: bool = False, is_val: bool = False) -> EpisodeBatch:
         if not hasattr(self, "_batch_names"):
             self._batch_names = set(field.name for field in dataclasses.fields(ExtendedTimeStep))
         if not isinstance(self._future, float):

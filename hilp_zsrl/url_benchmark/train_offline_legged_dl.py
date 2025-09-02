@@ -1,3 +1,192 @@
+import os
+from pathlib import Path
+import typing as tp
+import dataclasses
+import tempfile
+
+import hydra
+from hydra.core.config_store import ConfigStore
+import omegaconf as omgcf
+import torch
+import numpy as np
+from dm_env import specs
+from torch.utils.data import DataLoader
+
+from url_benchmark.logger import Logger
+from url_benchmark import utils
+from url_benchmark.hilbert_dataset import HilbertRepresentationDataset
+from url_benchmark.agent import sf_dl as agents
+
+
+@dataclasses.dataclass
+class Config:
+    agent: tp.Any
+    run_group: str = "Debug"
+    seed: int = 1
+    device: str = "cuda"
+    use_tb: bool = False
+    use_wandb: bool = True
+    experiment: str = "offline"
+
+    # task/dataset
+    task: str = "h1int"
+    obs_type: str = "states"
+    image_wh: int = 64
+    action_repeat: int = 1
+    discount: float = 0.98
+    future: float = 0.99
+    p_currgoal: float = 0.0
+    p_randomgoal: float = 0.5
+    hilbert_obs_horizon: int = 5
+    hilbert_types: tp.Optional[tp.List[str]] = None
+    hilbert_max_episodes_per_type: tp.Optional[int] = None
+    use_history_action: bool = True
+
+    # training
+    num_grad_steps: int = 100000
+    log_every_steps: int = 1000
+    eval_every_steps: int = 0
+    batch_size: int = omgcf.II("agent.batch_size")
+
+    # dataset path
+    load_replay_buffer: tp.Optional[str] = None
+
+
+ConfigStore.instance().store(name="workspace_config_dl", node=Config)
+
+
+def make_agent(obs_dim: int, action_dim: int, cfg: omgcf.DictConfig) -> agents.SFAgent:
+    cfg.obs_type = cfg.obs_type
+    cfg.image_wh = cfg.image_wh
+    cfg.obs_shape = (obs_dim,)
+    cfg.action_shape = (action_dim,)
+    cfg.num_expl_steps = 0
+    return hydra.utils.instantiate(cfg)
+
+
+def legged_collate(cfg: Config):
+    def _collate(batch: tp.List[tp.Dict[str, torch.Tensor]]) -> tp.Dict[str, torch.Tensor]:
+        out: tp.Dict[str, torch.Tensor] = {}
+        # stack required keys
+        keys = batch[0].keys()
+        for k in keys:
+            if k == 'goal_obs':
+                continue
+            out[k] = torch.stack([b[k] for b in batch], dim=0)
+        # map goal_obs -> future_obs
+        out['future_obs'] = torch.stack([b['goal_obs'] for b in batch], dim=0)
+        # add discount
+        B = next(iter(out.values())).shape[0]
+        out['discount'] = torch.full((B, 1), fill_value=cfg.discount, dtype=torch.float32)
+        return out
+    return _collate
+
+
+class Workspace:
+    def __init__(self, cfg: Config) -> None:
+        self.work_dir = Path.cwd()
+        print(f"Workspace: {self.work_dir}")
+        self.cfg = cfg
+        utils.set_seed_everywhere(cfg.seed)
+        if not torch.cuda.is_available() and cfg.device != "cpu":
+            cfg.device = "cpu"
+            cfg.agent.device = "cpu"
+        self.device = torch.device(cfg.device)
+
+        # build dataset and dataloader
+        assert cfg.load_replay_buffer is not None, "load_replay_buffer (dataset root) must be provided"
+        dataset = HilbertRepresentationDataset(
+            data_dir=str(cfg.load_replay_buffer),
+            types=cfg.hilbert_types,
+            max_episodes_per_type=cfg.hilbert_max_episodes_per_type,
+            goal_future=cfg.future,
+            p_randomgoal=cfg.p_randomgoal,
+            obs_horizon=cfg.hilbert_obs_horizon,
+            full_loading=True,
+            use_history_action=cfg.use_history_action,
+        )
+        self.dataset = dataset
+        # infer dims
+        obs_dim = int(dataset.obs_dim)
+        # prefer dataset.action_dim when present, else fallback
+        action_dim = int(dataset.action_dim) if dataset.action_dim is not None else 19
+
+        self.logger = Logger(self.work_dir, use_tb=cfg.use_tb, use_wandb=cfg.use_wandb)
+        if cfg.use_wandb:
+            import wandb
+            wandb_output_dir = tempfile.mkdtemp()
+            wandb.init(project='hilp_zsrl', group=cfg.run_group, name=f"sd{cfg.seed:03d}_sf_dl",
+                       config=omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False),
+                       dir=wandb_output_dir)
+
+        # build agent
+        agent_cfg = cfg.agent
+        agent_cfg.obs_shape = (obs_dim,)
+        self.agent = make_agent(obs_dim, action_dim, agent_cfg)
+
+        # dataloader
+        num_workers = int(getattr(agent_cfg, 'dataloader_num_workers', 4))
+        pin_memory = bool(getattr(agent_cfg, 'dataloader_pin_memory', True))
+        drop_last = bool(getattr(agent_cfg, 'dataloader_drop_last', True))
+        self.loader = DataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+            collate_fn=legged_collate(cfg),
+        )
+        self.data_iter = iter(self.loader)
+
+        self.timer = utils.Timer()
+        self.global_step = 0
+        self._checkpoint_filepath = self.work_dir / "models" / "latest.pt"
+        self._checkpoint_filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def global_frame(self) -> int:
+        return self.global_step * self.cfg.action_repeat
+
+    def train(self) -> None:
+        train_until_step = utils.Until(self.cfg.num_grad_steps)
+        log_every_step = utils.Every(self.cfg.log_every_steps)
+        while train_until_step(self.global_step):
+            # update with dataloader iterator
+            metrics = self.agent.update(self.data_iter, self.global_step)
+            self.logger.log_metrics(metrics, self.global_step, ty='train')
+            if log_every_step(self.global_step):
+                elapsed_time, total_time = self.timer.reset()
+                with self.logger.log_and_dump_ctx(self.global_step, ty='train') as log:
+                    log('fps', self.cfg.log_every_steps / elapsed_time)
+                    log('total_time', total_time)
+                    log('step', self.global_step)
+            self.global_step += 1
+
+            # save rolling checkpoint without dataloader
+            if self.cfg.num_grad_steps > 0 and self.global_step % max(1, self.cfg.log_every_steps * 10) == 0:
+                self.save_checkpoint(self._checkpoint_filepath)
+
+        self.save_checkpoint(self._checkpoint_filepath)
+
+    _CHECKPOINTED_KEYS = ('agent', 'global_step')
+
+    def save_checkpoint(self, fp: tp.Union[Path, str]) -> None:
+        payload = {k: self.__dict__[k] for k in self._CHECKPOINTED_KEYS}
+        fp = Path(fp)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, fp)
+
+
+@hydra.main(config_path='.', config_name='base_config')
+def main(cfg: omgcf.DictConfig) -> None:
+    ws = Workspace(cfg)
+    ws.train()
+
+
+if __name__ == '__main__':
+    main()
+
 import platform
 import os
 
@@ -182,7 +371,7 @@ class Workspace:
                 exp_name += f's_{os.environ["SLURM_JOB_ID"]}.'
             if 'SLURM_PROCID' in os.environ:
                 exp_name += f'{os.environ["SLURM_PROCID"]}.'
-            exp_name += '_'.join([cfg.agent.name, self.domain, str(self.cfg.discount), str(self.cfg.future), str(self.cfg.p_randomgoal), str(self.cfg.agent.hilp_expectile), str(self.cfg.agent.hilp_discount), str(self.cfg.agent.q_loss), str(self.cfg.agent.command_injection), str(self.cfg.agent.mix_ratio), str(self.cfg.use_history_action), str(self.cfg.agent.z_dim)
+            exp_name += '_'.join([cfg.agent.name, self.domain, str(self.cfg.discount), str(self.cfg.future), str(self.cfg.p_randomgoal), str(self.cfg.agent.hilp_expectile), str(self.cfg.agent.hilp_discount), str(self.cfg.agent.q_loss), str(self.cfg.agent.command_injection), str(self.cfg.agent.mix_ratio), str(self.cfg.use_history_action)
             ])
 
             wandb_output_dir = tempfile.mkdtemp()
@@ -628,7 +817,7 @@ class Workspace:
         # 确保所有eval层级的metrics都被dump到wandb
         self.logger.dump_all_eval(self.global_step)
 
-            
+          
 
     _CHECKPOINTED_KEYS = ('agent', 'global_step', 'global_episode', "replay_loader")
 

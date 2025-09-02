@@ -80,7 +80,7 @@ def get_optimal_chunks(shape, dtype, target_chunk_bytes=1024 * 1024 * 2, max_chu
     return chunks
 
 
-class ReplayBuffer:
+class DataBuffer:
     """
     Zarr-based temporal datastructure.
     Assumes first dimention to be time. Only chunk in time dimension.
