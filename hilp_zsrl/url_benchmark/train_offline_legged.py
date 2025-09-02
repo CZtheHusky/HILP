@@ -177,7 +177,7 @@ class Workspace:
 
         if cfg.use_wandb:
             exp_name = ''
-            exp_name += f'sd{cfg.seed:03d}_'
+            # exp_name += f'sd{cfg.seed:03d}_'
             if 'SLURM_JOB_ID' in os.environ:
                 exp_name += f's_{os.environ["SLURM_JOB_ID"]}.'
             if 'SLURM_PROCID' in os.environ:
@@ -434,15 +434,15 @@ class Workspace:
                 while not dones.any() and timestep < eval_steps:
                     with torch.inference_mode():
                         assert self.agent.command_injection, f"command_injection must be True"
-                        z_vector = self.agent.sample_z(1, obs_command)
-                        actions, _ = self.agent.actor.act_inference(pure_obs, z_vector)
+                        z_hilbert, z_actor = self.agent.sample_z(1, obs_command)
+                        actions, _ = self.agent.actor.act_inference(pure_obs, z_actor)
                     last_obs = pure_obs
                     obs, critic_obs, reward, dones, _ = self.eval_env.step(actions)
                     
                     pure_obs, obs_command = self._proprocess_obs(obs)
                     self.eval_env.commands[:, :10] = command_vec
                     with torch.inference_mode():
-                        z_reward = self.agent.get_z_rewards(last_obs, pure_obs, z_vector.cpu().numpy())
+                        z_reward = self.agent.get_z_rewards(last_obs, pure_obs, z_hilbert.cpu().numpy())
                     rewards_recorder['env_rew_list'].append(float(reward.item()))
                     rewards_recorder['z_rew_list'].append(float(z_reward))
                     rewards_recorder['env_rewards'] += reward.item()
@@ -499,129 +499,130 @@ class Workspace:
                 eval_results['z_rewards_raw_cmd'].append(mean_z_rewards)
                 eval_results['ep_len_raw_cmd'].append(ep_len)
                 self.logger.log_metrics(metrics, self.global_step, ty='eval_detail')
-        for command_horizon in commands_horizons:
-            horizon_results = {'env_rewards': [], 'z_rewards': [], 'ep_len': []}
-            for key, data_buffer in self.example_data_buffers.items():
-                command_name = key
-                env_commands = data_buffer.meta['episode_command_A'][:]
-                random_traj_id = np.random.randint(0, len(env_commands))
-                command_vec = torch.tensor(env_commands[random_traj_id], device=self.eval_env.device)
-                VIDEO_PATH = video_save_parent / f"{command_name}_{random_traj_id}_{command_horizon}.mp4"
-                rewards_json_path = video_save_parent / f"{command_name}_{random_traj_id}_{command_horizon}.json"
-                data_start_idx = 0 if random_traj_id == 0 else data_buffer.episode_ends[random_traj_id - 1]
-                data_end_idx = data_buffer.episode_ends[random_traj_id]
-                len_trajectory = data_end_idx - data_start_idx
-                _, _ = self.eval_env.reset()
-                obs, critic_obs, _, _, _ = self.eval_env.step(torch.zeros(
-                    self.eval_env.num_envs, self.eval_env.num_actions, dtype=torch.float, device=self.eval_env.device))
-                look_at = np.array(self.eval_env.root_states[0, :3].cpu(), dtype=np.float64)
-                _safe_set_viewer_cam(self.eval_env, look_at + self.camera_relative_position, look_at, self.track_index)
-                # ==================== 相机传感器与视频写出器 ====================
-                frame_skip = max(1, int(round(1.0 / (self.FPS * self.eval_env.dt))))  # 模拟 -> 视频帧率下采样
-
-                # 让传感器相机与 viewer 相机初始对齐
-                self.eval_env.gym.set_camera_location(
-                    self.cam_handle, self.eval_env.envs[0],
-                    gymapi.Vec3(*(look_at + self.camera_relative_position)),
-                    gymapi.Vec3(*look_at)
-                )
-                self.eval_env.commands[:, :10] = command_vec
-
-
-                z_resample_interval = command_horizon
-                resample_steps_list = [i for i in range(0, len_trajectory + z_resample_interval - 1, z_resample_interval)]
-                goals_list = [data_buffer.data['proprio'][i, :, :self.obs_dim].reshape(1, -1) for i in resample_steps_list]
-                goals_list.append(data_buffer.data['proprio'][-1, :, :self.obs_dim].reshape(1, -1))
-
-                timestep = 0
-                pure_obs, obs_command = self._proprocess_obs(obs)
-                last_index = -1
-
-                # imageio 写 mp4，依赖 ffmpeg（imageio-ffmpeg）
-                writer = imageio.get_writer(VIDEO_PATH, fps=self.FPS)
-                dones = np.zeros(self.eval_env.num_envs, dtype=np.bool_)
-                rewards_recorder = {}
-                rewards_recorder['env_rewards'] = 0
-                rewards_recorder['z_rewards'] = 0
-                rewards_recorder['env_rew_list'] = []
-                rewards_recorder['z_rew_list'] = []
-                while not dones.any() and timestep < eval_steps:
-                    with torch.inference_mode():
-                        if timestep // z_resample_interval != last_index and last_index < len(goals_list) - 1:
-                            print(f"Switch goal state: {last_index} -> {timestep // z_resample_interval} / {eval_steps}")
-                            last_index = timestep // z_resample_interval
-                            last_index = min(last_index, len(goals_list) - 1)
-                        meta = self.agent.get_goal_meta(goal_array=goals_list[last_index].squeeze(0), obs_array=pure_obs.squeeze(0))
-                        z_vector = torch.tensor(meta['z'], device=self.eval_env.device).reshape(1, -1)
-                        actions, _ = self.agent.actor.act_inference(pure_obs, z_vector)
-                    last_obs = pure_obs
-                    obs, critic_obs, reward, dones, _ = self.eval_env.step(actions)
-                    
-                    pure_obs, obs_command = self._proprocess_obs(obs)
-                    self.eval_env.commands[:, :10] = command_vec
-                    with torch.inference_mode():
-                        z_reward = self.agent.get_z_rewards(last_obs, pure_obs, z_vector.cpu().numpy())
-                    rewards_recorder['env_rew_list'].append(float(reward.item()))
-                    rewards_recorder['z_rew_list'].append(float(z_reward))
-                    rewards_recorder['env_rewards'] += reward.item()
-                    rewards_recorder['z_rewards'] += z_reward
-                    # print(f"z_reward: {z_reward}, env_reward: {reward.item()}")
-                    if dones.any():
-                        print(f"command: {command_name}, episode env reward: {reward.item()}, episode z reward: {rewards_recorder['z_rewards']}, ep_len: {len(rewards_recorder['env_rew_list'])}")
-                    # ===== 相机跟踪与旋转 =====
+        else:
+            for command_horizon in commands_horizons:
+                horizon_results = {'env_rewards': [], 'z_rewards': [], 'ep_len': []}
+                for key, data_buffer in self.example_data_buffers.items():
+                    command_name = key
+                    env_commands = data_buffer.meta['episode_command_A'][:]
+                    random_traj_id = np.random.randint(0, len(env_commands))
+                    command_vec = torch.tensor(env_commands[random_traj_id], device=self.eval_env.device)
+                    VIDEO_PATH = video_save_parent / f"{command_name}_{random_traj_id}_{command_horizon}.mp4"
+                    rewards_json_path = video_save_parent / f"{command_name}_{random_traj_id}_{command_horizon}.json"
+                    data_start_idx = 0 if random_traj_id == 0 else data_buffer.episode_ends[random_traj_id - 1]
+                    data_end_idx = data_buffer.episode_ends[random_traj_id]
+                    len_trajectory = data_end_idx - data_start_idx
+                    _, _ = self.eval_env.reset()
+                    obs, critic_obs, _, _, _ = self.eval_env.step(torch.zeros(
+                        self.eval_env.num_envs, self.eval_env.num_actions, dtype=torch.float, device=self.eval_env.device))
                     look_at = np.array(self.eval_env.root_states[0, :3].cpu(), dtype=np.float64)
-                    camera_rot = (self.camera_rot + self.camera_rot_per_sec * self.eval_env.dt) % (2 * np.pi)
-                    h_scale, v_scale = 1.0, 0.8
-                    camera_relative_position = 2 * np.array(
-                        [np.cos(camera_rot) * h_scale, np.sin(camera_rot) * h_scale, 0.5 * v_scale]
-                    )
-                    # 更新 viewer 相机
-                    _safe_set_viewer_cam(self.eval_env, look_at + camera_relative_position, look_at, self.track_index)
-                    # env.set_camera(look_at + camera_relative_position, look_at, track_index)
-                    # 同步传感器相机（用于录制）
+                    _safe_set_viewer_cam(self.eval_env, look_at + self.camera_relative_position, look_at, self.track_index)
+                    # ==================== 相机传感器与视频写出器 ====================
+                    frame_skip = max(1, int(round(1.0 / (self.FPS * self.eval_env.dt))))  # 模拟 -> 视频帧率下采样
+
+                    # 让传感器相机与 viewer 相机初始对齐
                     self.eval_env.gym.set_camera_location(
                         self.cam_handle, self.eval_env.envs[0],
-                        gymapi.Vec3(*(look_at + camera_relative_position)),
+                        gymapi.Vec3(*(look_at + self.camera_relative_position)),
                         gymapi.Vec3(*look_at)
                     )
+                    self.eval_env.commands[:, :10] = command_vec
 
-                    # ===== 干扰和中断设置 =====
-                    self.eval_env.use_disturb = True
-                    self.eval_env.disturb_masks[:] = True
-                    self.eval_env.disturb_isnoise[:] = True
-                    self.eval_env.disturb_rad_curriculum[:] = 1.0
-                    self.eval_env.interrupt_mask[:] = self.eval_env.disturb_masks[:]
-                    self.eval_env.standing_envs_mask[:] = True
 
-                    # ===== 抓帧与写视频（CPU 路径）=====
-                    if timestep % frame_skip == 0:
-                        # 确保渲染管线推进
-                        self.eval_env.gym.step_graphics(self.eval_env.sim)
-                        self.eval_env.gym.render_all_camera_sensors(self.eval_env.sim)
+                    z_resample_interval = command_horizon
+                    resample_steps_list = [i for i in range(0, len_trajectory + z_resample_interval - 1, z_resample_interval)]
+                    goals_list = [data_buffer.data['proprio'][i, :, :self.obs_dim].reshape(1, -1) for i in resample_steps_list]
+                    goals_list.append(data_buffer.data['proprio'][-1, :, :self.obs_dim].reshape(1, -1))
 
-                        img_any = self.eval_env.gym.get_camera_image(
-                            self.eval_env.sim, self.eval_env.envs[0], self.cam_handle, gymapi.IMAGE_COLOR
+                    timestep = 0
+                    pure_obs, obs_command = self._proprocess_obs(obs)
+                    last_index = -1
+
+                    # imageio 写 mp4，依赖 ffmpeg（imageio-ffmpeg）
+                    writer = imageio.get_writer(VIDEO_PATH, fps=self.FPS)
+                    dones = np.zeros(self.eval_env.num_envs, dtype=np.bool_)
+                    rewards_recorder = {}
+                    rewards_recorder['env_rewards'] = 0
+                    rewards_recorder['z_rewards'] = 0
+                    rewards_recorder['env_rew_list'] = []
+                    rewards_recorder['z_rew_list'] = []
+                    while not dones.any() and timestep < eval_steps:
+                        with torch.inference_mode():
+                            if timestep // z_resample_interval != last_index and last_index < len(goals_list) - 1:
+                                print(f"Switch goal state: {last_index} -> {timestep // z_resample_interval} / {eval_steps}")
+                                last_index = timestep // z_resample_interval
+                                last_index = min(last_index, len(goals_list) - 1)
+                            meta = self.agent.get_goal_meta(goal_array=goals_list[last_index].squeeze(0), obs_array=pure_obs.squeeze(0))
+                            z_vector = torch.tensor(meta['z'], device=self.eval_env.device).reshape(1, -1)
+                            actions, _ = self.agent.actor.act_inference(pure_obs, z_vector)
+                        last_obs = pure_obs
+                        obs, critic_obs, reward, dones, _ = self.eval_env.step(actions)
+                        
+                        pure_obs, obs_command = self._proprocess_obs(obs)
+                        self.eval_env.commands[:, :10] = command_vec
+                        with torch.inference_mode():
+                            z_reward = self.agent.get_z_rewards(last_obs, pure_obs, z_vector.cpu().numpy())
+                        rewards_recorder['env_rew_list'].append(float(reward.item()))
+                        rewards_recorder['z_rew_list'].append(float(z_reward))
+                        rewards_recorder['env_rewards'] += reward.item()
+                        rewards_recorder['z_rewards'] += z_reward
+                        # print(f"z_reward: {z_reward}, env_reward: {reward.item()}")
+                        if dones.any():
+                            print(f"command: {command_name}, episode env reward: {reward.item()}, episode z reward: {rewards_recorder['z_rewards']}, ep_len: {len(rewards_recorder['env_rew_list'])}")
+                        # ===== 相机跟踪与旋转 =====
+                        look_at = np.array(self.eval_env.root_states[0, :3].cpu(), dtype=np.float64)
+                        camera_rot = (self.camera_rot + self.camera_rot_per_sec * self.eval_env.dt) % (2 * np.pi)
+                        h_scale, v_scale = 1.0, 0.8
+                        camera_relative_position = 2 * np.array(
+                            [np.cos(camera_rot) * h_scale, np.sin(camera_rot) * h_scale, 0.5 * v_scale]
                         )
-                        rgb = _to_rgb_frame(img_any, self.H, self.W)
-                        writer.append_data(rgb)
-                    timestep += 1
-                writer.close()
-                with open(rewards_json_path, 'w') as f:
-                    json.dump(rewards_recorder, f, indent=4)
-                print("Saved video to %s", VIDEO_PATH)
-                mean_env_rewards = np.mean(rewards_recorder['env_rew_list'])
-                mean_z_rewards = np.mean(rewards_recorder['z_rew_list'])
-                ep_len = len(rewards_recorder['env_rew_list'])
-                metrics = {f"{command_name}_{command_horizon}_env_rew": mean_env_rewards, f"{command_name}_{command_horizon}_z_rew": mean_z_rewards, f"{command_name}_{command_horizon}_ep_len": ep_len}
-                eval_results['env_rewards'].append(mean_env_rewards)
-                eval_results['z_rewards'].append(mean_z_rewards)
-                eval_results['ep_len'].append(ep_len)
-                self.logger.log_metrics(metrics, self.global_step, ty='eval_detail')
-                horizon_results['env_rewards'].append(mean_env_rewards)
-                horizon_results['z_rewards'].append(mean_z_rewards)
-                horizon_results['ep_len'].append(ep_len)
-            metrics = {f"horizon_{command_horizon}_env_rew": np.mean(horizon_results['env_rewards']), f"horizon_{command_horizon}_z_rew": np.mean(horizon_results['z_rewards']), f"horizon_{command_horizon}_ep_len": np.mean(horizon_results['ep_len'])}
-            self.logger.log_metrics(metrics, self.global_step, ty='eval_horizon')
+                        # 更新 viewer 相机
+                        _safe_set_viewer_cam(self.eval_env, look_at + camera_relative_position, look_at, self.track_index)
+                        # env.set_camera(look_at + camera_relative_position, look_at, track_index)
+                        # 同步传感器相机（用于录制）
+                        self.eval_env.gym.set_camera_location(
+                            self.cam_handle, self.eval_env.envs[0],
+                            gymapi.Vec3(*(look_at + camera_relative_position)),
+                            gymapi.Vec3(*look_at)
+                        )
+
+                        # ===== 干扰和中断设置 =====
+                        self.eval_env.use_disturb = True
+                        self.eval_env.disturb_masks[:] = True
+                        self.eval_env.disturb_isnoise[:] = True
+                        self.eval_env.disturb_rad_curriculum[:] = 1.0
+                        self.eval_env.interrupt_mask[:] = self.eval_env.disturb_masks[:]
+                        self.eval_env.standing_envs_mask[:] = True
+
+                        # ===== 抓帧与写视频（CPU 路径）=====
+                        if timestep % frame_skip == 0:
+                            # 确保渲染管线推进
+                            self.eval_env.gym.step_graphics(self.eval_env.sim)
+                            self.eval_env.gym.render_all_camera_sensors(self.eval_env.sim)
+
+                            img_any = self.eval_env.gym.get_camera_image(
+                                self.eval_env.sim, self.eval_env.envs[0], self.cam_handle, gymapi.IMAGE_COLOR
+                            )
+                            rgb = _to_rgb_frame(img_any, self.H, self.W)
+                            writer.append_data(rgb)
+                        timestep += 1
+                    writer.close()
+                    with open(rewards_json_path, 'w') as f:
+                        json.dump(rewards_recorder, f, indent=4)
+                    print("Saved video to %s", VIDEO_PATH)
+                    mean_env_rewards = np.mean(rewards_recorder['env_rew_list'])
+                    mean_z_rewards = np.mean(rewards_recorder['z_rew_list'])
+                    ep_len = len(rewards_recorder['env_rew_list'])
+                    metrics = {f"{command_name}_{command_horizon}_env_rew": mean_env_rewards, f"{command_name}_{command_horizon}_z_rew": mean_z_rewards, f"{command_name}_{command_horizon}_ep_len": ep_len}
+                    eval_results['env_rewards'].append(mean_env_rewards)
+                    eval_results['z_rewards'].append(mean_z_rewards)
+                    eval_results['ep_len'].append(ep_len)
+                    self.logger.log_metrics(metrics, self.global_step, ty='eval_detail')
+                    horizon_results['env_rewards'].append(mean_env_rewards)
+                    horizon_results['z_rewards'].append(mean_z_rewards)
+                    horizon_results['ep_len'].append(ep_len)
+                metrics = {f"horizon_{command_horizon}_env_rew": np.mean(horizon_results['env_rewards']), f"horizon_{command_horizon}_z_rew": np.mean(horizon_results['z_rewards']), f"horizon_{command_horizon}_ep_len": np.mean(horizon_results['ep_len'])}
+                self.logger.log_metrics(metrics, self.global_step, ty='eval_horizon')
         metrics = {key: np.mean(eval_results[key]) for key in eval_results if len(eval_results[key]) > 0}
         self.logger.log_metrics(metrics, self.global_step, ty='eval_mean')
         

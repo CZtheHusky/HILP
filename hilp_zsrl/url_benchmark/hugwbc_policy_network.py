@@ -165,40 +165,7 @@ class BaseAdaptModel(nn.Module):
             *MLP(control_input_dim, act_dim, actor_hidden_dims, 
                 activation, output_activation)
         )
-# Actor MLP: MlpAdaptModel(
-#   (state_estimator): Sequential(
-#     (0): Linear(in_features=32, out_features=64, bias=True)
-#     (1): ELU(alpha=1.0)
-#     (2): Linear(in_features=64, out_features=32, bias=True)
-#     (3): ELU(alpha=1.0)
-#     (4): Linear(in_features=32, out_features=3, bias=True)
-#   )
-#   (low_level_net): Sequential(
-#     (0): Linear(in_features=111, out_features=256, bias=True)
-#     (1): ELU(alpha=1.0)
-#     (2): Linear(in_features=256, out_features=128, bias=True)
-#     (3): ELU(alpha=1.0)
-#     (4): Linear(in_features=128, out_features=32, bias=True)
-#     (5): ELU(alpha=1.0)
-#     (6): Linear(in_features=32, out_features=19, bias=True)
-#   )
-#   (mem_encoder): Sequential(
-#     (0): Linear(in_features=315, out_features=256, bias=True)
-#     (1): ELU(alpha=1.0)
-#     (2): Linear(in_features=256, out_features=128, bias=True)
-#     (3): ELU(alpha=1.0)
-#     (4): Linear(in_features=128, out_features=32, bias=True)
-#   )
-# )
-# Critic MLP: Sequential(
-#   (0): Linear(in_features=321, out_features=512, bias=True)
-#   (1): ELU(alpha=1.0)
-#   (2): Linear(in_features=512, out_features=256, bias=True)
-#   (3): ELU(alpha=1.0)
-#   (4): Linear(in_features=256, out_features=128, bias=True)
-#   (5): ELU(alpha=1.0)
-#   (6): Linear(in_features=128, out_features=1, bias=True)
-# )
+
     def forward(self, 
                 obs: torch.Tensor, 
                 z_vector: torch.Tensor,
@@ -723,7 +690,40 @@ def create_hugwbc_critic(input_dim=321, output_dim=1, hidden_dims=[512, 256, 128
     )
     return nn.Sequential(*mlp_layers)
 
-
+# Actor MLP: MlpAdaptModel(
+#   (state_estimator): Sequential(
+#     (0): Linear(in_features=32, out_features=64, bias=True)
+#     (1): ELU(alpha=1.0)
+#     (2): Linear(in_features=64, out_features=32, bias=True)
+#     (3): ELU(alpha=1.0)
+#     (4): Linear(in_features=32, out_features=3, bias=True)
+#   )
+#   (low_level_net): Sequential(
+#     (0): Linear(in_features=111, out_features=256, bias=True)
+#     (1): ELU(alpha=1.0)
+#     (2): Linear(in_features=256, out_features=128, bias=True)
+#     (3): ELU(alpha=1.0)
+#     (4): Linear(in_features=128, out_features=32, bias=True)
+#     (5): ELU(alpha=1.0)
+#     (6): Linear(in_features=32, out_features=19, bias=True)
+#   )
+#   (mem_encoder): Sequential(
+#     (0): Linear(in_features=315, out_features=256, bias=True)
+#     (1): ELU(alpha=1.0)
+#     (2): Linear(in_features=256, out_features=128, bias=True)
+#     (3): ELU(alpha=1.0)
+#     (4): Linear(in_features=128, out_features=32, bias=True)
+#   )
+# )
+# Critic MLP: Sequential(
+#   (0): Linear(in_features=321, out_features=512, bias=True)
+#   (1): ELU(alpha=1.0)
+#   (2): Linear(in_features=512, out_features=256, bias=True)
+#   (3): ELU(alpha=1.0)
+#   (4): Linear(in_features=256, out_features=128, bias=True)
+#   (5): ELU(alpha=1.0)
+#   (6): Linear(in_features=128, out_features=1, bias=True)
+# )
 
 # =============================================================================
 # Example Usage and Testing

@@ -541,17 +541,17 @@ class SFAgent:
         meta['z'] = z
         return meta
 
-    def get_z_rewards(self, obs: np.ndarray, next_obs: np.ndarray, z_vector: np.ndarray, normalize: bool = True) -> np.ndarray:
+    def get_z_rewards(self, obs: np.ndarray, next_obs: np.ndarray, z_hilbert: np.ndarray, normalize: bool = True) -> np.ndarray:
         obs = torch.tensor(obs).to(self.cfg.device)
         next_obs = torch.tensor(next_obs).to(self.cfg.device)
-        z_vector = torch.tensor(z_vector).to(self.cfg.device)
+        z_hilbert = torch.tensor(z_hilbert).to(self.cfg.device)
         with torch.no_grad():
             obs = self.encoder(obs)
             next_obs = self.encoder(next_obs)
             z_obs = self.feature_learner.feature_net(obs)
             z_next_obs = self.feature_learner.feature_net(next_obs)
             z_diff = z_next_obs - z_obs
-            rewards = torch.einsum('sd, sd -> s', z_diff, z_vector)
+            rewards = torch.einsum('sd, sd -> s', z_diff, z_hilbert)
         if normalize:
             rewards = rewards / math.sqrt(self.cfg.z_dim)
         return rewards.squeeze(0).cpu().numpy()
@@ -577,12 +577,13 @@ class SFAgent:
         return meta
 
     def sample_z(self, size, env_command=None):
+        z_hilbert = torch.randn((size, self.cfg.z_dim), dtype=torch.float32)
+        z_hilbert = math.sqrt(self.cfg.z_dim) * F.normalize(z_hilbert, dim=1)
         if self.command_injection:
-            z = self.command_injection_net(env_command)
+            z_actor = self.command_injection_net(env_command)
         else:
-            z = torch.randn((size, self.cfg.z_dim), dtype=torch.float32)
-        z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
-        return z
+            z_actor = z_hilbert
+        return z_hilbert, z_actor
 
     def init_meta(self) -> MetaDict:
         if self.solved_meta is not None:
@@ -718,7 +719,7 @@ class SFAgent:
 
         return metrics
 
-    def update_actor(self, obs: torch.Tensor, z: torch.Tensor, step: int, privileged_obs: torch.Tensor) -> tp.Dict[str, float]:
+    def update_actor(self, obs: torch.Tensor, z_hilbert: torch.Tensor, z_actor: torch.Tensor, step: int, privileged_obs: torch.Tensor) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
         # if self.cfg.boltzmann:
         #     dist = self.actor(obs, z)
@@ -727,14 +728,14 @@ class SFAgent:
         #     stddev = utils.schedule(self.cfg.stddev_schedule, step)
         #     dist = self.actor(obs, z, stddev)
         #     action = dist.sample(clip=self.cfg.stddev_clip)
-        self.actor.update_distribution(obs, z, privileged_obs, sync_update=True)
+        self.actor.update_distribution(obs, z_actor, privileged_obs, sync_update=True)
         dist = self.actor.distribution
         action = dist.sample()
         privileged_recon_loss = self.actor.actor.privileged_recon_loss
         log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-        F1, F2 = self.successor_net(obs, z, action)
-        Q1 = torch.einsum('sd, sd -> s', F1, z)
-        Q2 = torch.einsum('sd, sd -> s', F2, z)
+        F1, F2 = self.successor_net(obs, z_hilbert, action)
+        Q1 = torch.einsum('sd, sd -> s', F1, z_hilbert)
+        Q2 = torch.einsum('sd, sd -> s', F2, z_hilbert)
         Q = torch.min(Q1, Q2)
         # actor_loss = (self.cfg.temp * log_prob - Q).mean() if self.cfg.boltzmann else -Q.mean()
         actor_loss = (self.cfg.temp * log_prob - Q).mean()
@@ -795,8 +796,8 @@ class SFAgent:
             commands_obs = batch.commands
             # print(obs.shape, action.shape, discount.shape, next_obs.shape, future_obs.shape, privileged_obs.shape)
 
-            z = self.sample_z(self.cfg.batch_size, commands_obs).to(self.cfg.device)
-            if not z.shape[-1] == self.cfg.z_dim:
+            z_hilbert, z_actor = self.sample_z(self.cfg.batch_size, commands_obs).to(self.cfg.device)
+            if not z_hilbert.shape[-1] == self.cfg.z_dim:
                 raise RuntimeError("There's something wrong with the logic here")
 
             obs = self.aug_and_encode(obs)
@@ -830,10 +831,10 @@ class SFAgent:
                 new_z = math.sqrt(self.cfg.z_dim) * F.normalize(new_z, dim=1)
                 z[mix_idxs] = new_z
 
-            metrics.update(self.update_sf(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z=z.detach(), step=step))
+            metrics.update(self.update_sf(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z=z_hilbert.detach(), step=step))
             if not self.cfg.train_phi_only:
                 # update actor
-                metrics.update(self.update_actor(obs.detach(), z, step, privileged_obs))
+                metrics.update(self.update_actor(obs.detach(), z_hilbert, z_actor, step, privileged_obs))
 
                 # update critic target
                 utils.soft_update_params(self.successor_net, self.successor_target_net, self.cfg.sf_target_tau)

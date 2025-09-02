@@ -42,328 +42,17 @@ import imageio.v2 as imageio
 from collections import defaultdict
 import torch.nn.functional as F
 import argparse
+import time
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
-# ==============================
-# Soft Actor-Critic (SAC) Agent
-# ==============================
-import dataclasses
-from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Optional
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-
-try:
-    # reuse project factory functions
-    from url_benchmark.hugwbc_policy_network import create_hugwbc_policy, create_hugwbc_critic
-except Exception as e:
-    create_hugwbc_policy = None
-    create_hugwbc_critic = None
-
-class SquashedGaussianActor(nn.Module):
-    """Simple MLP squashed Gaussian actor.
-    Inputs are the concatenation of obs, optional z_vector and clock.
-    """
-    def __init__(self, in_dim: int, act_dim: int, hidden_dims=(256,256)):
-        super().__init__()
-        layers = []
-        last = in_dim
-        for h in hidden_dims:
-            layers += [nn.Linear(last, h), nn.ReLU(inplace=True)]
-            last = h
-        self.backbone = nn.Sequential(*layers)
-        self.mu = nn.Linear(last, act_dim)
-        self.log_std = nn.Linear(last, act_dim)
-    
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.backbone(x)
-        mu = self.mu(h)
-        log_std = self.log_std(h).clamp(-20, 2)  # SAC standard clamp
-        return mu, log_std
-    
-    def sample(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        mu, log_std = self(x)
-        std = log_std.exp()
-        # reparameterized sample
-        noise = torch.randn_like(mu)
-        pre_tanh = mu + std * noise
-        a = torch.tanh(pre_tanh)
-        # log prob with tanh correction
-        # log N(pre_tanh; mu, std)
-        log_prob = (-0.5 * ((pre_tanh - mu) / (std + 1e-8))**2
-                    - log_std
-                    - 0.5 * torch.log(torch.tensor(2 * torch.pi, device=x.device))).sum(-1, keepdim=True)
-        # tanh correction (stable form)
-        log_prob -= (2 * (torch.log(torch.tensor(2.0, device=x.device)) - pre_tanh - nn.functional.softplus(-2*pre_tanh))).sum(-1, keepdim=True)
-        return a, log_prob
-    
-    def act_inference(self, x: torch.Tensor) -> torch.Tensor:
-        mu, _ = self(x)
-        return torch.tanh(mu)
-
-
-@dataclass
-class HugWBCSACConfig:
-    _target_: str = "url_benchmark.hugwbc_offp_agent.HugWBCSACAgent"
-    name: str = "hugwbc_sac"
-    device: str = "cuda:0"
-    # training
-    gamma: float = 0.99
-    tau: float = 0.005
-    batch_size: int = 512
-    actor_lr: float = 3e-4
-    critic_lr: float = 3e-4
-    alpha_lr: float = 3e-4
-    init_temperature: float = 0.1
-    target_entropy_scale: float = 1.0  # 1.0 => -action_dim
-    # architecture
-    use_project_actor: bool = False  # True 时使用 create_hugwbc_policy
-    z_dim: int = 11
-    clock_dim: int = 0
-    horizon: int = 5
-    # dataset
-    data_dir: str = "/path/to/hugwbc/replay/buffer"
-    obs_horizon: int = 5
-    types: Tuple[str, ...] = ("walk", "turn", "stand")
-    max_episodes_per_type: Optional[int] = None
-    # logging
-    use_wandb: bool = False
-    wandb_project: str = "hugwbc_sac"
-    wandb_group: str = "experiments"
-    wandb_name: str = "hugwbc_sac_training"
-    log_dir: str = "./logs/hugwbc_sac"
-    num_epochs: int = 200
-    eval_every_epochs: int = 5
-    save_every_epochs: int = 10
-
-
-class DoubleQ(nn.Module):
-    """Wrap two critics that both take [privileged_obs, action] as input."""
-    def __init__(self, critic1: nn.Module, critic2: nn.Module):
-        super().__init__()
-        self.q1 = critic1
-        self.q2 = critic2
-    def forward(self, priv: torch.Tensor, act: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Expect both critics to accept concatenated inputs
-        x = torch.cat([priv, act], dim=-1)
-        return self.q1(x), self.q2(x)
-
-
-class HugWBCSACAgent:
-    def __init__(self, cfg: HugWBCSACConfig, dataset_cls=None) -> None:
-        self.cfg = cfg
-        self.device = torch.device(cfg.device)
-        # dataset（重用你的 SL 数据集包装；batch 必须包含 transitions）
-        if dataset_cls is None:
-            from url_benchmark.hilbert_dataset import HugWBCSLDataset as DefaultDataset
-            dataset_cls = DefaultDataset
-        dataset = dataset_cls(
-            data_dir=cfg.data_dir,
-            obs_horizon=cfg.obs_horizon,
-            types=cfg.types,
-            max_episodes_per_type=cfg.max_episodes_per_type,
-        )
-        self.data_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=8, pin_memory=True)
-        # networks 延迟到首个 batch 初始化（拿到维度）
-        self.actor = None
-        self.critic: Optional[DoubleQ] = None
-        self.critic_target: Optional[DoubleQ] = None
-        self.actor_opt = None
-        self.critic_opt = None
-        # temperature
-        self.log_alpha = torch.tensor(float(torch.log(torch.tensor(cfg.init_temperature))).item(), device=self.device, requires_grad=True)
-        self.alpha_opt = optim.Adam([self.log_alpha], lr=cfg.alpha_lr)
-        self.target_entropy = None  # 待拿到 act_dim 后设定
-
-    # ---------- helpers ----------
-    def _build_networks_from_batch(self, batch: Dict[str, torch.Tensor]):
-        # infer dimensions
-        obs = batch.get("obs").to(self.device)
-        act = batch.get("actions").to(self.device)
-        priv = batch.get("privileged_obs").to(self.device)
-        z = batch.get("z_vector", torch.zeros(obs.shape[0], 0, device=self.device)).to(self.device)
-        clock = batch.get("clock", torch.zeros(obs.shape[0], 0, device=self.device)).to(self.device)
-        act_dim = act.shape[-1]
-        # actor input uses regular observations + z + clock
-        actor_in_dim = obs.shape[-1] + z.shape[-1] + clock.shape[-1]
-        # critic uses privileged obs + action (内部拼接)
-        critic_in_dim = priv.shape[-1] + act_dim
-        # build actor
-        if self.cfg.use_project_actor and create_hugwbc_policy is not None:
-            self.actor = create_hugwbc_policy(z_dim=z.shape[-1], clock_dim=clock.shape[-1], horizon=self.cfg.horizon).to(self.device)
-            self.actor_is_project = True
-        else:
-            self.actor = SquashedGaussianActor(in_dim=actor_in_dim, act_dim=act_dim).to(self.device)
-            self.actor_is_project = False
-        # build double critics
-        if create_hugwbc_critic is None:
-            # fallback: 简单 MLP
-            def _mlp(dim_in):
-                return nn.Sequential(
-                    nn.Linear(dim_in, 256), nn.ReLU(inplace=True),
-                    nn.Linear(256, 256), nn.ReLU(inplace=True),
-                    nn.Linear(256, 1)
-                )
-            q1 = _mlp(critic_in_dim).to(self.device)
-            q2 = _mlp(critic_in_dim).to(self.device)
-        else:
-            # 优先传 input_dim，若工厂无此签名则退化为无参
-            try:
-                q1 = create_hugwbc_critic(input_dim=critic_in_dim).to(self.device)
-                q2 = create_hugwbc_critic(input_dim=critic_in_dim).to(self.device)
-            except TypeError:
-                q1 = create_hugwbc_critic().to(self.device)
-                q2 = create_hugwbc_critic().to(self.device)
-        self.critic = DoubleQ(q1, q2).to(self.device)
-        # target
-        import copy
-        self.critic_target = DoubleQ(copy.deepcopy(q1), copy.deepcopy(q2)).to(self.device)
-        for p in self.critic_target.parameters():
-            p.requires_grad = False
-        # optimizers
-        self.actor_opt = optim.Adam(self.actor.parameters(), lr=self.cfg.actor_lr)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=self.cfg.critic_lr)
-        # temperature
-        self.target_entropy = - self.cfg.target_entropy_scale * act_dim
-    
-    def _cat_actor_input(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        obs = batch["obs"].to(self.device)
-        parts = [obs]
-        if "z_vector" in batch:
-            parts.append(batch["z_vector"].to(self.device))
-        if "clock" in batch:
-            parts.append(batch["clock"].to(self.device))
-        return torch.cat(parts, dim=-1)
-
-    def _actor_sample(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.actor_is_project:
-            # 兼容项目 actor 的 API（若仅有 act_inference，则退化为确定性）
-            if hasattr(self.actor, "act"):
-                a, logp = self.actor.act(x)  # type: ignore
-            elif hasattr(self.actor, "sample"):
-                a, logp = self.actor.sample(x)  # type: ignore
-            else:
-                a = self.actor.act_inference(x) if hasattr(self.actor, "act_inference") else self.actor(x)[0]
-                logp = torch.zeros(a.shape[0], 1, device=a.device)
-        else:
-            a, logp = self.actor.sample(x)
-        return a, logp
-    
-    def _actor_infer(self, x: torch.Tensor) -> torch.Tensor:
-        if self.actor_is_project:
-            if hasattr(self.actor, "act_inference"):
-                return self.actor.act_inference(x)
-            elif hasattr(self.actor, "forward"):
-                mu, _ = self.actor(x)
-                return torch.tanh(mu)
-            else:
-                raise RuntimeError("Unknown project actor interface.")
-        else:
-            return self.actor.act_inference(x)
-    
-    # ---------- SAC updates ----------
-    def update(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        if self.actor is None:
-            self._build_networks_from_batch(batch)
-        metrics = {}
-        device = self.device
-        # to device
-        for k in list(batch.keys()):
-            if isinstance(batch[k], torch.Tensor):
-                batch[k] = batch[k].to(device)
-        obs = batch["obs"]
-        next_obs = batch.get("next_obs", None)
-        if next_obs is None and "obs_next" in batch:
-            next_obs = batch["obs_next"]
-        actions = batch["actions"]
-        rewards = batch.get("rewards", batch.get("reward")).unsqueeze(-1).float()
-        dones = batch.get("dones", batch.get("done")).unsqueeze(-1).float()
-        priv = batch["privileged_obs"]
-        priv_next = batch.get("next_privileged_obs", None)
-        if priv_next is None and "privileged_obs_next" in batch:
-            priv_next = batch["privileged_obs_next"]
-        # actor inputs
-        x = self._cat_actor_input(batch)
-        # next actor input
-        next_batch = dict(obs=next_obs)
-        if "z_vector" in batch: next_batch["z_vector"] = batch["z_vector"]
-        if "clock" in batch and "next_clock" in batch: next_batch["clock"] = batch["next_clock"]
-        elif "clock" in batch: next_batch["clock"] = batch["clock"]
-        x_next = self._cat_actor_input(next_batch)
-        # ---------------- Critic ----------------
-        with torch.no_grad():
-            a_next, logp_next = self._actor_sample(x_next)
-            q1_t, q2_t = self.critic_target(priv_next, a_next)
-            q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * logp_next
-            target_q = rewards + (1.0 - dones) * self.cfg.gamma * q_t
-        q1, q2 = self.critic(priv, actions)
-        critic_loss = nn.functional.mse_loss(q1, target_q) + nn.functional.mse_loss(q2, target_q)
-        self.critic_opt.zero_grad()
-        critic_loss.backward()
-        self.critic_opt.step()
-        metrics.update({
-            "loss/critic": critic_loss.item(),
-            "q1_mean": q1.mean().item(),
-            "q2_mean": q2.mean().item(),
-        })
-        # ---------------- Actor & Alpha ----------------
-        a, logp = self._actor_sample(x)
-        q1_pi, q2_pi = self.critic(priv, a)
-        q_pi = torch.min(q1_pi, q2_pi)
-        actor_loss = (self.log_alpha.exp() * logp - q_pi).mean()
-        self.actor_opt.zero_grad()
-        actor_loss.backward()
-        self.actor_opt.step()
-        # temperature
-        alpha_loss = (-(self.log_alpha) * (logp + self.target_entropy).detach()).mean()
-        self.alpha_opt.zero_grad()
-        alpha_loss.backward()
-        self.alpha_opt.step()
-        # ---------------- Target update ----------------
-        with torch.no_grad():
-            for p, p_targ in zip(self.critic.parameters(), self.critic_target.parameters()):
-                p_targ.data.mul_(1 - self.cfg.tau).add_(self.cfg.tau * p.data)
-        metrics.update({
-            "loss/actor": actor_loss.item(),
-            "loss/alpha": alpha_loss.item(),
-            "alpha": self.log_alpha.exp().item(),
-            "entropy": (-logp).mean().item(),
-        })
-        return metrics
-
-
-def train_sac(cfg: HugWBCSACConfig):
-    import time, os, math
-    agent = HugWBCSACAgent(cfg)
-    if cfg.use_wandb:
-        import wandb
-        wandb.init(project=cfg.wandb_project, group=cfg.wandb_group, name=cfg.wandb_name, config=dataclasses.asdict(cfg))
-    global_step = 0
-    for epoch in range(cfg.num_epochs):
-        log_sums = {}
-        num = 0
-        for batch in agent.data_loader:
-            metrics = agent.update(batch)
-            for k, v in metrics.items():
-                log_sums[k] = log_sums.get(k, 0.0) + float(v)
-            num += 1
-            global_step += 1
-        logs = {k: v / max(1, num) for k, v in log_sums.items()}
-        logs["epoch"] = epoch
-        logs["steps"] = global_step
-        if cfg.use_wandb:
-            import wandb
-            wandb.log(logs, step=global_step)
-        else:
-            print({k: round(v, 4) for k, v in logs.items()})
-        # TODO: 可按 cfg.save_every_epochs 保存 checkpoint
-    return agent
-
-
-
+@contextmanager
+def timer(name="Block"):
+    start = time.perf_counter()
+    yield
+    end = time.perf_counter()
+    print(f"[{name}] 耗时: {end - start:.4f} 秒")
 
 
 CANDATE_ENV_COMMANDS = {
@@ -447,13 +136,14 @@ class HugWBCBCAgent:
         # Create optimizer and scheduler
         self.optimizer = Adam(self.policy.parameters(), lr=cfg.lr)
         # self.scheduler = StepLR(self.optimizer, step_size=30, gamma=0.5)
+        with timer("Loading dataset"):
+            dataset = HugWBCSLDataset(
+                data_dir=cfg.data_dir,
+                obs_horizon=cfg.obs_horizon,
+                types=cfg.types,
+                max_episodes_per_type=cfg.max_episodes_per_type,
+            )
         
-        dataset = HugWBCSLDataset(
-            data_dir=cfg.data_dir,
-            obs_horizon=cfg.obs_horizon,
-            types=cfg.types,
-            max_episodes_per_type=cfg.max_episodes_per_type,
-        )
         train_dataset, val_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
         self.data_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=16, pin_memory=True)
         self.val_data_loader = DataLoader(val_dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=16, pin_memory=True)
@@ -707,6 +397,12 @@ class HugWBCBCAgent:
         """Main training loop."""
         logger.info("Starting HugWBC BC training...")
         os.makedirs(self.cfg.log_dir, exist_ok=True)
+        print("Data loader speed test")
+        num_batches = len(self.data_loader)
+        for batch in tqdm(self.data_loader, desc="Training", total=num_batches):
+            pass
+        print("Data loader speed test finished")
+
         
         # Training loop
         for epoch in range(self.cfg.num_epochs):

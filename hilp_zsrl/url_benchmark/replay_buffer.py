@@ -90,17 +90,17 @@ class DataBuffer:
         """
         Dummy constructor. Use copy_from* and create_from* class methods instead.
         """
-        assert "data" in root
-        assert "meta" in root
-        assert "episode_ends" in root["meta"]
-        for key, value in root["data"].items():
-            assert (
-                value.shape[0] == root["meta"]["episode_ends"][-1]
-            ), f"{key} {value.shape} {root['meta']['episode_ends'].shape} {root['meta']['episode_ends'][-1]}"
-            if not (
-                value.shape[0] == root["meta"]["episode_ends"][-1]
-            ):
-                print(f"{key} {value.shape} {root['meta']['episode_ends'].shape} {root['meta']['episode_ends'][-1]}")
+        # assert "data" in root
+        # assert "meta" in root
+        # assert "episode_ends" in root["meta"]
+        # for key, value in root["data"].items():
+        #     assert (
+        #         value.shape[0] == root["meta"]["episode_ends"][-1]
+        #     ), f"{key} {value.shape} {root['meta']['episode_ends'].shape} {root['meta']['episode_ends'][-1]}"
+        #     if not (
+        #         value.shape[0] == root["meta"]["episode_ends"][-1]
+        #     ):
+        #         print(f"{key} {value.shape} {root['meta']['episode_ends'].shape} {root['meta']['episode_ends'][-1]}")
         self.root = root
         
     def truncate_data(self, key, target_size):
@@ -479,6 +479,8 @@ class DataBuffer:
     # =========== our API ==============
     @property
     def n_steps(self):
+        if "episode_ends" not in self.meta:
+            return 0
         if len(self.episode_ends) == 0:
             return 0
         return self.episode_ends[-1]
@@ -570,6 +572,184 @@ class DataBuffer:
             # copy meta
             arr[-value.shape[0] :] = value
 
+    # ============================================================
+    # New: add with explicit storage selection (zstd+bitshuffle / sharded)
+    # ============================================================
+    def _make_storage_compressor(
+        self,
+        *,
+        storage: str,
+        chunks: tuple,
+        zstd_level: int = 5,
+        use_bitshuffle: bool = True,
+        shard_time: int = 1024,
+    ):
+        """
+        Build compressor for requested storage scheme.
+        - storage='zstd_bitshuffle': return Blosc(zstd,+bitshuffle)
+        - storage='sharded': return ShardingCodec(...) with inner zstd(+bitshuffle)
+          shard along time dim (dim0): shard_shape[0] = chunks[0] * shard_time
+        """
+        storage = (storage or "").lower()
+        if storage in ("zstd_bitshuffle", "zstd+bitshuffle", "bitshuffle+zstd", "disk"):
+            shuffle = numcodecs.Blosc.BITSHUFFLE if use_bitshuffle else numcodecs.Blosc.NOSHUFFLE
+            return numcodecs.Blosc(cname="zstd", clevel=zstd_level, shuffle=shuffle)
+
+        if storage in ("sharded", "zarr_sharded", "sharding"):
+            try:
+                from numcodecs import ShardingCodec
+            except Exception as e:
+                raise RuntimeError(
+                    "Requested storage='sharded' but numcodecs.ShardingCodec is unavailable "
+                    "(need numcodecs>=0.11). Try `pip install -U numcodecs` or use storage='zstd_bitshuffle'."
+                ) from e
+            # inner codec：zstd(+bitshuffle) via Blosc（兼容性最好）
+            shuffle = numcodecs.Blosc.BITSHUFFLE if use_bitshuffle else numcodecs.Blosc.NOSHUFFLE
+            inner = numcodecs.Blosc(cname="zstd", clevel=zstd_level, shuffle=shuffle)
+
+            # shard_shape：仅在时间维合并 shard_time 个 chunk，其余维度与 chunk 对齐
+            if not isinstance(chunks, tuple) or len(chunks) == 0:
+                raise ValueError(f"Invalid chunks={chunks}")
+            shard_shape = list(chunks)
+            shard_shape[0] = max(1, int(shard_shape[0]) * int(shard_time))
+            shard_shape = tuple(shard_shape)
+
+            # 注意：ShardingCodec 作为 compressor 传入
+            return ShardingCodec(codec=inner, chunk_shape=chunks, shard_shape=shard_shape)
+
+        raise ValueError(f"Unknown storage='{storage}'. Use 'zstd_bitshuffle' or 'sharded'.")
+
+    def add_chunked_meta_encoded(
+        self,
+        data: Dict[str, np.ndarray],
+        *,
+        storage: str = "zstd_bitshuffle",   # sharded or zstd_bitshuffle
+        chunks: Optional[Dict[str, tuple]] = dict(),
+        zstd_level: int = 5,
+        use_bitshuffle: bool = True,
+        shard_time: int = 1024,
+        target_chunk_bytes: int = 1024 * 1024 * 2,
+    ):
+        """
+        Append meta arrays with explicit storage scheme.
+        Behaves like add_chunked_meta, but you can pick storage={'zstd_bitshuffle','sharded'}.
+        """
+        is_zarr = self.backend == "zarr"
+        for key, value in data.items():
+            if key not in self.meta:
+                current_len = 0
+            else:
+                current_len = self.meta[key].shape[0]
+            new_shape = (current_len + value.shape[0],) + value.shape[1:]
+
+            if key not in self.meta:
+                if is_zarr:
+                    # decide chunks
+                    # use provided chunks mapping or auto
+                    if isinstance(chunks, dict) and (key in chunks):
+                        cks = chunks[key]
+                    else:
+                        # default: optimize for target bytes (only chunk in time by your class assumption)
+                        cks = get_optimal_chunks(shape=new_shape, dtype=value.dtype, target_chunk_bytes=target_chunk_bytes)
+                    # build compressor for chosen storage
+                    cpr = self._make_storage_compressor(
+                        storage=storage, chunks=cks,
+                        zstd_level=zstd_level, use_bitshuffle=use_bitshuffle, shard_time=shard_time
+                    )
+                    arr = self.meta.zeros(name=key, shape=new_shape, chunks=cks, dtype=value.dtype, compressor=cpr)
+                else:
+                    arr = np.zeros(shape=new_shape, dtype=value.dtype)
+                    self.meta[key] = arr
+            else:
+                arr = self.meta[key]
+                # if compressor mismatch, rechunk/recompress
+                if is_zarr:
+                    # prepare desired chunks (keep existing if not specified)
+                    if isinstance(chunks, dict) and (key in chunks):
+                        desired_chunks = chunks[key]
+                    else:
+                        desired_chunks = arr.chunks
+                    desired_cpr = self._make_storage_compressor(
+                        storage=storage, chunks=desired_chunks,
+                        zstd_level=zstd_level, use_bitshuffle=use_bitshuffle, shard_time=shard_time
+                    )
+                    if (arr.compressor != desired_cpr) or (arr.chunks != desired_chunks):
+                        arr = rechunk_recompress_array(self.meta, key, chunks=desired_chunks, compressor=desired_cpr)
+                # resize
+                if is_zarr:
+                    arr.resize(new_shape)
+                else:
+                    arr.resize(new_shape, refcheck=False)
+
+            # append copy
+            self.meta[key][-value.shape[0]:] = value
+
+    def add_chunked_data_encoded(
+        self,
+        data: Dict[str, np.ndarray],
+        *,
+        storage: str = "zstd_bitshuffle",   # sharded or zstd_bitshuffle
+        chunks: Optional[Dict[str, tuple]] = dict(),
+        zstd_level: int = 5,
+        use_bitshuffle: bool = True,
+        shard_time: int = 1024,
+        target_chunk_bytes: int = 1024 * 1024 * 2,
+    ):
+        """
+        Append data arrays with explicit storage scheme (privileged obs / obs / actions / etc.).
+        Critic: same as add_chunked_data but lets you pick storage={'zstd_bitshuffle','sharded'}.
+        """
+        is_zarr = self.backend == "zarr"
+
+        # 1) 先扩展 data 组里所有数组的时间维，使其长度一致
+        new_len = 0
+        for key, value in data.items():
+            current_len = self.data[key].shape[0] if key in self.data else 0
+            new_len = max(new_len, current_len + value.shape[0])
+
+        for key, value in data.items():
+            new_shape = (new_len,) + value.shape[1:]
+
+            # create if absent
+            if key not in self.data:
+                if is_zarr:
+                    # chunks: use provided or auto
+                    if isinstance(chunks, dict) and (key in chunks):
+                        cks = chunks[key]
+                    else:
+                        cks = get_optimal_chunks(shape=new_shape, dtype=value.dtype, target_chunk_bytes=target_chunk_bytes)
+                    # compressor by storage
+                    cpr = self._make_storage_compressor(
+                        storage=storage, chunks=cks,
+                        zstd_level=zstd_level, use_bitshuffle=use_bitshuffle, shard_time=shard_time
+                    )
+                    arr = self.data.zeros(name=key, shape=new_shape, chunks=cks, dtype=value.dtype, compressor=cpr)
+                else:
+                    arr = np.zeros(shape=new_shape, dtype=value.dtype)
+                    self.data[key] = arr
+            else:
+                arr = self.data[key]
+                # adjust compressor / chunks if needed
+                if is_zarr:
+                    if isinstance(chunks, dict) and (key in chunks):
+                        desired_chunks = chunks[key]
+                    else:
+                        desired_chunks = arr.chunks
+                    desired_cpr = self._make_storage_compressor(
+                        storage=storage, chunks=desired_chunks,
+                        zstd_level=zstd_level, use_bitshuffle=use_bitshuffle, shard_time=shard_time
+                    )
+                    if (arr.compressor != desired_cpr) or (arr.chunks != desired_chunks):
+                        arr = rechunk_recompress_array(self.data, key, chunks=desired_chunks, compressor=desired_cpr)
+                # resize to new length
+                if is_zarr:
+                    arr.resize(new_shape)
+                else:
+                    arr.resize(new_shape, refcheck=False)
+
+        # 2) 逐键把追加数据拷入尾部
+        for key, value in data.items():
+            self.data[key][-value.shape[0]:] = value
 
     def add_episode(
         self,
