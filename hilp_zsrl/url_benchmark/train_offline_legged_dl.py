@@ -35,7 +35,7 @@ from tqdm import tqdm
 import logging
 import warnings
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore', category=DeprecationWarning)  # 屏蔽冗余的弃用告警
 
 import json
@@ -56,7 +56,7 @@ import torch
 from dm_env import specs
 from url_benchmark import utils
 from url_benchmark import agent as agents
-from url_benchmark.logger import Logger
+# from url_benchmark.logger import Logger
 from gym import spaces
 from url_benchmark.replay_buffer import DataBuffer
 from url_benchmark.hilbert_dataset import HilbertRepresentationDatasetLegacy, HilbertRepresentationDataset
@@ -293,7 +293,8 @@ class Workspace:
         utils.set_seed_everywhere(cfg.seed)
         if not torch.cuda.is_available():
             if cfg.device != "cpu":
-                logger.warning(f"Falling back to cpu as {cfg.device} is not available")
+                print(f"Falling back to cpu as {cfg.device} is not available")
+                # logger.warning(f"Falling back to cpu as {cfg.device} is not available")
                 cfg.device = "cpu"
                 cfg.agent.device = "cpu"
         self.device = torch.device(cfg.device)
@@ -327,8 +328,8 @@ class Workspace:
         os.makedirs(self.work_dir, exist_ok=True)
         print(f'Workspace: {self.work_dir}')
         print(f'Running code in : {Path(__file__).parent.resolve().absolute()}')
-        logger.info(f'Workspace: {self.work_dir}')
-        logger.info(f'Running code in : {Path(__file__).parent.resolve().absolute()}')  
+        # logger.info(f'Workspace: {self.work_dir}')
+        # logger.info(f'Running code in : {Path(__file__).parent.resolve().absolute()}')  
 
         wandb_output_dir = tempfile.mkdtemp()
         cfg_dict = omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
@@ -963,7 +964,8 @@ class Workspace:
 
         保存内容包含：agent、global_step、global_episode、replay_loader（可被 only/exclude 调整）。
         """
-        logger.info(f"Saving checkpoint to {fp}")
+        # logger.info(f"Saving checkpoint to {fp}")
+        print(f"Saving checkpoint to {fp}")
         fp = Path(fp)
         fp.parent.mkdir(exist_ok=True, parents=True)
         # this is just a dumb security check to not forget about it
@@ -977,7 +979,7 @@ class Workspace:
         - only：仅恢复指定键（例如只加载 replay_loader）。
         - use_pixels：当使用像素观测时，将存储中的 'pixel' 字段重命名为 'observation'。
         """
-        print(f"loading checkpoint from {fp}")
+        print(f"Loading checkpoint from {fp}")
         fp = Path(fp)
         with fp.open('rb') as f:
             payload = torch.load(f)
@@ -987,14 +989,16 @@ class Workspace:
             del payload._storage['pixel']
             payload._batch_names.remove('pixel')
         for name, val in payload.items():
-            logger.info("Reloading %s from %s", name, fp)
+            # logger.info("Reloading %s from %s", name, fp)
+            print(f"Reloading {name} from {fp}")
             if name == "agent":
                 self.agent.init_from(val)
             else:
                 assert hasattr(self, name)
                 setattr(self, name, val)
                 if name == "global_episode":
-                    logger.warning(f"Reloaded agent at global episode {self.global_episode}")
+                    print(f"Reloaded agent at global episode {self.global_episode}")
+                    # logger.warning(f"Reloaded agent at global episode {self.global_episode}")
 
 
 @hydra.main(config_path='.', config_name='base_config')

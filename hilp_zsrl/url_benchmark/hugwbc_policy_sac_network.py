@@ -493,6 +493,28 @@ class HugWBCPolicyNetwork(nn.Module):
         if len(observations.shape) == 2:
             observations = observations.reshape(observations.shape[0], self.max_length, -1)
         return self.actor(observations, z_vector, privileged_obs, sync_update=sync_update, **kwargs)
+
+    # for sac
+    def sample_and_logprob(self, observations, z_vector,
+                        privileged_obs=None, sync_update=False,
+                        squash: bool = True, action_scale: Optional[torch.Tensor] = None,
+                        eps: float = 1e-6, **kwargs):
+        if len(observations.shape) == 2:
+            observations = observations.reshape(observations.shape[0], self.max_length, -1)
+        self.update_distribution(observations, z_vector, privileged_obs, sync_update=sync_update, **kwargs)
+
+        u = self.distribution.rsample()  # 关键：rsample
+        if squash:
+            a = torch.tanh(u)
+            logp = self.distribution.log_prob(u).sum(-1) - torch.log(1 - a.pow(2) + eps).sum(-1)
+            if action_scale is not None:
+                a = a * action_scale
+                logp = logp - torch.log(action_scale).sum()  # 常数项
+        else:
+            a = u
+            logp = self.distribution.log_prob(u).sum(-1)
+        return a, logp
+
     
     def update_distribution(self, 
                           observations: torch.Tensor,
@@ -566,21 +588,21 @@ class HugWBCPolicyNetwork(nn.Module):
             observations = observations.reshape(observations.shape[0], self.max_length, -1)
         actions_mean = self.actor(observations, z_vector, **kwargs)
         return actions_mean, self.actor.z
-    
-    def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
-        """Get log probabilities of actions.
         
-        Args:
-            actions: Actions to evaluate
-                    Shape: [batch, act_dim]
-            
-        Returns:
-            log_probs: Log probabilities of actions
-                      Shape: [batch]
-        """
+    def get_actions_log_prob(self, actions: torch.Tensor, already_squashed: bool = False,
+                            action_scale: Optional[torch.Tensor] = None, eps: float = 1e-6) -> torch.Tensor:
         if self.distribution is None:
             raise RuntimeError("Must call update_distribution first")
-        return self.distribution.log_prob(actions).sum(dim=-1)
+        if already_squashed:
+            # 反挤压回 u，再算 logp + Jacobian（需要裁剪避免数值溢出）
+            a = actions
+            if action_scale is not None: a = a / action_scale
+            a = torch.clamp(a, -1 + 1e-6, 1 - 1e-6)
+            u = 0.5 * (torch.log1p(a + eps) - torch.log1p(-a + eps))  # atanh
+            logp = self.distribution.log_prob(u).sum(-1) - torch.log(1 - a.pow(2) + eps).sum(-1)
+        else:
+            logp = self.distribution.log_prob(actions).sum(-1)
+        return logp
     
     @property
     def action_mean(self) -> torch.Tensor:

@@ -172,6 +172,7 @@ class HilbertRepresentationDataset(Dataset):
                     self._step_index.append((buf_id, t, ep_end - 1))
 
         self.total_samples = len(self._step_index)
+        self._step_index = np.asarray(self._step_index, dtype=np.int32)
         # infer action dim if loaded
         self.action_dim: Optional[int] = None
         if self._full_loading:
@@ -193,7 +194,7 @@ class HilbertRepresentationDataset(Dataset):
         if self._full_loading:
             if not use_history_action:
                 new_buffer_dict['actions'] = buf['actions'][:]
-            new_buffer_dict['rewards'] = buf['rewards'][:]
+            # new_buffer_dict['rewards'] = buf['rewards'][:]
             new_buffer_dict['privileged_obs'] = buf['privileged'][:, :3]
             if self._load_command:
                 new_buffer_dict['commands'] = buf['commands'][:]
@@ -213,18 +214,42 @@ class HilbertRepresentationDataset(Dataset):
         horizon_end = t + 1
         proprio = buf['proprio'][horizon_start:horizon_end]
         valid_len = proprio.shape[0]
+        # if self.use_history_action:
+        #     history_action = np.zeros((valid_len, buf['actions'].shape[-1]))
+        #     if valid_len > 1:
+        #         his_a_start = max(ep_start, t - self.req_horizon)
+        #         his_a_end = t
+        #         history_len = his_a_end - his_a_start
+        #         history_action[-history_len:] = buf['actions'][his_a_start:his_a_end]
+        #     obs = np.concatenate([proprio, history_action], axis=-1)
+        # else:
+        #     obs = proprio
+        # if valid_len < self.req_horizon:
+        #     obs = np.concatenate([buf['ep_start_obs'][ep_id, -(self.req_horizon - valid_len):, :obs.shape[-1]], obs], axis=0)
+        # return obs.reshape(-1)
         if self.use_history_action:
-            history_action = np.zeros((valid_len, buf['actions'].shape[-1]))
+            # 预分配 + 原地写，避免 concatenate
+            act_dim = buf["actions"].shape[-1]
+            obs = np.empty((self.req_horizon, proprio.shape[-1] + act_dim), dtype=proprio.dtype)
+            # 前段可能需要 pad ep_start_obs
+            pad = self.req_horizon - valid_len
+            obs[pad:pad+valid_len, :proprio.shape[-1]] = proprio
+            # history actions
+            obs[:, proprio.shape[-1]:] = 0
             if valid_len > 1:
                 his_a_start = max(ep_start, t - self.req_horizon)
                 his_a_end = t
-                history_len = his_a_end - his_a_start
-                history_action[-history_len:] = buf['actions'][his_a_start:his_a_end]
-            obs = np.concatenate([proprio, history_action], axis=-1)
+                history = buf["actions"][his_a_start:his_a_end]
+                obs[-history.shape[0]:, proprio.shape[-1]:] = history
+            if pad > 0:
+                obs[:pad] = buf["ep_start_obs"][ep_id, -pad:, :obs.shape[-1]]
         else:
-            obs = proprio
-        if valid_len < self.req_horizon:
-            obs = np.concatenate([buf['ep_start_obs'][ep_id, -(self.req_horizon - valid_len):, :obs.shape[-1]], obs], axis=0)
+            obs = np.empty((self.req_horizon, proprio.shape[-1]), dtype=proprio.dtype)
+            pad = self.req_horizon - valid_len
+            obs[pad:pad+valid_len] = proprio
+            if pad > 0:
+                obs[:pad] = buf["ep_start_obs"][ep_id, -pad:, :obs.shape[-1]]
+
         return obs.reshape(-1)
 
     def __getitem__(self, idx):
@@ -247,19 +272,19 @@ class HilbertRepresentationDataset(Dataset):
             goal_obs_t = future_obs_t
 
         out = {
-            'obs': obs_t,
-            'next_obs': next_obs_t,
-            'future_obs': goal_obs_t,
+            'obs': obs_t.astype(np.float32),
+            'next_obs': next_obs_t.astype(np.float32),
+            'future_obs': goal_obs_t.astype(np.float32),
         }
 
         if self._full_loading:
-            out['actions'] = buf['actions'][t]
-            out['rewards'] = buf['rewards'][t]
-            out['privileged_obs'] = buf['privileged_obs'][t]
+            out['actions'] = buf['actions'][t].astype(np.float32)
+            # out['rewards'] = buf['rewards'][t]
+            out['privileged_obs'] = buf['privileged_obs'][t].astype(np.float32)
             if "commands" in buf:
-                out['commands'] = buf['commands'][t]
+                out['commands'] = buf['commands'][t].astype(np.float32)
         if self._discount is not None:
-            out['discount'] = self._discount
+            out['discount'] = self._discount.astype(np.float32)
         return out
    
 
@@ -332,7 +357,7 @@ class HilbertRepresentationDatasetLegacy(Dataset):
             max_eps = min(max_eps, num_eps_total)
             for ep_idx in range(max_eps):
                 ep_end = int(ep_ends[ep_idx])
-                ep_start = 0 if ep_idx == 0 else ep_ends[ep_idx - 1] + ep_start_delta
+                ep_start = 0 if ep_idx == 0 else ep_ends[ep_idx - 1]
                 ep_len = ep_end - ep_start
                 if ep_len < self.req_horizon:
                     continue

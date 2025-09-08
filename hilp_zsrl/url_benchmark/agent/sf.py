@@ -676,13 +676,6 @@ class SFAgent:
         # compute target successor measure
         if not self.cfg.train_phi_only:
             with torch.no_grad():
-                # if self.cfg.boltzmann:
-                #     dist = self.actor(next_obs, z)
-                #     next_action = dist.sample()
-                # else:
-                #     stddev = utils.schedule(self.cfg.stddev_schedule, step)
-                #     dist = self.actor(next_obs, z, stddev)
-                #     next_action = dist.sample(clip=self.cfg.stddev_clip)
                 self.actor.update_distribution(next_obs, z)
                 dist = self.actor.distribution
                 next_action = dist.sample()
@@ -755,13 +748,6 @@ class SFAgent:
 
     def update_actor(self, obs: torch.Tensor, z_hilbert: torch.Tensor, z_actor: torch.Tensor, step: int, privileged_obs: torch.Tensor, is_train: bool = True) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
-        # if self.cfg.boltzmann:
-        #     dist = self.actor(obs, z)
-        #     action = dist.rsample()
-        # else:
-        #     stddev = utils.schedule(self.cfg.stddev_schedule, step)
-        #     dist = self.actor(obs, z, stddev)
-        #     action = dist.sample(clip=self.cfg.stddev_clip)
         self.actor.update_distribution(obs, z_actor, privileged_obs, sync_update=True)
         dist = self.actor.distribution
         action = dist.rsample()

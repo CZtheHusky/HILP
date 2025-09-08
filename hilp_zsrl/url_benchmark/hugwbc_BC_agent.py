@@ -229,7 +229,7 @@ class HugWBCBCAgent:
             'privileged_recon_loss': privileged_recon_loss.item(),
             'total_loss': total_loss.item(),
             'log_prob_mean': log_probs.mean().item(),
-            'log_prob_std': log_probs.std().item(),
+            # 'log_prob_std': log_probs.std().item(),
             'mse_loss': mse_loss.item(),
         }
         
