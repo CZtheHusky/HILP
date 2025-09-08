@@ -471,7 +471,12 @@ class DataBuffer:
         return self.data.items()
 
     def __getitem__(self, key):
-        return self.data[key]
+        if key in self.meta and key in self.data:
+            raise ValueError(f"key {key} in both meta and data")
+        if key in self.data:
+            return self.data[key]
+        else:
+            return self.meta[key]
 
     def __contains__(self, key):
         return key in self.data

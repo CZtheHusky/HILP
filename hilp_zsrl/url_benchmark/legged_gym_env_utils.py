@@ -53,6 +53,9 @@ def build_isaac_namespace(
         device=sim_device,                 # 某些仓库会读这个
         capture_video=False,
         force_render=not headless,         # 有些示例用它来强制创建图形上下文
+        rl_device=sim_device,
+        horovod=False,
+        sim_joystick=False,
     )
 
 

@@ -15,11 +15,11 @@ pip install -r requirements.txt
 
 ## Examples
 ```
-CUDA_VISIBLE_DEVICES=6 python train_hilp_feature.py  --data_dir /root/workspace/HugWBC/collected_trajectories_v2  --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50
+CUDA_VISIBLE_DEVICES=6 python train_hilp_feature.py  --data_dir /root/workspace/HugWBC/dataset/collected_trajectories_v2  --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50
 
-CUDA_VISIBLE_DEVICES=5 python train_hilp_feature.py  --data_dir /root/workspace/HugWBC/collected_trajectories_v2  --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50 --gamma 0.965
+CUDA_VISIBLE_DEVICES=5 python train_hilp_feature.py  --data_dir /root/workspace/HugWBC/dataset/collected_trajectories_v2  --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50 --gamma 0.965
 
-CUDA_VISIBLE_DEVICES=4 python train_hilp_feature.py  --data_dir /root/workspace/HugWBC/collected_trajectories_v2  --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50 --gamma 0.97
+CUDA_VISIBLE_DEVICES=4 python train_hilp_feature.py  --data_dir /root/workspace/HugWBC/dataset/collected_trajectories_v2  --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50 --gamma 0.97
 
 CUDA_VISIBLE_DEVICES=7 python train_hilp_feature.py  --load_replay_buffer /root/workspace/exorl/datasets/walker/rnd/replay.pt --discount 0.98   --future 0.99   --p_randomgoal 0.375 --epochs 100 --batch_size 2048   --learning_rate 5e-4   --device auto --wandb --z_dim 50
 

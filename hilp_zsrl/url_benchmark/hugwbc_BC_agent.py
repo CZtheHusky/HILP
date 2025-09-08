@@ -557,14 +557,14 @@ parse.add_argument("--use_neg_logp", action="store_true", default=False, help="W
 parse.add_argument("--use_mse", action="store_true", default=False, help="Whether to use mean square error loss.")
 parse.add_argument("--pretrained", action="store_true", default=False, help="Whether to use pretrained model.")
 parse.add_argument("--log_dir", type=str, default="hugwbc_bc", help="Path to logs.")
-parse.add_argument("--data_dir", type=str, default="/root/workspace/HugWBC/collected_trajectories_v2", help="Path to data.")
+parse.add_argument("--data_dir", type=str, default="/root/workspace/HugWBC/dataset/collected_trajectories_v2", help="Path to data.")
 
 # python ./url_benchmark/hugwbc_BC_agent.py --device cuda:0 --use_neg_logp --log_dir hugwbc_bc_neg_mse --use_mse
 # python ./url_benchmark/hugwbc_BC_agent.py --device cuda:1 --use_neg_logp --pretrained --log_dir hugwbc_bc_neg_pretrain_mse --use_mse
 # python ./url_benchmark/hugwbc_BC_agent.py --device cuda:1 --use_neg_logp --pretrained --log_dir hugwbc_bc_neg_pretrain
 # python ./url_benchmark/hugwbc_BC_agent.py --device cuda:2 --pretrained --log_dir hugwbc_bc_pretrain_mse --use_mse
 # python ./url_benchmark/hugwbc_BC_agent.py --device cuda:3 --log_dir hugwbc_bc_mse
-# python ./url_benchmark/hugwbc_BC_agent.py --device cuda:0 --use_neg_logp  --use_mse  --log_dir hugwbc_bc_neg_mse_large --data_dir /root/workspace/HugWBC/collected_large
+# python ./url_benchmark/hugwbc_BC_agent.py --device cuda:0 --use_neg_logp  --use_mse  --log_dir hugwbc_bc_neg_mse_large --data_dir /root/workspace/HugWBC/dataset/collected_large
 
 
 

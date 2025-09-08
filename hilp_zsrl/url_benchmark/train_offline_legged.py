@@ -59,9 +59,18 @@ from gym import spaces
 from url_benchmark.replay_buffer import DataBuffer
 from isaacgym import gymapi
 from url_benchmark.legged_gym_env_utils import build_isaac_namespace, _to_rgb_frame
+import matplotlib.pyplot as plt
 
 def _safe_set_viewer_cam(env, pos, look, track_index=0):
     env.set_camera(pos, look, track_index)
+
+# calculate the cosine similarity of a trajectory
+def get_cosine_sim(array: np.ndarray) -> np.ndarray:
+    assert len(array.shape) == 2
+    norms = np.linalg.norm(array, axis=-1, keepdims=True)
+    norms = np.where(norms == 0, 1e-12, norms)  # 防止除零
+    unit = array / norms
+    return unit @ unit.T
 
 @dataclasses.dataclass
 class Config:
@@ -75,7 +84,7 @@ class Config:
     run_group: str = "Debug"
     seed: int = 1
     device: str = "cuda"
-    example_replay_path: str = "/root/workspace/HugWBC/example_trajectories"
+    example_replay_path: str = "/root/workspace/HugWBC/dataset/example_trajectories"
     use_tb: bool = False
     use_wandb: bool = True
     # experiment
@@ -182,7 +191,7 @@ class Workspace:
                 exp_name += f's_{os.environ["SLURM_JOB_ID"]}.'
             if 'SLURM_PROCID' in os.environ:
                 exp_name += f'{os.environ["SLURM_PROCID"]}.'
-            exp_name += '_'.join([cfg.agent.name, self.domain, str(self.cfg.discount), str(self.cfg.future), str(self.cfg.p_randomgoal), str(self.cfg.agent.hilp_expectile), str(self.cfg.agent.hilp_discount), str(self.cfg.agent.q_loss), str(self.cfg.agent.command_injection), str(self.cfg.agent.mix_ratio), str(self.cfg.use_history_action), str(self.cfg.agent.z_dim)
+            exp_name += '_'.join([cfg.agent.name, self.domain, str(self.cfg.discount), f"f{str(self.cfg.future)}", f"pr{str(self.cfg.p_randomgoal)}", f"phi_expectile{str(self.cfg.agent.hilp_expectile)}", f"phi_g{str(self.cfg.agent.hilp_discount)}", f"ql{str(self.cfg.agent.q_loss)}", str(self.cfg.agent.command_injection), f"mix{str(self.cfg.agent.mix_ratio)}", str(self.cfg.use_history_action), str(self.cfg.agent.z_dim), self.cfg.load_replay_buffer.split("/")[-1], f"phih{str(self.cfg.agent.phi_hidden_dim)}"
             ])
 
             wandb_output_dir = tempfile.mkdtemp()
@@ -221,6 +230,7 @@ class Workspace:
         print("Obs dim per time step: ", self.obs_dim)
         agent_cfg = self.cfg.agent
         agent_cfg.obs_shape = (flatten_obs_dim,)
+        agent_cfg.critic_obs_shape = (flatten_obs_dim,)
         self.agent = make_agent(cfg.obs_type,
                                 cfg.image_wh,
                                 specs.Array(shape=(self.flatten_obs_dim,), dtype=np.float32, name='obs'),
@@ -228,11 +238,20 @@ class Workspace:
                                 cfg.num_seed_frames // cfg.action_repeat,
                                 agent_cfg)
         self.example_data_buffers = {}
+        self.target_traj_idx = {}
+        self.raw_cosine_sim = {}
+        self.raw_diff_cosine_sim = {}
         for dirn in os.listdir(self.cfg.example_replay_path):
             full_path = os.path.join(self.cfg.example_replay_path, dirn)
             commandn = dirn.split('.')[0]
             example_data_buffer = DataBuffer.copy_from_path(full_path)
             self.example_data_buffers[commandn] = example_data_buffer
+            episode_ends = example_data_buffer.episode_ends[:]
+            episode_lengths = np.diff(episode_ends)
+            max_traj_idx = np.argmax(episode_lengths)
+            ep_start = 0 if max_traj_idx == 0 else episode_ends[max_traj_idx - 1]
+            ep_end = episode_ends[max_traj_idx]
+            self.target_traj_idx[commandn] = (max_traj_idx, ep_start, ep_end)
         self._checkpoint_filepath = self.work_dir / "models" / "latest.pt"
         if self._checkpoint_filepath.exists():
             self.load_checkpoint(self._checkpoint_filepath)
@@ -333,7 +352,6 @@ class Workspace:
         return next_obs_t[torch.argmax(reward_t)].detach().cpu().numpy()
 
     def train(self):
-        """主训练循环：反复从 ReplayBuffer 采样并调用 agent.update 进行训练，周期性评估与保存。"""
         if self.cfg.eval_only:
             if self.cfg.load_model is not None and not self.cfg.load_model.endswith('.pt'):
                 ckpts = os.listdir(self.cfg.load_model)
@@ -341,9 +359,9 @@ class Workspace:
                 ckpts.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
                 for ckpt in ckpts:
                     self.load_checkpoint(os.path.join(self.cfg.load_model, ckpt), exclude=["replay_loader"])
-                    self.eval(self.global_step)
+                    self.eval()
             else:
-                self.eval(self.global_step)
+                self.eval()
             return
 
         train_until_step = utils.Until(self.cfg.num_grad_steps)
@@ -353,7 +371,6 @@ class Workspace:
         while train_until_step(self.global_step):
             # try to evaluate
             if eval_every_step(self.global_step):
-                self.logger.log('eval_total_time', self.timer.total_time(), self.global_step)
                 self.eval()
 
             metrics = self.agent.update(self.replay_loader, self.global_step)
@@ -375,7 +392,7 @@ class Workspace:
                 _checkpoint_filepath = self.work_dir / "models" / f"{self.global_step}.pt"
                 self.save_checkpoint(_checkpoint_filepath, exclude=["replay_loader"])
         if self.cfg.checkpoint_every != 0:
-            self.save_checkpoint(self._checkpoint_filepath, exclude=["replay_loader"])  # make sure we save the final checkpoint
+            self.save_checkpoint(self._checkpoint_filepath)  # make sure we save the final checkpoint
             
     def _proprocess_obs(self, obs):
         pure_obs = obs[..., :self.obs_dim].reshape(1, -1)                
@@ -388,20 +405,67 @@ class Workspace:
         return pure_obs, obs_command
 
     def eval(self):
-        commands_horizons = [10, 20, 40, 80, 160]
+        self.agent.feature_learner.eval()
+        commands_horizons = [10, 20, 40, 80]
         eval_time = 10
-        video_save_parent = self.work_dir / "models" / f"{self.global_step}"
+        video_save_parent = self.work_dir / "eval_result" / f"{self.global_step}"
         os.makedirs(video_save_parent, exist_ok=True)
         eval_steps = int(eval_time / self.eval_env.dt)
         eval_results = {'env_rewards': [], 'z_rewards': [], 'env_rewards_raw_cmd': [], 'z_rewards_raw_cmd': [], 'ep_len': [], 'ep_len_raw_cmd': []}
-        if self.cfg.agent.command_injection:
+        image_save_parent = video_save_parent / "images"
+        os.makedirs(image_save_parent, exist_ok=True)
+        for key, data_buffer in self.example_data_buffers.items():
+            command_name = key
+            state_trajectorys = data_buffer.data['proprio'][..., :self.obs_dim]
+            traj_idx, ep_start, ep_end = self.target_traj_idx[command_name]
+            traj = state_trajectorys[ep_start:ep_end]
+            traj = traj.reshape(traj.shape[0], -1)
+            z, hilbert_traj = self.agent.get_traj_meta(traj)  # (traj_len, z_dim)
+            # draw a hot map of z, with metric as the cosine similarity between all z of different time steps
+            if command_name not in self.raw_cosine_sim:
+                self.raw_cosine_sim[command_name] = get_cosine_sim(traj)
+                self.raw_diff_cosine_sim[command_name] = get_cosine_sim(np.diff(traj, axis=0))
+            raw_cos_sim = self.raw_cosine_sim[command_name]
+            raw_diff_cos_sim = self.raw_diff_cosine_sim[command_name]
+            hilbert_cos_sim = get_cosine_sim(hilbert_traj)
+            z_cos_sim = get_cosine_sim(z)
+            fig, axs = plt.subplots(2, 2, figsize=(10, 8), dpi=400, constrained_layout=True)
+            common = dict(
+                vmin=-1, vmax=1, cmap='coolwarm',
+                origin='lower', aspect='auto', interpolation='nearest'
+            )
+
+            im00 = axs[0, 0].imshow(raw_cos_sim, **common)
+            axs[0, 0].set_title('raw state cosine similarity')
+            axs[0, 0].set_xlabel('time step'); axs[0, 0].set_ylabel('time step')
+
+            im01 = axs[0, 1].imshow(raw_diff_cos_sim, **common)
+            axs[0, 1].set_title('Δ raw state (t vs t-1) cosine similarity')
+            axs[0, 1].set_xlabel('time step'); axs[0, 1].set_ylabel('time step')
+
+            im10 = axs[1, 0].imshow(hilbert_cos_sim, **common)
+            axs[1, 0].set_title('Hilbert(traj) cosine similarity')
+            axs[1, 0].set_xlabel('time step'); axs[1, 0].set_ylabel('time step')
+
+            im11 = axs[1, 1].imshow(z_cos_sim, **common)
+            axs[1, 1].set_title('z cosine similarity')
+            axs[1, 1].set_xlabel('time step'); axs[1, 1].set_ylabel('time step')
+
+            # 共享色条：用同一标尺比较四张图
+            fig.colorbar(im11, ax=axs, location='right', shrink=0.9, label='cosine similarity')
+
+            fig.suptitle(f'{command_name}  ep={traj_idx}')
+            fig.savefig(f"{image_save_parent}/cos_sims_{command_name}_{traj_idx}.png", bbox_inches='tight')
+            plt.close(fig)
+
+        if self.cfg.agent.command_injection or self.cfg.agent.use_raw_command:
             for key, data_buffer in self.example_data_buffers.items():
                 command_name = key  
                 env_commands = data_buffer.meta['episode_command_A'][:]
-                random_traj_id = np.random.randint(0, len(env_commands))
-                command_vec = torch.tensor(env_commands[random_traj_id], device=self.eval_env.device)
-                VIDEO_PATH = video_save_parent / f"{command_name}_{random_traj_id}_raw_cmd.mp4"
-                rewards_json_path = video_save_parent / f"{command_name}_{random_traj_id}_raw_cmd.json"
+                # random_traj_id = np.random.randint(0, len(env_commands))
+                command_vec = torch.tensor(env_commands[0], device=self.eval_env.device)
+                VIDEO_PATH = video_save_parent / f"{command_name}_raw_cmd.mp4"
+                rewards_json_path = video_save_parent / f"{command_name}_raw_cmd.json"
                 _, _ = self.eval_env.reset()
 
                 self.eval_env.commands[:, :10] = command_vec
@@ -421,7 +485,7 @@ class Workspace:
 
                 timestep = 0
                 pure_obs, obs_command = self._proprocess_obs(obs)
-                last_index = -1
+                # last_index = -1
 
                 # imageio 写 mp4，依赖 ffmpeg（imageio-ffmpeg）
                 writer = imageio.get_writer(VIDEO_PATH, fps=self.FPS)
@@ -433,7 +497,7 @@ class Workspace:
                 rewards_recorder['z_rew_list'] = []
                 while not dones.any() and timestep < eval_steps:
                     with torch.inference_mode():
-                        assert self.agent.command_injection, f"command_injection must be True"
+                        assert self.agent.command_injection or self.agent.use_raw_command, f"command_injection or use_raw_command must be True"
                         z_hilbert, z_actor = self.agent.sample_z(1, obs_command)
                         actions, _ = self.agent.actor.act_inference(pure_obs, z_actor)
                     last_obs = pure_obs
@@ -505,12 +569,11 @@ class Workspace:
                 for key, data_buffer in self.example_data_buffers.items():
                     command_name = key
                     env_commands = data_buffer.meta['episode_command_A'][:]
-                    random_traj_id = np.random.randint(0, len(env_commands))
-                    command_vec = torch.tensor(env_commands[random_traj_id], device=self.eval_env.device)
-                    VIDEO_PATH = video_save_parent / f"{command_name}_{random_traj_id}_{command_horizon}.mp4"
-                    rewards_json_path = video_save_parent / f"{command_name}_{random_traj_id}_{command_horizon}.json"
-                    data_start_idx = 0 if random_traj_id == 0 else data_buffer.episode_ends[random_traj_id - 1]
-                    data_end_idx = data_buffer.episode_ends[random_traj_id]
+                    command_vec = torch.tensor(env_commands[0], device=self.eval_env.device)
+                    VIDEO_PATH = video_save_parent / f"{command_name}_{command_horizon}.mp4"
+                    rewards_json_path = video_save_parent / f"{command_name}_{command_horizon}.json"
+                    data_start_idx = 0
+                    data_end_idx = data_buffer.episode_ends[0]
                     len_trajectory = data_end_idx - data_start_idx
                     _, _ = self.eval_env.reset()
                     obs, critic_obs, _, _, _ = self.eval_env.step(torch.zeros(
@@ -527,7 +590,6 @@ class Workspace:
                         gymapi.Vec3(*look_at)
                     )
                     self.eval_env.commands[:, :10] = command_vec
-
 
                     z_resample_interval = command_horizon
                     resample_steps_list = [i for i in range(0, len_trajectory + z_resample_interval - 1, z_resample_interval)]
@@ -625,11 +687,9 @@ class Workspace:
                 self.logger.log_metrics(metrics, self.global_step, ty='eval_horizon')
         metrics = {key: np.mean(eval_results[key]) for key in eval_results if len(eval_results[key]) > 0}
         self.logger.log_metrics(metrics, self.global_step, ty='eval_mean')
-        
         # 确保所有eval层级的metrics都被dump到wandb
         self.logger.dump_all_eval(self.global_step)
-
-            
+        self.agent.feature_learner.train()
 
     _CHECKPOINTED_KEYS = ('agent', 'global_step', 'global_episode', "replay_loader")
 

@@ -80,6 +80,129 @@ def get_cosine_sim(array: np.ndarray) -> np.ndarray:
     unit = array / norms
     return unit @ unit.T
 
+def collect_nonzero_losses(M: np.ndarray, eps: float = 0.0):
+    """
+    从 φ-loss 矩阵中收集非零（或绝对值>eps）的有效项（忽略 NaN），返回数值列表。
+    """
+    mask = ~np.isnan(M)
+    if eps > 0:
+        mask &= (np.abs(M) > eps)
+    else:
+        mask &= (M != 0)
+    return M[mask].tolist()
+
+def collect_nonzero_losses_with_idx(M: np.ndarray, eps: float = 0.0):
+    """
+    收集 (i, g, value) 三元组：i 行、g 列、对应 loss 值。
+    仅保留有效且非零（或绝对值>eps）的条目。
+    """
+    mask = ~np.isnan(M)
+    if eps > 0:
+        mask &= (np.abs(M) > eps)
+    else:
+        mask &= (M != 0)
+    is_, gs = np.where(mask)
+    return [(int(i), int(g), float(M[i, g])) for i, g in zip(is_, gs)]
+
+
+def calc_phi_loss_upper(arr: np.ndarray, gamma: float = 0.99, fill_value: float = np.nan) -> np.ndarray:
+    """
+    计算 φ-loss：
+        L(i,g) = -1 - gamma * ||arr[i+1] - arr[g]|| + ||arr[i] - arr[g]||, 仅对 g>i
+
+    返回 T x T 的严格上三角矩阵 M：
+        M[i, g] = L(i, g)  (仅 g>i 有值)
+        其它位置填 fill_value（默认 NaN）
+    """
+    assert arr.ndim == 2, f"expect 2D, got {arr.shape}"
+    T = arr.shape[0]
+    if T < 2:
+        return np.full((T, T), fill_value, dtype=np.float32)
+
+    # 所有 pairwise L2 距离 dists[a, b] = ||arr[a] - arr[b]||
+    diffs = arr[:, None, :] - arr[None, :, :]   # [T, T, D]
+    dists = np.linalg.norm(diffs, axis=-1)      # [T, T]
+
+    # 严格上三角索引：rows=i, cols=g, 且 g>i
+    rows, cols = np.triu_indices(T, k=1)
+
+    out = np.full((T, T), fill_value, dtype=dists.dtype)
+    # 注意：rows 最大为 T-2，因此 rows+1 索引安全
+    out[rows, cols] = -1.0 - gamma * dists[rows + 1, cols] + dists[rows, cols]
+    return out
+
+def compute_global_color_limits(mats, lower_q: float = 5, upper_q: float = 95):
+    """
+    参数:
+        mats: 由多个 (T, T) φ-loss 矩阵构成的列表，矩阵中无效处为 NaN
+        lower_q, upper_q: 用分位数裁剪极端值，稳健设定颜色范围
+    返回:
+        (vmin, vmax)
+    """
+    vals = []
+    for M in mats:
+        if M is None:
+            continue
+        v = M[~np.isnan(M)]
+        if v.size:
+            vals.append(v)
+    if not vals:
+        return None, None
+    all_vals = np.concatenate(vals)
+    vmin, vmax = np.percentile(all_vals, [lower_q, upper_q])
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return None, None
+    if vmin == vmax:
+        eps = 1e-6
+        vmin -= eps
+        vmax += eps
+    return float(vmin), float(vmax)
+
+def plot_phi_loss_heatmaps(
+    mats,
+    names,
+    out_dir: str,
+    vmin,
+    vmax,
+    max_T= None,
+    cmap_name: str = "coolwarm",
+):
+    """
+    使用统一的 vmin/vmax，为每个 episode 的 φ-loss 矩阵绘图保存。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    cmap = plt.get_cmap(cmap_name).copy()
+    cmap.set_bad(color="#eeeeee")  # NaN 区域浅灰
+
+    for M, name in zip(mats, names):
+        if M is None:
+            continue
+        # 可选：限制最大绘制尺寸
+        if max_T is not None:
+            M_plot = M[:max_T, :max_T]
+        else:
+            M_plot = M
+
+        masked = np.ma.masked_invalid(M_plot)
+
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
+        im = ax.imshow(masked, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+        cb = fig.colorbar(im, ax=ax)
+        cb.set_label("φ-loss")
+
+        ax.set_title(f"Phi loss (upper triangle) - {name}")
+        ax.set_xlabel("g (future timestep)")
+        ax.set_ylabel("i (current timestep)")
+
+        # y 轴从上到下
+        ax.set_xlim(-0.5, masked.shape[1]-0.5)
+        ax.set_ylim(masked.shape[0]-0.5, -0.5)
+
+        plt.tight_layout()
+        fig.savefig(os.path.join(out_dir, f"phi_loss_latent_{name}.png"), bbox_inches='tight')
+        plt.close(fig)
+
 @dataclasses.dataclass
 class Config:
     """顶层配置
@@ -124,7 +247,6 @@ class Config:
     # checkpoint
     snapshot_at: tp.Tuple[int, ...] = ()
     checkpoint_every: int = 100000
-    load_model: tp.Optional[str] = None
     # training
     num_grad_steps: int = 100000000
     log_every_steps: int = 1000
@@ -144,6 +266,7 @@ class Config:
     # eval control
     eval_only: bool = False
     save_video: bool = False
+    resume_from: tp.Optional[str] = None
 
 
 ConfigStore.instance().store(name="workspace_config", node=Config)
@@ -167,8 +290,6 @@ class Workspace:
         self.cfg = cfg
         hydra_dir = Path.cwd()
         parent_dir = os.path.dirname(os.path.dirname(hydra_dir))
-        # if cfg.load_model is not None:
-        #     self.work_dir = os.path.dirname(os.path.dirname(cfg.load_model))
       
         utils.set_seed_everywhere(cfg.seed)
         if not torch.cuda.is_available():
@@ -182,8 +303,8 @@ class Workspace:
         self.domain = task.split('_', maxsplit=1)[0]
 
         # self.train_env = self._make_env()  # 环境仅用于读取规格与评估
-        # self.eval_env = self._make_eval_env()
-        # self._init_env_cam(self.eval_env)
+        self.eval_env = self._make_eval_env()
+        self._init_env_cam(self.eval_env)
 
         exp_name = ''
         # exp_name += f'sd{cfg.seed:03d}_'
@@ -193,7 +314,17 @@ class Workspace:
             exp_name += f'{os.environ["SLURM_PROCID"]}.'
         exp_name += '_'.join([cfg.agent.name, self.domain, str(self.cfg.discount), f"f{str(self.cfg.future)}", f"pr{str(self.cfg.p_randomgoal)}", f"phi_exp{str(self.cfg.agent.hilp_expectile)}", f"phi_g{str(self.cfg.agent.hilp_discount)}", f"ql{str(self.cfg.agent.q_loss)}", str(self.cfg.agent.command_injection), f"mix{str(self.cfg.agent.mix_ratio)}", str(self.cfg.use_history_action), str(self.cfg.agent.z_dim), self.cfg.load_replay_buffer.split("/")[-1], f"phih{str(self.cfg.agent.phi_hidden_dim)}", f"{str(self.cfg.agent.feature_type)}"
         ])
-        self.work_dir = os.path.join(parent_dir, exp_name, datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+        if cfg.resume_from is not None:
+            resume_parent_dir = os.path.dirname(cfg.resume_from)
+            resume_exp_name = os.path.basename(resume_parent_dir)
+            assert resume_exp_name == exp_name, f"Resume exp name {resume_exp_name} does not match {exp_name}"
+            self.work_dir = cfg.resume_from
+            import yaml
+            with open(os.path.join(self.work_dir, "wandb.yaml"), "r") as f:
+                wandb_run_id = yaml.safe_load(f)["run_id"]
+        else:
+            self.work_dir = os.path.join(parent_dir, exp_name, datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+            wandb_run_id = None
         os.makedirs(self.work_dir, exist_ok=True)
         print(f'Workspace: {self.work_dir}')
         print(f'Running code in : {Path(__file__).parent.resolve().absolute()}')
@@ -203,9 +334,13 @@ class Workspace:
         wandb_output_dir = tempfile.mkdtemp()
         cfg_dict = omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
         cfg_dict['work_dir'] = self.work_dir
-        wandb.init(project='hilp_zsrl', group=cfg.run_group, name=exp_name,
-                    config=cfg_dict,
-                    dir=wandb_output_dir)
+        if self.cfg.use_wandb:
+            wandb.init(project='hilp_zsrl', group=cfg.run_group, name=exp_name,
+                        config=cfg_dict,
+                        dir=wandb_output_dir,
+                        resume='allow',
+                        id=wandb_run_id
+            )
         self.timer = utils.Timer()
         self.global_step = 0
         self.global_episode = 0
@@ -219,7 +354,7 @@ class Workspace:
                 goal_future=float(cfg.future),
                 p_randomgoal=float(cfg.p_randomgoal),
                 obs_horizon=int(cfg.hilbert_obs_horizon),
-                full_loading=False,
+                full_loading=True,
                 use_history_action=cfg.use_history_action,
                 discount=float(cfg.discount),
             )
@@ -231,7 +366,7 @@ class Workspace:
                 obs_horizon=int(cfg.hilbert_obs_horizon),
                 types=cfg.hilbert_types,
                 max_episodes_per_type=cfg.hilbert_max_episodes_per_type,
-                full_loading=False,
+                full_loading=True,
                 use_history_action=cfg.use_history_action,
                 discount=float(cfg.discount),
             )
@@ -243,7 +378,7 @@ class Workspace:
             "pin_memory": True,
         }
         self.train_dataloader = DataLoader(train_set, **data_loader_conf)
-        self.val_dataloader = DataLoader(val_set, batch_size=self.cfg.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        self.val_dataloader = DataLoader(val_set, batch_size=self.cfg.batch_size, shuffle=True, num_workers=2, pin_memory=True)
         sample = dataset[0]
         print("Sample obs dim: ", sample['next_obs'].shape[-1])
         flatten_obs_dim = int(sample['next_obs'].shape[-1])
@@ -253,7 +388,6 @@ class Workspace:
         agent_cfg = self.cfg.agent
         agent_cfg.obs_shape = (flatten_obs_dim,)
         agent_cfg.critic_obs_shape = (flatten_obs_dim,)
-        agent_cfg.train_phi_only = True
         self.agent = make_agent(cfg.obs_type,
                                 cfg.image_wh,
                                 specs.Array(shape=(self.flatten_obs_dim,), dtype=np.float32, name='obs'),
@@ -275,12 +409,14 @@ class Workspace:
             ep_start = 0 if max_traj_idx == 0 else episode_ends[max_traj_idx - 1]
             ep_end = episode_ends[max_traj_idx]
             self.target_traj_idx[commandn] = (max_traj_idx, ep_start, ep_end)
-        # self._checkpoint_filepath = self.work_dir / "models" / "latest.pt"
-        self._checkpoint_filepath = os.path.join(self.work_dir, "models", "latest.pt")
-        if os.path.exists(self._checkpoint_filepath):
-            self.load_checkpoint(self._checkpoint_filepath)
-        elif cfg.load_model is not None and cfg.load_model.endswith('.pt'):
-            self.load_checkpoint(cfg.load_model)
+        if cfg.resume_from is not None:
+            models_dir = os.path.join(self.work_dir, "models")
+            assert os.path.exists(models_dir), f"Models dir {models_dir} does not exist"
+            models = os.listdir(models_dir)
+            models.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+            self._checkpoint_filepath = os.path.join(self.work_dir, "models", models[-1])
+            if os.path.exists(self._checkpoint_filepath):
+                self.load_checkpoint(self._checkpoint_filepath)
 
     
     def _make_eval_env(self):
@@ -372,40 +508,63 @@ class Workspace:
         return next_obs_t[torch.argmax(reward_t)].detach().cpu().numpy()
 
     def train(self):
-        assert not self.cfg.eval_only, "eval_only must be False"
+        if self.cfg.eval_only:
+            if self.cfg.resume_from is not None and not self.cfg.resume_from.endswith('.pt'):
+                ckpts = os.listdir(os.path.join(self.work_dir, "models"))
+                ckpts = [ckpt for ckpt in ckpts if ckpt.endswith('.pt')]
+                ckpts.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                for ckpt in ckpts:
+                    self.load_checkpoint(os.path.join(self.work_dir, "models", ckpt))
+                    self.eval()
+            else:
+                self.eval()
+            return
         while True:
             metrics_summon = defaultdict(list)
+            eval_num_batches = self.cfg.eval_every_steps // 20
             for batch in tqdm(self.train_dataloader):
+                if self.global_step % self.cfg.eval_every_steps == 0:
+                    _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
+                    self.save_checkpoint(_checkpoint_filepath)
+                    self.eval() 
+                    self.eval_data(num_batches=eval_num_batches)
                 metrics = self.agent.update_batch(batch, self.global_step)
                 for k, v in metrics.items():
                     metrics_summon[k].append(v)
                 if (self.global_step + 1) % self.cfg.log_every_steps == 0:
                     for k, v in metrics_summon.items():
                         metrics_summon[k] = np.mean(v)
-                    wandb.log({f"train/{'_'.join(k.split('/'))}" if "/" in k else f"train/{k}": v for k, v in metrics_summon.items()}, step=self.global_step)
+                    if self.cfg.use_wandb:
+                        wandb.log({f"train/{'_'.join(k.split('/'))}" if "/" in k else f"train/{k}": v for k, v in metrics_summon.items()}, step=self.global_step)
+                    else:
+                        for k, v in metrics_summon.items():
+                            print(f"train/{'_'.join(k.split('/'))}" if "/" in k else f"train/{k}: {v}")
                     metrics_summon = defaultdict(list)
-                self.global_step += 1
-            _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
-            self.save_checkpoint(_checkpoint_filepath)
-            self.eval_data()
-            # self.eval()            
+                self.global_step += 1           
+                if self.global_step >= (self.cfg.num_grad_steps // self.cfg.action_repeat):
+                    break
             if self.global_step >= (self.cfg.num_grad_steps // self.cfg.action_repeat):
                 break
         _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
         self.save_checkpoint(self._checkpoint_filepath)  # make sure we save the final checkpoint
 
     @torch.no_grad()
-    def eval_data(self):
+    def eval_data(self, num_batches=100):
         self.agent.feature_learner.eval()
         summon_metrics = defaultdict(list)
-        for batch in tqdm(self.val_dataloader):
+        for idx, batch in tqdm(enumerate(self.val_dataloader), total=num_batches):
+            if idx >= num_batches:
+                break
             metrics = self.agent.update_batch(batch, self.global_step, is_train=False)
             for k, v in metrics.items():
                 summon_metrics[k].append(v)
         for k, v in summon_metrics.items():
             summon_metrics[k] = np.mean(v)
-        # self.logger.log_metrics(summon_metrics, self.global_step, ty='eval')
-        wandb.log({f"eval/{k}": v for k, v in summon_metrics.items()}, step=self.global_step)
+        if self.cfg.use_wandb:
+            wandb.log({f"eval/{k}": v for k, v in summon_metrics.items()}, step=self.global_step)
+        else:
+            for k, v in summon_metrics.items():
+                print(f"eval/{k}: {v}")
         self.agent.feature_learner.train()
             
     def _proprocess_obs(self, obs):
@@ -545,7 +704,11 @@ class Workspace:
         elif goal_type == "fit":
             command_name = command_name + "_fit"
         metrics = {f"{command_name}_env_rew": mean_env_rewards, f"{command_name}_z_rew": mean_z_rewards, f"{command_name}_ep_len": ep_len, f"{command_name}_sum_env_rew": sum_env_rewards, f"{command_name}_sum_z_rew": sum_z_rewards}
-        wandb.log({f"eval_detail/{k}": v for k, v in metrics.items()}, step=self.global_step)
+        if self.cfg.use_wandb:
+            wandb.log({f"eval_detail/{k}": v for k, v in metrics.items()}, step=self.global_step)
+        else:
+            for k, v in metrics.items():
+                print(f"eval_detail/{k}: {v}")
         return {"mean_env_rewards": mean_env_rewards, "mean_z_rewards": mean_z_rewards, "ep_len": ep_len, "sum_env_rewards": sum_env_rewards, "sum_z_rewards": sum_z_rewards}
 
     def eval(self):
@@ -556,51 +719,90 @@ class Workspace:
         video_save_parent = os.path.join(self.work_dir, "eval_result", f"{self.global_step}")
         os.makedirs(video_save_parent, exist_ok=True)
         eval_steps = int(eval_time / self.eval_env.dt)
-        # image_save_parent = os.path.join(video_save_parent, "images")
-        # os.makedirs(image_save_parent, exist_ok=True)
-        # for key, data_buffer in self.example_data_buffers.items():
-        #     command_name = key
-        #     state_trajectorys = data_buffer.data['proprio'][..., :self.obs_dim]
-        #     traj_idx, ep_start, ep_end = self.target_traj_idx[command_name]
-        #     traj = state_trajectorys[ep_start:ep_end]
-        #     traj = traj.reshape(traj.shape[0], -1)
-        #     z, hilbert_traj = self.agent.get_traj_meta(traj)  # (traj_len, z_dim)
-        #     # draw a hot map of z, with metric as the cosine similarity between all z of different time steps
-        #     if command_name not in self.raw_cosine_sim:
-        #         self.raw_cosine_sim[command_name] = get_cosine_sim(traj)
-        #         self.raw_diff_cosine_sim[command_name] = get_cosine_sim(np.diff(traj, axis=0))
-        #     raw_cos_sim = self.raw_cosine_sim[command_name]
-        #     raw_diff_cos_sim = self.raw_diff_cosine_sim[command_name]
-        #     hilbert_cos_sim = get_cosine_sim(hilbert_traj)
-        #     z_cos_sim = get_cosine_sim(z)
-        #     fig, axs = plt.subplots(2, 2, figsize=(10, 8), dpi=400, constrained_layout=True)
-        #     common = dict(
-        #         vmin=-1, vmax=1, cmap='coolwarm',
-        #         origin='lower', aspect='auto', interpolation='nearest'
-        #     )
+        cos_sim_save_parent = os.path.join(video_save_parent, "images", "cos_sims")
+        phi_loss_save_parent = os.path.join(video_save_parent, "images", "phi_losses")
+        os.makedirs(cos_sim_save_parent, exist_ok=True)
+        os.makedirs(phi_loss_save_parent, exist_ok=True)
+        # 全局收集
+        phi_losses = []
+        phi_loss_mats = []        # 各 episode 的 φ-loss 矩阵
+        phi_loss_mats_names = []      
+        for key, data_buffer in self.example_data_buffers.items():
+            command_name = key
+            state_trajectorys = data_buffer.data['proprio'][..., :self.obs_dim]
+            traj_idx, ep_start, ep_end = self.target_traj_idx[command_name]
+            traj = state_trajectorys[ep_start:ep_end]
+            traj = traj.reshape(traj.shape[0], -1)
+            z, hilbert_traj = self.agent.get_traj_meta(traj)  # (traj_len, z_dim)
+            # draw a hot map of z, with metric as the cosine similarity between all z of different time steps
+            if command_name not in self.raw_cosine_sim:
+                self.raw_cosine_sim[command_name] = get_cosine_sim(traj)
+                self.raw_diff_cosine_sim[command_name] = get_cosine_sim(np.diff(traj, axis=0))
+            raw_cos_sim = self.raw_cosine_sim[command_name]
+            raw_diff_cos_sim = self.raw_diff_cosine_sim[command_name]
+            hilbert_cos_sim = get_cosine_sim(hilbert_traj)
+            z_cos_sim = get_cosine_sim(z)
+            fig, axs = plt.subplots(2, 2, figsize=(10, 8), dpi=400, constrained_layout=True)
+            common = dict(
+                vmin=-1, vmax=1, cmap='coolwarm',
+                origin='lower', aspect='auto', interpolation='nearest'
+            )
 
-        #     im00 = axs[0, 0].imshow(raw_cos_sim, **common)
-        #     axs[0, 0].set_title('raw state cosine similarity')
-        #     axs[0, 0].set_xlabel('time step'); axs[0, 0].set_ylabel('time step')
+            im00 = axs[0, 0].imshow(raw_cos_sim, **common)
+            axs[0, 0].set_title('raw state cosine similarity')
+            axs[0, 0].set_xlabel('time step'); axs[0, 0].set_ylabel('time step')
 
-        #     im01 = axs[0, 1].imshow(raw_diff_cos_sim, **common)
-        #     axs[0, 1].set_title('Δ raw state (t vs t-1) cosine similarity')
-        #     axs[0, 1].set_xlabel('time step'); axs[0, 1].set_ylabel('time step')
+            im01 = axs[0, 1].imshow(raw_diff_cos_sim, **common)
+            axs[0, 1].set_title('Δ raw state (t vs t-1) cosine similarity')
+            axs[0, 1].set_xlabel('time step'); axs[0, 1].set_ylabel('time step')
 
-        #     im10 = axs[1, 0].imshow(hilbert_cos_sim, **common)
-        #     axs[1, 0].set_title('Hilbert(traj) cosine similarity')
-        #     axs[1, 0].set_xlabel('time step'); axs[1, 0].set_ylabel('time step')
+            im10 = axs[1, 0].imshow(hilbert_cos_sim, **common)
+            axs[1, 0].set_title('Hilbert(traj) cosine similarity')
+            axs[1, 0].set_xlabel('time step'); axs[1, 0].set_ylabel('time step')
 
-        #     im11 = axs[1, 1].imshow(z_cos_sim, **common)
-        #     axs[1, 1].set_title('z cosine similarity')
-        #     axs[1, 1].set_xlabel('time step'); axs[1, 1].set_ylabel('time step')
+            im11 = axs[1, 1].imshow(z_cos_sim, **common)
+            axs[1, 1].set_title('z cosine similarity')
+            axs[1, 1].set_xlabel('time step'); axs[1, 1].set_ylabel('time step')
 
-        #     # 共享色条：用同一标尺比较四张图
-        #     fig.colorbar(im11, ax=axs, location='right', shrink=0.9, label='cosine similarity')
+            # 共享色条：用同一标尺比较四张图
+            fig.colorbar(im11, ax=axs, location='right', shrink=0.9, label='cosine similarity')
 
-        #     fig.suptitle(f'{command_name}  ep={traj_idx}')
-        #     fig.savefig(f"{image_save_parent}/cos_sims_{command_name}_{traj_idx}.png", bbox_inches='tight')
-        #     plt.close(fig)
+            fig.suptitle(f'{command_name}  ep={traj_idx}')
+            fig.savefig(f"{cos_sim_save_parent}/cos_sims_{command_name}_{traj_idx}.png", bbox_inches='tight')
+            plt.close(fig)
+
+            phi_loss_matrix = calc_phi_loss_upper(hilbert_traj, gamma=self.cfg.agent.hilp_discount)
+            phi_loss = collect_nonzero_losses(phi_loss_matrix)
+            phi_losses.extend(phi_loss)
+            # phi_loss_idx = collect_nonzero_losses_with_idx(phi_loss_matrix)
+            # phi_losses_with_idx.append(phi_loss_idx)
+            phi_loss_mats.append(phi_loss_matrix)
+            phi_loss_mats_names.append(f"{command_name}_{traj_idx}")
+        vmin, vmax = compute_global_color_limits(phi_loss_mats)
+        plot_phi_loss_heatmaps(phi_loss_mats, phi_loss_mats_names, phi_loss_save_parent, vmin, vmax)
+        print("="*20)
+        if len(phi_losses) > 0:
+            phi_losses = np.array(phi_losses)
+            phi_loss_stats = {
+                "mean_phi_losses": np.mean(phi_losses),
+                "max_phi_losses": np.max(phi_losses),
+                "min_phi_losses": np.min(phi_losses),
+                "std_phi_losses": np.std(phi_losses),
+                "mse_phi_losses": np.mean(phi_losses ** 2)
+            }
+            print(f"mean_phi_losses: {phi_loss_stats['mean_phi_losses']}")
+            print(f"max_phi_losses:  {phi_loss_stats['max_phi_losses']}")
+            print(f"min_phi_losses:  {phi_loss_stats['min_phi_losses']}")
+            print(f"std_phi_losses:  {phi_loss_stats['std_phi_losses']}")
+            print(f"mse_phi_losses: {phi_loss_stats['mse_phi_losses']}")
+            if self.cfg.use_wandb:
+                wandb.log({f"eval_phi_loss_stats/{k}": v for k, v in phi_loss_stats.items()}, step=self.global_step)
+            else:
+                for k, v in phi_loss_stats.items():
+                    print(f"eval_phi_loss_stats/{k}: {v}")
+        else:
+            print("No phi losses collected.")
+        print("="*20)
 
         if self.cfg.agent.command_injection or self.cfg.agent.use_raw_command:
             eval_results = {'mean_env_rewards': [], 'mean_z_rewards': [], 'ep_len': [], 'sum_env_rewards': [], 'sum_z_rewards': []}
@@ -622,7 +824,11 @@ class Workspace:
                 for k, v in rollout_results.items():
                     eval_results[k].append(v) 
             eval_results = {key: np.mean(eval_results[key]) for key in eval_results if len(eval_results[key]) > 0}
-            wandb.log({f"eval_mean/{k}_raw_cmd": v for k, v in eval_results.items()}, step=self.global_step)
+            if self.cfg.use_wandb:
+                wandb.log({f"eval_mean/{k}_raw_cmd": v for k, v in eval_results.items()}, step=self.global_step)
+            else:
+                for k, v in eval_results.items():
+                    print(f"eval_mean/{k}_raw_cmd: {v}")
         else:
             eval_fit = {key: [] for key in ['mean_env_rewards', 'mean_z_rewards', 'ep_len', 'sum_env_rewards', 'sum_z_rewards']}
             for key, data_buffer in self.example_data_buffers.items():
@@ -664,7 +870,11 @@ class Workspace:
                 for k, v in rollout_results.items():
                     eval_fit[k].append(v)
             eval_fit = {key: np.mean(eval_fit[key]) for key in eval_fit.keys()}
-            wandb.log({f"eval_fit_mean/{k}": v for k, v in eval_fit.items()}, step=self.global_step)
+            if self.cfg.use_wandb:
+                wandb.log({f"eval_fit_mean/{k}": v for k, v in eval_fit.items()}, step=self.global_step)
+            else:
+                for k, v in eval_fit.items():
+                    print(f"eval_fit_mean/{k}: {v}")
 
             eval_diff = {'mean_env_rewards': [], 'mean_z_rewards': [], 'ep_len': [], 'sum_env_rewards': [], 'sum_z_rewards': []}
             eval_state = {'mean_env_rewards': [], 'mean_z_rewards': [], 'ep_len': [], 'sum_env_rewards': [], 'sum_z_rewards': []}
@@ -722,15 +932,28 @@ class Workspace:
                 for k, v in state_horizon_results.items():
                     state_horizon_metrics[f"{command_horizon}_{k}"] = np.mean(v)
                     eval_state[k].append(np.mean(v))
-                wandb.log({f"eval_diff_horizon/{k}": v for k, v in diff_horizon_metrics.items()}, step=self.global_step)
-                wandb.log({f"eval_state_horizon/{k}": v for k, v in state_horizon_metrics.items()}, step=self.global_step)
+                if self.cfg.use_wandb:
+                    wandb.log({f"eval_diff_horizon/{k}": v for k, v in diff_horizon_metrics.items()}, step=self.global_step)
+                    wandb.log({f"eval_state_horizon/{k}": v for k, v in state_horizon_metrics.items()}, step=self.global_step)
+                else:
+                    for k, v in diff_horizon_metrics.items():
+                        print(f"eval_diff_horizon/{k}: {v}")
+                    for k, v in state_horizon_metrics.items():
+                        print(f"eval_state_horizon/{k}: {v}")
             eval_diff = {key: np.mean(eval_diff[key]) for key in eval_diff.keys()}
             eval_state = {key: np.mean(eval_state[key]) for key in eval_state.keys()}
-            wandb.log({f"eval_diff/{k}": v for k, v in eval_diff.items()}, step=self.global_step)
-            wandb.log({f"eval_state/{k}": v for k, v in eval_state.items()}, step=self.global_step)
-
             eval_mean = {key: np.mean([eval_diff[key], eval_state[key]]) for key in eval_diff.keys()}
-            wandb.log({f"eval_mean/{k}": v for k, v in eval_mean.items()}, step=self.global_step)
+            if self.cfg.use_wandb:
+                wandb.log({f"eval_diff/{k}": v for k, v in eval_diff.items()}, step=self.global_step)
+                wandb.log({f"eval_state/{k}": v for k, v in eval_state.items()}, step=self.global_step)
+                wandb.log({f"eval_mean/{k}": v for k, v in eval_mean.items()}, step=self.global_step)
+            else:
+                for k, v in eval_diff.items():
+                    print(f"eval_diff/{k}: {v}")
+                for k, v in eval_state.items():
+                    print(f"eval_state/{k}: {v}")
+                for k, v in eval_mean.items():
+                    print(f"eval_mean/{k}: {v}")
         self.agent.feature_learner.train()
 
     _CHECKPOINTED_KEYS = ('agent', 'global_step', 'global_episode')
