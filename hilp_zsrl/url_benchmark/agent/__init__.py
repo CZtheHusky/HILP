@@ -2,5 +2,10 @@ from .ddpg import DDPGAgent as DDPGAgent
 from .ddpg import DDPGAgentConfig as DDPGAgentConfig
 from .fb_ddpg import FBDDPGAgent as FBDDPGAgent
 from .ddpg import MetaDict as MetaDict
-from .sf import SFAgent
-from .gctd3 import GCTD3Agent
+from .sf import SFAgent as SFAgent
+from .sf import SFAgentConfig as SFAgentConfig
+from .sf_hum import SFHumanoidAgent as SFHumanoidAgent
+from .sf_hum import SFHumanoidAgentConfig as SFHumanoidAgentConfig
+from .sf_hum_online import SFHumanoidOnlineAgent as SFHumanoidOnlineAgent
+from .sf_hum_online import SFHumanoidOnlineAgentConfig as SFHumanoidOnlineAgentConfig
+from .gctd3 import GCTD3Agent as GCTD3Agent

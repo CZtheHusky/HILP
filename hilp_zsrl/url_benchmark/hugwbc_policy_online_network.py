@@ -13,9 +13,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Normal
 from typing import Dict, List, Optional, Tuple, Union
-
+from torch.distributions import Normal, TransformedDistribution, Independent
+from torch.distributions.transforms import TanhTransform, AffineTransform
 
 # =============================================================================
 # Utility Functions
@@ -99,19 +99,15 @@ class BaseAdaptModel(nn.Module):
     
     This is the foundation class that defines the core architecture for
     HugWBC's adaptive policy networks. It includes:
-    - State estimator for privileged information prediction
     - Low-level control network for action generation
-    - Privileged information reconstruction loss
     """
     
     def __init__(self,
                  act_dim: int,
                  proprioception_dim: int,
                  cmd_dim: int,
-                 privileged_dim: int,
                  terrain_dim: int,
                  latent_dim: int,
-                 privileged_recon_dim: int,
                  actor_hidden_dims: List[int],
                  activation: str,
                  output_activation: Optional[str] = None,
@@ -122,10 +118,8 @@ class BaseAdaptModel(nn.Module):
             act_dim: Action dimension (19 for H1 robot)
             proprioception_dim: Proprioception observation dimension (63 for H1)
             cmd_dim: Command dimension (11 for H1 interrupt)
-            privileged_dim: Privileged information dimension (24 for H1)
             terrain_dim: Terrain information dimension (221 for H1)
             latent_dim: Latent space dimension for memory encoding (32)
-            privileged_recon_dim: Privileged reconstruction dimension (3: base linear velocities)
             actor_hidden_dims: Hidden layer dimensions for low-level network
             activation: Activation function name
             output_activation: Output activation function name (optional)
@@ -140,26 +134,16 @@ class BaseAdaptModel(nn.Module):
         self.proprioception_dim = proprioception_dim
         self.cmd_dim = cmd_dim
         self.terrain_dim = terrain_dim
-        self.privileged_dim = privileged_dim
-        self.privileged_recon_dim = privileged_recon_dim
         
         # Training state
-        self.privileged_recon_loss = 0
         self.z = 0  # Latent variable for inference
         self.clock_dim = clock_dim
         
-        # State Estimator: latent -> privileged prediction
-        # Input: [batch, latent_dim] -> Output: [batch, privileged_recon_dim]
-        self.state_estimator = nn.Sequential(
-            *MLP(latent_dim, self.privileged_recon_dim, [64, 32], activation)
-        )
-        
         # Low-level Control Network: concatenated features -> actions
-        # Input: [batch, latent_dim + privileged_recon_dim + proprioception_dim + cmd_dim + clock_dim]
         # Output: [batch, act_dim]
         # clock_dim = 2  # Clock inputs dimension
         # we do not use command for hilp
-        control_input_dim = (latent_dim + privileged_recon_dim + 
+        control_input_dim = (latent_dim + 
                            proprioception_dim + self.cmd_dim + self.clock_dim)
         self.low_level_net = nn.Sequential(
             *MLP(control_input_dim, 2 * act_dim, actor_hidden_dims, 
@@ -169,9 +153,7 @@ class BaseAdaptModel(nn.Module):
     def forward(self, 
                 obs: torch.Tensor, 
                 z_vector: torch.Tensor,
-                privileged_obs: Optional[torch.Tensor] = None,
                 env_mask: Optional[torch.Tensor] = None,
-                sync_update: bool = False,
                 clock: torch.Tensor = None,
                 **kwargs) -> torch.Tensor:
         """Forward pass of the adaptive model.
@@ -179,10 +161,7 @@ class BaseAdaptModel(nn.Module):
         Args:
             x: Input observations
                Shape: [batch, history_steps, obs_dim] or [batch, obs_dim]
-            privileged_obs: Privileged observations (for training)
-                          Shape: [batch, privileged_obs_dim]
             env_mask: Environment mask (unused in base implementation)
-            sync_update: Whether to compute privileged reconstruction loss
             **kwargs: Additional arguments
             
         Returns:
@@ -199,11 +178,7 @@ class BaseAdaptModel(nn.Module):
         # Encode memory from proprioception sequence
         # mem: [batch, latent_dim]
         mem = self.memory_encoder(pro_obs_seq, **kwargs)
-        
-        # Predict privileged information from memory
-        # privileged_pred_now: [batch, privileged_recon_dim]
-        privileged_pred_now = self.state_estimator(mem)
-        
+                
         # Current proprioception (latest timestep)
         # current_proprio: [batch, proprioception_dim]
         current_proprio = obs[:, -1, :]
@@ -214,10 +189,8 @@ class BaseAdaptModel(nn.Module):
         # no clock for hilp
         
         # Concatenate all features for low-level control
-        # control_input: [batch, latent_dim + privileged_recon_dim + proprioception_dim + cmd_dim + clock_dim]
         control_input = torch.cat([
             mem,                    # [batch, latent_dim]
-            privileged_pred_now,    # [batch, privileged_recon_dim]
             current_proprio,        # [batch, proprioception_dim]
             cmd,                    # [batch, cmd_dim]
         ], dim=-1)
@@ -228,23 +201,6 @@ class BaseAdaptModel(nn.Module):
         # Generate actions
         # actions: [batch, act_dim]
         actions, stds = self.low_level_net(control_input).chunk(2, dim=-1)
-        
-        # Compute privileged reconstruction loss if in sync update mode
-        if sync_update and privileged_obs is not None:
-            # Extract ground truth privileged information (base linear velocities)
-            # privileged_obs structure: [proprio(63) + cmd(11) + clock(2) + privileged(24) + terrain(221)]
-            # We want the first 3 dims of privileged part: base_lin_vel (x, y, z)
-            # privileged_start = self.proprioception_dim + self.cmd_dim
-            # privileged_end = privileged_start + self.privileged_recon_dim
-            if privileged_obs.shape[-1] == 3:
-                privileged_gt = privileged_obs
-            else:
-                privileged_gt = privileged_obs[..., 76:79]
-            
-            # Compute MSE loss with coefficient 2 for base linear velocity reconstruction
-            self.privileged_recon_loss = 2 * (
-                (privileged_pred_now - privileged_gt.detach()).pow(2).mean()
-            )
         
         # Store latent for inference
         self.z = mem
@@ -266,19 +222,6 @@ class BaseAdaptModel(nn.Module):
                    Shape: [batch, latent_dim]
         """
         raise NotImplementedError("Subclasses must implement memory_encoder")
-    
-    def compute_adaptation_pred_loss(self, metrics: Dict[str, float]) -> torch.Tensor:
-        """Compute and record privileged prediction loss.
-        
-        Args:
-            metrics: Dictionary to store metrics
-            
-        Returns:
-            privileged_recon_loss: Reconstruction loss tensor
-        """
-        if self.privileged_recon_loss != 0:
-            metrics['privileged_recon_loss'] += self.privileged_recon_loss.item()
-        return self.privileged_recon_loss
 
 
 class MlpAdaptModel(BaseAdaptModel):
@@ -287,7 +230,6 @@ class MlpAdaptModel(BaseAdaptModel):
     This is the main implementation of HugWBC's policy network, using MLPs
     for memory encoding and action generation. Key features:
     - Short-term memory encoding using flattened history
-    - State estimation for privileged information
     - Low-level control network for action generation
     """
     
@@ -296,10 +238,8 @@ class MlpAdaptModel(BaseAdaptModel):
                  act_dim: int,
                  proprioception_dim: int,
                  cmd_dim: int,
-                 privileged_dim: int,
                  terrain_dim: int,
                  latent_dim: int = 32,
-                 privileged_recon_dim: int = 3,
                  actor_hidden_dims: List[int] = [256, 128, 32],
                  activation: str = 'elu',
                  output_activation: Optional[str] = None,
@@ -314,10 +254,8 @@ class MlpAdaptModel(BaseAdaptModel):
             act_dim: Action dimension (19 for H1 robot)
             proprioception_dim: Proprioception dimension (63 for H1)
             cmd_dim: Command dimension (11 for H1 interrupt)
-            privileged_dim: Privileged information dimension (24 for H1)
             terrain_dim: Terrain information dimension (221 for H1)
             latent_dim: Latent space dimension (32)
-            privileged_recon_dim: Privileged reconstruction dimension (3: base linear velocities)
             actor_hidden_dims: Hidden layer dimensions for low-level network
             activation: Activation function name ('elu')
             output_activation: Output activation function name (None)
@@ -329,10 +267,8 @@ class MlpAdaptModel(BaseAdaptModel):
             act_dim=act_dim,
             proprioception_dim=proprioception_dim,
             cmd_dim=cmd_dim,
-            privileged_dim=privileged_dim,
             terrain_dim=terrain_dim,
             latent_dim=latent_dim,
-            privileged_recon_dim=privileged_recon_dim,
             actor_hidden_dims=actor_hidden_dims,
             activation=activation,
             output_activation=output_activation,
@@ -394,10 +330,8 @@ class HugWBCPolicyNetwork(nn.Module):
                  proprioception_dim: int = 63,
                  cmd_dim: int = 11,
                  act_dim: int = 19,
-                 privileged_dim: int = 24,
                  terrain_dim: int = 221,
                  latent_dim: int = 32,
-                 privileged_recon_dim: int = 3,
                  max_length: int = 5,
                  
                  # Hidden layer dimensions
@@ -410,26 +344,24 @@ class HugWBCPolicyNetwork(nn.Module):
                  clock_dim: int = 0,
                  # Action noise parameters
                  init_noise_std: float = 1.0,
-                 max_std: float = 1.2,
-                 min_std: float = 0.1):
+                 max_log_std: float = 0.182,
+                 min_log_std: float = 0.1):
         """Initialize HugWBC Policy Network.
         
         Args:
             proprioception_dim: Proprioception observation dimension
             cmd_dim: Command dimension
             act_dim: Action dimension
-            privileged_dim: Privileged information dimension
             terrain_dim: Terrain information dimension
             latent_dim: Latent space dimension for memory encoding
-            privileged_recon_dim: Privileged reconstruction dimension (3: base linear velocities)
             max_length: Maximum history length
             actor_hidden_dims: Hidden layer dimensions for actor network
             mlp_hidden_dims: Hidden layer dimensions for memory encoder
             activation: Activation function name
             output_activation: Output activation function name
             init_noise_std: Initial noise standard deviation
-            max_std: Maximum standard deviation
-            min_std: Minimum standard deviation
+            max_log_std: Maximum standard deviation
+            min_log_std: Minimum standard deviation
         """
         super().__init__()
         
@@ -440,9 +372,12 @@ class HugWBCPolicyNetwork(nn.Module):
         self.max_length = max_length
         
         # Action noise parameters
-        self.max_std = max_std
-        self.min_std = min_std
-        
+        self.max_log_std = max_log_std
+        self.min_log_std = min_log_std
+        self.register_buffer("action_scale", torch.ones(act_dim))
+        self.register_buffer("action_bias",  torch.zeros(act_dim))  # 可选（非对称动作空间）
+        self.action_max = np.array([2.8929266929626465, 3.1424105167388916, 8.912518501281738, 9.273897171020508, 20.635496139526367, 1.5641342401504517, 6.097947120666504, 5.219802379608154, 8.732982635498047, 15.844582557678223, 5.335212230682373, 14.903319358825684, 2.345292568206787, 0.9799386262893677, 0.5946072936058044, 14.76853084564209, 3.138103723526001, 0.8584625124931335, 1.1060798168182373])
+        self.action_min = np.array([-1.7501237392425537, -8.597620010375977, -9.818479537963867, -24.81416893005371, -13.048727989196777, -2.8899900913238525, -2.8148365020751953, -9.641386985778809, -30.218889236450195, -12.128853797912598, -7.452919960021973, -6.481909275054932, -2.5507757663726807, -0.7834361791610718, -3.2907698154449463, -6.089234828948975, -2.8664331436157227, -0.8890500068664551, -2.376858711242676])
         # Actor network
         obs_dim = proprioception_dim + cmd_dim  # Simplified obs dim
         self.actor = MlpAdaptModel(
@@ -451,10 +386,8 @@ class HugWBCPolicyNetwork(nn.Module):
             proprioception_dim=proprioception_dim,
             cmd_dim=cmd_dim,
             clock_dim=clock_dim,
-            privileged_dim=privileged_dim,
             terrain_dim=terrain_dim,
             latent_dim=latent_dim,
-            privileged_recon_dim=privileged_recon_dim,
             actor_hidden_dims=actor_hidden_dims,
             activation=activation,
             output_activation=output_activation,
@@ -468,12 +401,20 @@ class HugWBCPolicyNetwork(nn.Module):
         
         # Disable validation for speed
         Normal.set_default_validate_args = False
+        self.set_action_space(self.action_min, self.action_max)
+
+    def set_action_space(self, low: np.ndarray, high: np.ndarray):
+        low  = torch.as_tensor(low, dtype=torch.float32, device=self.action_scale.device)
+        high = torch.as_tensor(high, dtype=torch.float32, device=self.action_scale.device)
+        scale = (high - low) / 2.0
+        bias  = (high + low) / 2.0
+        eps = torch.finfo(scale.dtype).eps
+        self.action_scale.copy_(torch.clamp(scale, min=eps))
+        self.action_bias.copy_(bias)
     
     def forward(self, 
                 observations: torch.Tensor,
                 z_vector: torch.Tensor,
-                privileged_obs: Optional[torch.Tensor] = None,
-                sync_update: bool = False,
                 **kwargs) -> torch.Tensor:
         """Forward pass to get action mean.
         
@@ -482,8 +423,6 @@ class HugWBCPolicyNetwork(nn.Module):
                          Shape: [batch, history_steps, obs_dim] or [batch, obs_dim]
             z_vector: Command vector
                      Shape: [batch, z_dim]
-            privileged_obs: Privileged observations (for training)
-            sync_update: Whether to compute privileged reconstruction loss
             **kwargs: Additional arguments
             
         Returns:
@@ -493,35 +432,12 @@ class HugWBCPolicyNetwork(nn.Module):
         print(observations.shape)
         if len(observations.shape) == 2:
             observations = observations.reshape(observations.shape[0], self.max_length, -1)
-        return self.actor(observations, z_vector, privileged_obs, sync_update=sync_update, **kwargs)
-
-    # for sac
-    def sample_and_logprob(self, observations, z_vector,
-                        privileged_obs=None, sync_update=False,
-                        squash: bool = True, action_scale: Optional[torch.Tensor] = None,
-                        eps: float = 1e-6, **kwargs):
-        if len(observations.shape) == 2:
-            observations = observations.reshape(observations.shape[0], self.max_length, -1)
-        self.update_distribution(observations, z_vector, privileged_obs, sync_update=sync_update, **kwargs)
-
-        u = self.distribution.rsample()  # 关键：rsample
-        if squash:
-            a = torch.tanh(u)
-            logp = self.distribution.log_prob(u).sum(-1) - torch.log(1 - a.pow(2) + eps).sum(-1)
-            if action_scale is not None:
-                a = a * action_scale
-                logp = logp - torch.log(action_scale).sum()  # 常数项
-        else:
-            a = u
-            logp = self.distribution.log_prob(u).sum(-1)
-        return a, logp
+        return self.actor(observations, z_vector, **kwargs)
 
     
     def update_distribution(self, 
                           observations: torch.Tensor,
                           z_vector: torch.Tensor,
-                          privileged_obs: Optional[torch.Tensor] = None,
-                          sync_update: bool = False,
                           **kwargs):
         """Update the action distribution.
         
@@ -529,81 +445,54 @@ class HugWBCPolicyNetwork(nn.Module):
             observations: Input observations
             z_vector: Command vector
                      Shape: [batch, z_dim]
-            privileged_obs: Privileged observations (for training)
-            sync_update: Whether to compute privileged reconstruction loss
             **kwargs: Additional arguments
         """
         if len(observations.shape) == 2:
             observations = observations.reshape(observations.shape[0], self.max_length, -1)
         # Get action mean from actor
-        mean, stds = self.actor(observations, z_vector, privileged_obs, sync_update=sync_update, **kwargs)
-        
-        # Clamp standard deviation
-        stds = torch.clamp(stds, min=self.min_std, max=self.max_std)
+        mean, log_std = self.actor(observations, z_vector, **kwargs)
+        log_std = torch.tanh(log_std)
+        log_std = self.min_log_std + 0.5 * (self.max_log_std - self.min_log_std) * (log_std + 1)
+        std = log_std.exp()
         
         # Create normal distribution
-        self.distribution = Normal(mean, mean * 0.0 + stds)
-    
-    def act(self, 
-            observations: torch.Tensor,
-            z_vector: torch.Tensor,
-            privileged_obs: Optional[torch.Tensor] = None,
-            sync_update: bool = False,
-            **kwargs) -> torch.Tensor:
-        """Sample actions from the policy.
-        
-        Args:
-            observations: Input observations
-                         Shape: [batch, history_steps, obs_dim] or [batch, obs_dim]
-            privileged_obs: Privileged observations (for training)
-            sync_update: Whether to compute privileged reconstruction loss
-            **kwargs: Additional arguments
-            
-        Returns:
-            actions: Sampled actions
-                    Shape: [batch, act_dim]
-        """
+        base = Independent(Normal(mean, mean * 0.0 + std), 1)
+        scale = getattr(self, "action_scale")
+        bias  = getattr(self, "action_bias")
+        dist = TransformedDistribution(
+            base,
+            [TanhTransform(cache_size=1), AffineTransform(loc=bias, scale=scale)]
+        )
+        self.distribution = dist
+
+    @torch.no_grad()
+    def act_inference(
+        self, 
+        observations, 
+        z_vector, 
+        **kwargs
+    ):
         if len(observations.shape) == 2:
             observations = observations.reshape(observations.shape[0], self.max_length, -1)
-        self.update_distribution(observations, z_vector, privileged_obs, sync_update=sync_update, **kwargs)
-        return self.distribution.sample()
-    
-    def act_inference(self, 
-                     observations: torch.Tensor,
-                     z_vector: torch.Tensor,
-                     **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get deterministic actions for inference.
-        
-        Args:
-            observations: Input observations
-                         Shape: [batch, history_steps, obs_dim] or [batch, obs_dim]
-            **kwargs: Additional arguments
-            
-        Returns:
-            actions_mean: Mean actions (deterministic)
-                         Shape: [batch, act_dim]
-            latent: Latent representation from memory encoder
-                   Shape: [batch, latent_dim]
-        """
-        if len(observations.shape) == 2:
-            observations = observations.reshape(observations.shape[0], self.max_length, -1)
-        actions_mean, actions_stds = self.actor(observations, z_vector, **kwargs)
-        return actions_mean, self.actor.z
-        
-    def get_actions_log_prob(self, actions: torch.Tensor, already_squashed: bool = False,
-                            action_scale: Optional[torch.Tensor] = None, eps: float = 1e-6) -> torch.Tensor:
-        if self.distribution is None:
-            raise RuntimeError("Must call update_distribution first")
-        if already_squashed:
-            # 反挤压回 u，再算 logp + Jacobian（需要裁剪避免数值溢出）
-            a = actions
-            if action_scale is not None: a = a / action_scale
-            a = torch.clamp(a, -1 + 1e-6, 1 - 1e-6)
-            u = 0.5 * (torch.log1p(a + eps) - torch.log1p(-a + eps))  # atanh
-            logp = self.distribution.log_prob(u).sum(-1) - torch.log(1 - a.pow(2) + eps).sum(-1)
-        else:
-            logp = self.distribution.log_prob(actions).sum(-1)
-        return logp
+        mean, _ = self.actor(observations, z_vector, **kwargs)  # pre-tanh mean
+        a = torch.tanh(mean)
+        scale = getattr(self, "action_scale")
+        bias  = getattr(self, "action_bias")
+        a = bias + scale * a
+        return a
+
+    def sample_and_logprob(self, observations, z_vector, **kwargs):
+        if observations.dim() == 2:
+            observations = observations.unsqueeze(1)
+        self.update_distribution(observations, z_vector, **kwargs)
+        a_env = self.distribution.rsample()      # 已是环境动作空间
+        logp  = self.distribution.log_prob(a_env)  # 形状 [B]，已包含 tanh+affine 的雅可比
+        return a_env, logp
+
+    def get_actions_log_prob(self, actions: torch.Tensor):
+        # 如 actions 来自同一分布，直接算即可；若可能略越界，可先夹到 (low, high) 的开区间内
+        return self.distribution.log_prob(actions)
+
     
     @property
     def action_mean(self) -> torch.Tensor:
@@ -619,26 +508,12 @@ class HugWBCPolicyNetwork(nn.Module):
             raise RuntimeError("Must call update_distribution first")
         return self.distribution.stddev
     
-    @property
-    def entropy(self) -> torch.Tensor:
-        """Get entropy of current distribution."""
-        if self.distribution is None:
-            raise RuntimeError("Must call update_distribution first")
-        return self.distribution.entropy().sum(dim=-1)
-    
-    def get_privileged_loss(self, metrics: Optional[Dict[str, float]] = None) -> torch.Tensor:
-        """Get privileged reconstruction loss.
-        
-        Args:
-            metrics: Dictionary to store metrics (optional)
-            
-        Returns:
-            privileged_recon_loss: Reconstruction loss
-        """
-        if metrics is None:
-            metrics = {}
-        return self.actor.compute_adaptation_pred_loss(metrics)
-
+    # @property
+    # def entropy(self) -> torch.Tensor:
+    #     """Get entropy of current distribution."""
+    #     if self.distribution is None:
+    #         raise RuntimeError("Must call update_distribution first")
+    #     return self.distribution.entropy().sum(dim=-1)
 
 # =============================================================================
 # Configuration and Factory Functions
@@ -648,16 +523,14 @@ class HugWBCConfig:
     """Configuration class for HugWBC Policy Network."""
     
     # H1 Robot specific dimensions
-    PROPRIOCEPTION_DIM = 63
+    PROPRIOCEPTION_DIM = 44
     CMD_DIM = 11
     CLOCK_DIM = 0
     ACT_DIM = 19
-    PRIVILEGED_DIM = 24
     TERRAIN_DIM = 221
     
     # Network architecture
     LATENT_DIM = 32
-    PRIVILEGED_RECON_DIM = 3
     MAX_LENGTH = 5
     
     # Hidden layer dimensions
@@ -670,8 +543,8 @@ class HugWBCConfig:
     
     # Action noise parameters
     INIT_NOISE_STD = 1.0
-    MAX_STD = 1.2
-    MIN_STD = 0.1
+    max_log_std = 0.182
+    min_log_std = -2.3
 
 
 def create_sac_policy(z_dim: int = 32, horizon: int = 5, proprio_dim: int = 63, clock_dim: int = 0) -> HugWBCPolicyNetwork:
@@ -694,18 +567,16 @@ def create_sac_policy(z_dim: int = 32, horizon: int = 5, proprio_dim: int = 63, 
         cmd_dim=config.CMD_DIM,
         act_dim=config.ACT_DIM,
         clock_dim=config.CLOCK_DIM,
-        privileged_dim=config.PRIVILEGED_DIM,
         terrain_dim=config.TERRAIN_DIM,
         latent_dim=config.LATENT_DIM,
-        privileged_recon_dim=config.PRIVILEGED_RECON_DIM,
         max_length=config.MAX_LENGTH,
         actor_hidden_dims=config.ACTOR_HIDDEN_DIMS,
         mlp_hidden_dims=config.MLP_HIDDEN_DIMS,
         activation=config.ACTIVATION,
         output_activation=config.OUTPUT_ACTIVATION,
         init_noise_std=config.INIT_NOISE_STD,
-        max_std=config.MAX_STD,
-        min_std=config.MIN_STD
+        max_log_std=config.max_log_std,
+        min_log_std=config.min_log_std
     )
 
 def create_hugwbc_critic(input_dim=321, output_dim=1, hidden_dims=[512, 256, 128], activation='elu', output_activation=None) -> HugWBCPolicyNetwork:
@@ -765,7 +636,7 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Create policy network
-    policy = create_hugwbc_policy(z_dim=32, clock_dim=2)
+    policy = create_sac_policy(z_dim=32, clock_dim=2)
     print(f"Created policy network with {sum(p.numel() for p in policy.parameters())} parameters")
     
     # Print network architecture
@@ -781,34 +652,25 @@ if __name__ == "__main__":
     # Create dummy observations
     observations = torch.randn(batch_size, history_steps, obs_dim)
     z_vector = torch.randn(batch_size, z_dim)
-    privileged_obs = torch.randn(batch_size, 3)  # Full critic observation dimension (63+11+2+24+221)
     clock = torch.randn(batch_size, 2)
     print(f"\nInput shapes:")
     print(f"  observations: {observations.shape}")
     print(f"  z_vector: {z_vector.shape}")
-    print(f"  privileged_obs: {privileged_obs.shape}")
     print(f"  clock: {clock.shape}")
     # Test forward pass
     with torch.no_grad():
         # Deterministic inference
-        actions_mean, latent = policy.act_inference(observations, z_vector, clock=clock)
+        actions_mean = policy.act_inference(observations, z_vector, clock=clock)
         print(f"\nInference output shapes:")
         print(f"  actions_mean: {actions_mean.shape}")
-        print(f"  latent: {latent.shape}")
         
         # Stochastic sampling
-        actions = policy.act(observations, z_vector, privileged_obs, clock=clock, sync_update=True)
+        actions, logp = policy.sample_and_logprob(observations, z_vector, clock=clock)
         print(f"  sampled_actions: {actions.shape}")
         
         # Get log probabilities
         log_probs = policy.get_actions_log_prob(actions)
         print(f"  log_probs: {log_probs.shape}")
-        
-        # Get privileged loss
-        metrics = {'privileged_recon_loss': 0.0}
-        priv_loss = policy.get_privileged_loss(metrics)
-        print(f"\nPrivileged reconstruction loss: {priv_loss.item():.6f}")
-        print(f"Metrics: {metrics}")
     
     print("\n" + "=" * 60)
     print("All tests passed! Policy network is working correctly.")

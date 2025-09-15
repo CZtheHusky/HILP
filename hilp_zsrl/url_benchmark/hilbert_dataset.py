@@ -129,9 +129,9 @@ class HilbertRepresentationDataset(Dataset):
         self.data_dir = data_dir
         self.goal_future = float(goal_future)
         self.p_randomgoal = float(p_randomgoal)
-        self.req_horizon = int(max(1, min(5, obs_horizon)))
+        self.req_horizon = obs_horizon
         self._full_loading = bool(full_loading)
-        self._discount = discount
+        self._discount = np.array(discount, dtype=np.float32)
         self.use_history_action = use_history_action
         self._load_command = load_command
 
@@ -284,7 +284,7 @@ class HilbertRepresentationDataset(Dataset):
             if "commands" in buf:
                 out['commands'] = buf['commands'][t].astype(np.float32)
         if self._discount is not None:
-            out['discount'] = self._discount.astype(np.float32)
+            out['discount'] = self._discount
         return out
    
 

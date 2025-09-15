@@ -181,8 +181,10 @@ class BaseTask():
         self.last_key_state = self.key_state.copy()
         self.last_stick_state = self.stick_state.copy()
 
-    def training_curriculum(self, num_steps=1):
+    def training_curriculum(self, num_steps=1, abs_steps=None):
         self.learning_iter += num_steps
+        if abs_steps is not None:
+            self.learning_iter = abs_steps
 
     def get_observations(self):
         return self.partial_obs_buf

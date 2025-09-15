@@ -11,3 +11,4 @@ exp_local
 outputs
 *.sh
 ipynbs
+eval*/

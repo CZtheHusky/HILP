@@ -2,13 +2,10 @@ import platform
 import os
 
 if 'mac' in platform.platform():
-    # macOS 下通常不需要特殊的渲染后端设置
     pass
 else:
-    # 非 macOS：指定使用 EGL 作为 MuJoCo 的 GL 后端，以便无显示环境下渲染
     os.environ['MUJOCO_GL'] = 'egl'
     if 'SLURM_STEP_GPUS' in os.environ:
-        # 在 SLURM 作业环境下，将 EGL 使用的设备与分配的 GPU 对齐
         os.environ['EGL_DEVICE_ID'] = os.environ['SLURM_STEP_GPUS']
 
 from pathlib import Path
@@ -24,15 +21,16 @@ import torch
 import warnings
 
 logger = logging.getLogger(__name__)
-torch.backends.cudnn.benchmark = True  # 允许 cuDNN 在固定形状下做最优算法搜索
-warnings.filterwarnings('ignore', category=DeprecationWarning)  # 屏蔽冗余的弃用告警
-
+torch.backends.cudnn.benchmark = True
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+from collections import defaultdict
 import json
 import dataclasses
 import tempfile
 import typing as tp
 from pathlib import Path
-
+import math
+import torch.nn.functional as F
 import hydra
 from hydra.core.config_store import ConfigStore
 import numpy as np
@@ -47,17 +45,11 @@ from url_benchmark import agent as agents
 from url_benchmark.logger import Logger
 from url_benchmark.in_memory_replay_buffer import ReplayBuffer
 from url_benchmark.video import VideoRecorder
-from url_benchmark.replay_loader_builder import build_replay_loader
 from url_benchmark.my_utils import record_video
-
+from url_benchmark.humanoid_utils import _safe_set_viewer_cam, get_cosine_sim, collect_nonzero_losses, calc_phi_loss_upper, calc_z_vector_matrixes, plot_matrix_heatmaps, compute_global_color_limits, plot_tripanel_heatmaps_with_line, plot_per_step_z
 
 @dataclasses.dataclass
 class Config:
-    """顶层配置
-
-    - agent: 由 Hydra 实例化的 agent 配置（见 url_benchmark/agent 下实现）
-    - 训练/评估/数据集等的所有关键参数
-    """
     agent: tp.Any
     # misc
     run_group: str = "Debug"
@@ -93,7 +85,7 @@ class Config:
     num_grad_steps: int = 1000000
     log_every_steps: int = 1000
     num_seed_frames: int = 0
-    replay_buffer_episodes: int = 5000  # 从离线缓冲区加载的 episode 数上限
+    replay_buffer_episodes: int = 5000
     update_encoder: bool = True
     batch_size: int = omgcf.II("agent.batch_size")
     goal_eval: bool = False
@@ -101,16 +93,14 @@ class Config:
     load_replay_buffer: tp.Optional[str] = None
     expl_agent: str = "rnd"
     replay_buffer_dir: str = omgcf.SI("../../../../datasets")
+    resume_from: tp.Optional[str] = None
+    eval_only: bool = False
 
 
 ConfigStore.instance().store(name="workspace_config", node=Config)
 
 
 class BaseReward:
-    """封装基于 DM Control 物理的奖励计算，用于自定义评估。
-
-    子类实现 get_goal/from_env 等接口，便于在不同任务下统一调用。
-    """
     def __init__(self, seed: tp.Optional[int] = None) -> None:
         self._env: dmc.EnvWrapper  # to be instantiated in subclasses
         self._rng = np.random.RandomState(seed)
@@ -129,7 +119,6 @@ class BaseReward:
 
 
 class DmcReward(BaseReward):
-    """基于 dm_control 的任务奖励，按给定的 env_task 名称实例化环境以计算 reward。"""
     def __init__(self, name: str) -> None:
         super().__init__()
         self.name = name
@@ -149,7 +138,6 @@ class DmcReward(BaseReward):
 def make_agent(
         obs_type: str, image_wh, obs_spec, action_spec, num_expl_steps: int, cfg: omgcf.DictConfig
 ) -> tp.Union[agents.FBDDPGAgent, agents.DDPGAgent]:
-    """利用 Hydra 配置实例化 agent，并注入观测/动作规格与探索步数。"""
     cfg.obs_type = obs_type
     cfg.image_wh = image_wh
     cfg.obs_shape = obs_spec.shape
@@ -159,12 +147,7 @@ def make_agent(
     return hydra.utils.instantiate(cfg)
 
 
-def _init_eval_meta(workspace, custom_reward: BaseReward = None):
-    """为评估阶段预先推断 agent 的 meta（例如 ZSRL 中的 z 向量）。
-
-    逻辑：从 ReplayBuffer 采样若干步，拼接成固定长度的 (obs, reward, next_obs)，
-    调用 agent.infer_meta_from_obs_and_rewards 生成评估所需的 meta。
-    """
+def _init_eval_meta(workspace, custom_reward: BaseReward = None, feature_type: str = None):
     num_steps = workspace.agent.cfg.num_inference_steps
     obs_list, reward_list, next_obs_list = [], [], []
     batch_size = 0
@@ -181,13 +164,15 @@ def _init_eval_meta(workspace, custom_reward: BaseReward = None):
         batch_size += batch.next_obs.size(0)
     obs, reward, next_obs = torch.cat(obs_list, 0), torch.cat(reward_list, 0), torch.cat(next_obs_list, 0)
     obs_t, reward_t, next_obs_t = obs[:num_steps], reward[:num_steps], next_obs[:num_steps]
-    return workspace.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t)
+    return workspace.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t, feature_type)
 
 
 class Workspace:
-    """训练工作台，负责构建组件与承载训练/评估/保存等过程。"""
     def __init__(self, cfg: Config) -> None:
-        self.work_dir = Path.cwd()
+        if cfg.resume_from is not None:
+            self.work_dir = Path(cfg.resume_from)
+        else:
+            self.work_dir = Path.cwd()
         print(f'Workspace: {self.work_dir}')
         print(f'Running code in : {Path(__file__).parent.resolve().absolute()}')
         logger.info(f'Workspace: {self.work_dir}')
@@ -205,7 +190,7 @@ class Workspace:
         task = cfg.task
         self.domain = task.split('_', maxsplit=1)[0]
 
-        self.train_env = self._make_env()  # 环境仅用于读取规格与评估
+        self.train_env = self._make_env()
         self.eval_env = self._make_env()
         # create agent
         self.train_env.reset()
@@ -229,15 +214,14 @@ class Workspace:
             if 'SLURM_PROCID' in os.environ:
                 exp_name += f'{os.environ["SLURM_PROCID"]}.'
             exp_name += '_'.join([
-                cfg.run_group, cfg.agent, self.domain,
+                cfg.run_group, cfg.agent.name, self.domain,
             ])
             wandb_output_dir = tempfile.mkdtemp()
             wandb.init(project='hilp_zsrl', group=cfg.run_group, name=exp_name,
                        config=omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
                        dir=wandb_output_dir)
 
-        # 初始化一个空的 ReplayBuffer 占位，随后从 checkpoint 加载真实数据
-        # self.replay_loader = ReplayBuffer(max_episodes=cfg.replay_buffer_episodes, discount=cfg.discount, future=cfg.future)
+        self.replay_loader = ReplayBuffer(max_episodes=cfg.replay_buffer_episodes, discount=cfg.discount, future=cfg.future)
 
         cam_id = 0 if 'quadruped' not in self.domain else 2
 
@@ -254,23 +238,13 @@ class Workspace:
         elif cfg.load_model is not None:
             self.load_checkpoint(cfg.load_model, exclude=["replay_loader"])
 
-        datasets_dir = self.work_dir / cfg.replay_buffer_dir  # 数据集根目录（用于信息打印/对齐路径）
+        datasets_dir = self.work_dir / cfg.replay_buffer_dir
         replay_dir = datasets_dir.resolve() / self.domain / cfg.expl_agent / 'buffer'
         print(f'replay dir: {replay_dir}')
 
         print("loading Replay from %s", self.cfg.load_replay_buffer)
-        # self.load_checkpoint(self.cfg.load_replay_buffer, only=["replay_loader"], num_episodes=cfg.replay_buffer_episodes, use_pixels=(cfg.obs_type == 'pixels'))
+        self.load_checkpoint(self.cfg.load_replay_buffer, only=["replay_loader"], num_episodes=cfg.replay_buffer_episodes, use_pixels=(cfg.obs_type == 'pixels'))
 
-        self.replay_loader = build_replay_loader(
-            load_replay_buffer=cfg.load_replay_buffer,
-            replay_buffer_episodes=cfg.replay_buffer_episodes,
-            obs_type=cfg.obs_type,
-            frame_stack=cfg.frame_stack,
-            discount=cfg.discount,
-            future=cfg.future,
-            p_currgoal=cfg.p_currgoal,
-            p_randomgoal=cfg.p_randomgoal,
-        )
         self.replay_loader._future = cfg.future
         self.replay_loader._discount = cfg.discount
         self.replay_loader._p_currgoal = cfg.p_currgoal
@@ -306,7 +280,10 @@ class Workspace:
         return next_obs_t[torch.argmax(reward_t)].detach().cpu().numpy()
 
     def train(self):
-        """主训练循环：反复从 ReplayBuffer 采样并调用 agent.update 进行训练，周期性评估与保存。"""
+        if self.cfg.eval_only:
+            self.finalize()
+            return
+        
         train_until_step = utils.Until(self.cfg.num_grad_steps)
         eval_every_step = utils.Every(self.cfg.eval_every_steps)
         log_every_step = utils.Every(self.cfg.log_every_steps)
@@ -318,7 +295,6 @@ class Workspace:
                 self.eval()
 
             metrics = self.agent.update(self.replay_loader, self.global_step)
-            # wandb.log(metrics, step=self.global_step)
             self.logger.log_metrics(metrics, self.global_step, ty='train')
             if log_every_step(self.global_step):
                 elapsed_time, total_time = self.timer.reset()
@@ -338,34 +314,44 @@ class Workspace:
             self.save_checkpoint(self._checkpoint_filepath, exclude=["replay_loader"])  # make sure we save the final checkpoint
         self.finalize()
 
-    def eval(self, final_eval=False):
-        """评估循环：在 eval_env 上 roll-out，记录奖励与视频。
-
-        - 支持 goal_eval：在 HILP 任务中按帧动态更新目标 meta。
-        - 支持自定义奖励：可在最终评估中使用。
-        """
+    def eval(self, final_eval=False, prefix=None):
+        assert prefix is None or prefix == 'state' or prefix == 'diff', "prefix must be None, state, or diff"
         step, episode = 0, 0
         eval_until_episode = utils.Until(self.cfg.num_eval_episodes)
         physics_agg = dmc.PhysicsAggregator()
         rewards: tp.List[float] = []
         custom_reward = self._make_custom_reward()  # not None only if final_eval
-        meta = _init_eval_meta(self, custom_reward)
+        meta, diag = _init_eval_meta(self, custom_reward, feature_type=prefix)
         videos = []
+        if prefix is None:
+            # cos_sim_save_parent = self.work_dir / self.cfg.task / 'state_cosine_sim'
+            current_goal_path = self.work_dir / self.cfg.task / 'state_current_goal'
+        else:
+            # cos_sim_save_parent = self.work_dir / self.cfg.task / f'_cosine_sim'
+            current_goal_path = self.work_dir / self.cfg.task / f'_current_goal'
+        import shutil
+        # shutil.rmtree(cos_sim_save_parent, ignore_errors=True)
+        shutil.rmtree(current_goal_path, ignore_errors=True)
+        # cos_sim_save_parent.mkdir(exist_ok=True, parents=True)
+        current_goal_path.mkdir(exist_ok=True, parents=True)
+        zstate_records = defaultdict(list)
         while eval_until_episode(episode):
             time_step = self.eval_env.reset()
             if self.cfg.goal_eval:
                 goal = self.get_argmax_goal(custom_reward)
                 meta = self.agent.get_goal_meta(goal_array=goal, obs_array=time_step.observation)
-
+            current_z = torch.as_tensor(meta['z']).to(self.cfg.device).unsqueeze(0)
             total_reward = 0.0
             video_enabled = (episode < 2) and (self.global_frame % self.cfg.video_every_steps == 0)
             self.video_recorder.init(self.eval_env, enabled=video_enabled)
+            current_phi = []
             while not time_step.last():
-                if self.cfg.goal_eval and self.cfg.agent == 'sf' and self.cfg.agent.feature_learner == 'hilp':
+                if self.cfg.goal_eval and self.cfg.agent.name == 'sf' and self.cfg.agent.feature_learner == 'hilp':
                     # Recompute z every step
                     meta = self.agent.get_goal_meta(goal_array=goal, obs_array=time_step.observation)
                 with torch.no_grad(), utils.eval_mode(self.agent):
-                    action = self.agent.act(time_step.observation, meta, self.global_step, eval_mode=True)
+                    action, phi = self.agent.act(time_step.observation, meta, self.global_step, eval_mode=True)
+                    current_phi.append(phi)
                 time_step = self.eval_env.step(action)
                 physics_agg.add(self.eval_env)
                 if step % self.cfg.num_skip_frames == 0:
@@ -374,6 +360,48 @@ class Workspace:
                     time_step.reward = custom_reward.from_env(self.eval_env)
                 total_reward += time_step.reward
                 step += 1
+            hilbert_traj = torch.cat(current_phi, axis=0)
+            last_z = hilbert_traj[-1]
+            z_diff = torch.diff(hilbert_traj, dim=0)
+            z_diff_normed = math.sqrt(self.cfg.agent.z_dim) * F.normalize(z_diff, dim=1)
+            z_diff_normed = z_diff_normed.cpu().numpy()
+            goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj.cpu().numpy(), goal_vector=last_z.cpu().numpy())
+            # plot_per_step_z(
+            #     latent=z_diff_normed,
+            #     eid=episode,
+            #     out_dir=cos_sim_save_parent,   
+            # )
+            plot_tripanel_heatmaps_with_line(
+                goal_z_cosine_sim_list,
+                goal_distance_list,
+                goal_absdist_list,
+                [f"goal={goal_z_cosine_sim_list[g_idx].shape[-1]}_{episode}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
+                current_goal_path,
+                title_cos=f'{episode} Z Cosine Similarity',
+                title_dist=f'{episode} Latent Space Distance',
+            )
+            goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj.cpu().numpy(), goal_vector=current_z.cpu().numpy())
+            plot_tripanel_heatmaps_with_line(
+                goal_z_cosine_sim_list,
+                goal_distance_list,
+                goal_absdist_list,
+                [f"goal=z_fit_{episode}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
+                current_goal_path,
+                title_cos=f'z_fit {episode} Z Cosine Similarity',
+                title_dist=f'z_fit {episode} Latent Space Distance',
+            )
+            diff_rewards = torch.einsum('sd, sd -> s', z_diff, current_z)
+            state_rewards = torch.einsum('sd, sd -> s', hilbert_traj[1:], current_z)
+            diff_sum = torch.sum(diff_rewards).item()
+            state_sum = torch.sum(state_rewards).item()
+            diff_mean = torch.mean(diff_rewards).item()
+            state_mean = torch.mean(state_rewards).item()
+            zstate_records['diff_rew_sum'].append(diff_sum)
+            zstate_records['state_rew_sum'].append(state_sum)
+            zstate_records['diff_rew_mean'].append(diff_mean)
+            zstate_records['state_rew_mean'].append(state_mean)
+            zstate_records['diff_rew_mean'].append(diff_mean)
+            zstate_records['state_rew_mean'].append(state_mean)
             if video_enabled:
                 videos.append(self.video_recorder.frames)
             rewards.append(total_reward)
@@ -383,27 +411,27 @@ class Workspace:
         self.eval_rewards_history.append(float(np.mean(rewards)))
         if final_eval:
             return {
-                'episode_reward': self.eval_rewards_history[-1],
+                f'episode_reward': self.eval_rewards_history[-1],
             }, videos
 
         if len(videos) > 0:
             video = record_video(f'TrajVideo_{self.global_frame}', videos, skip_frames=2)
-            wandb.log({'TrajVideo': video}, step=self.global_frame)
+            wandb.log({f'TrajVideo': video}, step=self.global_frame)
         with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
-            log('episode_reward', self.eval_rewards_history[-1])
+            log(f'episode_reward', self.eval_rewards_history[-1])
             if len(rewards) > 1:
-                log('episode_reward#std', float(np.std(rewards)))
-            log('episode_length', step * self.cfg.action_repeat / episode)
-            log('episode', self.global_episode)
+                log(f'episode_reward#std', float(np.std(rewards)))
+            log(f'episode_length', step * self.cfg.action_repeat / episode)
+            log(f'episode', self.global_episode)
             log('step', self.global_step)
+            for k, v in diag.items():
+                log(f'diag_{k}', v)
+            for k, v in zstate_records.items():
+                log(f'z_{k}', np.mean(v))
 
     _CHECKPOINTED_KEYS = ('agent', 'global_step', 'global_episode', "replay_loader")
 
     def save_checkpoint(self, fp: tp.Union[Path, str], exclude: tp.Sequence[str] = ()) -> None:
-        """保存关键状态用于断点重训。
-
-        保存内容包含：agent、global_step、global_episode、replay_loader（可被 only/exclude 调整）。
-        """
         logger.info(f"Saving checkpoint to {fp}")
         exclude = list(exclude)
         assert all(x in self._CHECKPOINTED_KEYS for x in exclude)
@@ -416,13 +444,6 @@ class Workspace:
             torch.save(payload, f, pickle_protocol=4)
 
     def load_checkpoint(self, fp: tp.Union[Path, str], only: tp.Optional[tp.Sequence[str]] = None, exclude: tp.Sequence[str] = (), num_episodes=None, use_pixels=False) -> None:
-        """从磁盘加载 checkpoint。
-
-        - only：仅恢复指定键（例如只加载 replay_loader）。
-        - exclude：排除指定键（例如不恢复 replay_loader）。
-        - num_episodes：可在加载时裁剪 ReplayBuffer 的 episode 数。
-        - use_pixels：当使用像素观测时，将存储中的 'pixel' 字段重命名为 'observation'。
-        """
         print(f"loading checkpoint from {fp}")
         fp = Path(fp)
         with fp.open('rb') as f:
@@ -468,7 +489,6 @@ class Workspace:
                     logger.warning(f"Reloaded agent at global episode {self.global_episode}")
 
     def finalize(self) -> None:
-        """最终评估：对一个 domain 下的所有变体任务逐一评估并日志化视频与指标。"""
         print("Running final test", flush=True)
 
         domain_tasks = {
@@ -492,15 +512,26 @@ class Workspace:
             self.eval_rewards_history = []
             self.cfg.num_eval_episodes = self.cfg.num_final_eval_episodes
             info, video = self.eval(final_eval=True)
-            rewards[name] = self.eval_rewards_history
+            rewards[name] = self.eval_rewards_history.copy()
             infos[name] = info
             videos[name] = video
+            # try:
+            #     diff_info, diff_video = self.eval(final_eval=True, prefix='diff')
+            #     videos[name + '_diff'] = diff_video
+            #     infos[name + '_diff'] = diff_info
+            #     rewards[name + '_diff'] = self.eval_rewards_history.copy()
+            # except Exception as e:
+            #     print(f"Error evaluating {name} diff: {e}")
         with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
             for name in domain_tasks[self.domain]:
                 video = record_video(f'Final_{name}', videos[name], skip_frames=2)
+                # diff_video = record_video(f'Final_{name}_diff', videos[name + '_diff'], skip_frames=2)
                 wandb.log({f'Final_{name}': video}, step=self.global_frame)
+                # wandb.log({f'Final_{name}_diff': diff_video}, step=self.global_frame)
                 for k, v in infos[name].items():
                     log(f'final/{name}/{k}', v)
+                # for k, v in diff_info.items():
+                #     log(f'final/{name}_diff/{k}', v)
         self.eval_rewards_history = eval_hist  # restore
         with (self.work_dir / "test_rewards.json").open("w") as f:
             json.dump(rewards, f)

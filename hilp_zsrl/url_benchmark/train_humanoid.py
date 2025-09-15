@@ -14,7 +14,8 @@ import matplotlib.pyplot as plt
 #     if 'SLURM_STEP_GPUS' in os.environ:
 #         # 在 SLURM 作业环境下，将 EGL 使用的设备与分配的 GPU 对齐
 #         os.environ['EGL_DEVICE_ID'] = os.environ['SLURM_STEP_GPUS']
-
+import yaml
+import shutil
 from pathlib import Path
 import sys
 base = Path(__file__).absolute().parents[1]
@@ -37,7 +38,8 @@ import warnings
 
 # logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore', category=DeprecationWarning)  # 屏蔽冗余的弃用告警
-
+import math
+import torch.nn.functional as F
 import json
 import dataclasses
 import tempfile
@@ -68,140 +70,16 @@ from collections import defaultdict
 # pbar import
 import datetime
 from tqdm import tqdm
-
-def _safe_set_viewer_cam(env, pos, look, track_index=0):
-    env.set_camera(pos, look, track_index)
-
-# calculate the cosine similarity of a trajectory
-def get_cosine_sim(array: np.ndarray) -> np.ndarray:
-    assert len(array.shape) == 2
-    norms = np.linalg.norm(array, axis=-1, keepdims=True)
-    norms = np.where(norms == 0, 1e-12, norms)  # 防止除零
-    unit = array / norms
-    return unit @ unit.T
-
-def collect_nonzero_losses(M: np.ndarray, eps: float = 0.0):
-    """
-    从 φ-loss 矩阵中收集非零（或绝对值>eps）的有效项（忽略 NaN），返回数值列表。
-    """
-    mask = ~np.isnan(M)
-    if eps > 0:
-        mask &= (np.abs(M) > eps)
-    else:
-        mask &= (M != 0)
-    return M[mask].tolist()
-
-def collect_nonzero_losses_with_idx(M: np.ndarray, eps: float = 0.0):
-    """
-    收集 (i, g, value) 三元组：i 行、g 列、对应 loss 值。
-    仅保留有效且非零（或绝对值>eps）的条目。
-    """
-    mask = ~np.isnan(M)
-    if eps > 0:
-        mask &= (np.abs(M) > eps)
-    else:
-        mask &= (M != 0)
-    is_, gs = np.where(mask)
-    return [(int(i), int(g), float(M[i, g])) for i, g in zip(is_, gs)]
+from url_benchmark.humanoid_utils import _safe_set_viewer_cam, get_cosine_sim, collect_nonzero_losses, calc_phi_loss_upper, calc_z_vector_matrixes, plot_matrix_heatmaps, compute_global_color_limits, plot_tripanel_heatmaps_with_line, plot_per_step_z
 
 
-def calc_phi_loss_upper(arr: np.ndarray, gamma: float = 0.99, fill_value: float = np.nan) -> np.ndarray:
-    """
-    计算 φ-loss：
-        L(i,g) = -1 - gamma * ||arr[i+1] - arr[g]|| + ||arr[i] - arr[g]||, 仅对 g>i
-
-    返回 T x T 的严格上三角矩阵 M：
-        M[i, g] = L(i, g)  (仅 g>i 有值)
-        其它位置填 fill_value（默认 NaN）
-    """
-    assert arr.ndim == 2, f"expect 2D, got {arr.shape}"
-    T = arr.shape[0]
-    if T < 2:
-        return np.full((T, T), fill_value, dtype=np.float32)
-
-    # 所有 pairwise L2 距离 dists[a, b] = ||arr[a] - arr[b]||
-    diffs = arr[:, None, :] - arr[None, :, :]   # [T, T, D]
-    dists = np.linalg.norm(diffs, axis=-1)      # [T, T]
-
-    # 严格上三角索引：rows=i, cols=g, 且 g>i
-    rows, cols = np.triu_indices(T, k=1)
-
-    out = np.full((T, T), fill_value, dtype=dists.dtype)
-    # 注意：rows 最大为 T-2，因此 rows+1 索引安全
-    out[rows, cols] = -1.0 - gamma * dists[rows + 1, cols] + dists[rows, cols]
-    return out
-
-def compute_global_color_limits(mats, lower_q: float = 5, upper_q: float = 95):
-    """
-    参数:
-        mats: 由多个 (T, T) φ-loss 矩阵构成的列表，矩阵中无效处为 NaN
-        lower_q, upper_q: 用分位数裁剪极端值，稳健设定颜色范围
-    返回:
-        (vmin, vmax)
-    """
-    vals = []
-    for M in mats:
-        if M is None:
-            continue
-        v = M[~np.isnan(M)]
-        if v.size:
-            vals.append(v)
-    if not vals:
-        return None, None
-    all_vals = np.concatenate(vals)
-    vmin, vmax = np.percentile(all_vals, [lower_q, upper_q])
-    if not np.isfinite(vmin) or not np.isfinite(vmax):
-        return None, None
-    if vmin == vmax:
-        eps = 1e-6
-        vmin -= eps
-        vmax += eps
-    return float(vmin), float(vmax)
-
-def plot_phi_loss_heatmaps(
-    mats,
-    names,
-    out_dir: str,
-    vmin,
-    vmax,
-    max_T= None,
-    cmap_name: str = "coolwarm",
-):
-    """
-    使用统一的 vmin/vmax，为每个 episode 的 φ-loss 矩阵绘图保存。
-    """
-    os.makedirs(out_dir, exist_ok=True)
-
-    cmap = plt.get_cmap(cmap_name).copy()
-    cmap.set_bad(color="#eeeeee")  # NaN 区域浅灰
-
-    for M, name in zip(mats, names):
-        if M is None:
-            continue
-        # 可选：限制最大绘制尺寸
-        if max_T is not None:
-            M_plot = M[:max_T, :max_T]
+def merge_keys(dict1, dict2):
+    for k, v in dict2.items():
+        if isinstance(v, dict):
+            dict1[k] = merge_keys(dict1.get(k, {}), v)
         else:
-            M_plot = M
-
-        masked = np.ma.masked_invalid(M_plot)
-
-        fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
-        im = ax.imshow(masked, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
-        cb = fig.colorbar(im, ax=ax)
-        cb.set_label("φ-loss")
-
-        ax.set_title(f"Phi loss (upper triangle) - {name}")
-        ax.set_xlabel("g (future timestep)")
-        ax.set_ylabel("i (current timestep)")
-
-        # y 轴从上到下
-        ax.set_xlim(-0.5, masked.shape[1]-0.5)
-        ax.set_ylim(masked.shape[0]-0.5, -0.5)
-
-        plt.tight_layout()
-        fig.savefig(os.path.join(out_dir, f"phi_loss_latent_{name}.png"), bbox_inches='tight')
-        plt.close(fig)
+            dict1[k] = v
+    return dict1
 
 @dataclasses.dataclass
 class Config:
@@ -234,18 +112,14 @@ class Config:
     num_envs: int = 1
     episode_length_s: float = 10.0
     commands_resampling_time: float = 10.0
-    headless: bool = False
+    headless: bool = True
     use_history_action: bool = True
     
     # eval
     num_eval_episodes: int = 10
     eval_every_steps: int = 10000
     num_final_eval_episodes: int = 50
-    video_every_steps: int = 100000
-    num_skip_frames: int = 2
     custom_reward: tp.Optional[str] = None  # activates custom eval if not None
-    # checkpoint
-    snapshot_at: tp.Tuple[int, ...] = ()
     # training
     num_grad_steps: int = 100000000
     log_every_steps: int = 1000
@@ -256,16 +130,13 @@ class Config:
     goal_eval: bool = False
     # dataset
     load_replay_buffer: tp.Optional[str] = None
-    expl_agent: str = "rnd"
-    replay_buffer_dir: str = omgcf.SI("../../../../datasets")
     # legged-gym dataset (Hilbert zarr) options
-    hilbert_types: tp.Optional[tp.List[str]] = None
-    hilbert_max_episodes_per_type: tp.Optional[int] = None
-    hilbert_obs_horizon: int = 5
     # eval control
     eval_only: bool = False
+    eval_all: bool = False
     save_video: bool = False
     resume_from: tp.Optional[str] = None
+    resume_phi_from: tp.Optional[str] = None
 
 
 ConfigStore.instance().store(name="workspace_config", node=Config)
@@ -273,7 +144,7 @@ ConfigStore.instance().store(name="workspace_config", node=Config)
 
 def make_agent(
         obs_type: str, image_wh, obs_spec, action_spec, num_expl_steps: int, cfg: omgcf.DictConfig
-) -> tp.Union[agents.FBDDPGAgent, agents.DDPGAgent]:
+) -> tp.Union[agents.FBDDPGAgent, agents.DDPGAgent, agents.SFHumanoidAgent]:
     """利用 Hydra 配置实例化 agent，并注入观测/动作规格与探索步数。"""
     cfg.obs_type = obs_type
     cfg.image_wh = image_wh
@@ -287,6 +158,7 @@ class Workspace:
     """训练工作台，负责构建组件与承载训练/评估/保存等过程。"""
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
+        assert not (cfg.headless and cfg.save_video), "headless and save_video cannot be both True"
         hydra_dir = Path.cwd()
         parent_dir = os.path.dirname(os.path.dirname(hydra_dir))
       
@@ -298,93 +170,115 @@ class Workspace:
                 cfg.device = "cpu"
                 cfg.agent.device = "cpu"
         self.device = torch.device(cfg.device)
-
         task = cfg.task
         self.domain = task.split('_', maxsplit=1)[0]
 
         # self.train_env = self._make_env()  # 环境仅用于读取规格与评估
         self.eval_env = self._make_eval_env()
         self._init_env_cam(self.eval_env)
+        print("CFG Device: ", cfg.device)
+        print("Self Device: ", self.device)
+        print("Eval Env Device: ", self.eval_env.device)
 
-        exp_name = ''
-        # exp_name += f'sd{cfg.seed:03d}_'
-        if 'SLURM_JOB_ID' in os.environ:
-            exp_name += f's_{os.environ["SLURM_JOB_ID"]}.'
-        if 'SLURM_PROCID' in os.environ:
-            exp_name += f'{os.environ["SLURM_PROCID"]}.'
-        exp_name += '_'.join([cfg.agent.name, self.domain, str(self.cfg.discount), f"f{str(self.cfg.future)}", f"pr{str(self.cfg.p_randomgoal)}", f"phi_exp{str(self.cfg.agent.hilp_expectile)}", f"phi_g{str(self.cfg.agent.hilp_discount)}", f"ql{str(self.cfg.agent.q_loss)}", str(self.cfg.agent.command_injection), f"mix{str(self.cfg.agent.mix_ratio)}", str(self.cfg.use_history_action), str(self.cfg.agent.z_dim), self.cfg.load_replay_buffer.split("/")[-1], f"phih{str(self.cfg.agent.phi_hidden_dim)}", f"{str(self.cfg.agent.feature_type)}"
-        ])
+        exp_name = 'offline'
         if cfg.resume_from is not None:
-            resume_parent_dir = os.path.dirname(cfg.resume_from)
-            resume_exp_name = os.path.basename(resume_parent_dir)
-            assert resume_exp_name == exp_name, f"Resume exp name {resume_exp_name} does not match {exp_name}"
-            self.work_dir = cfg.resume_from
-            import yaml
-            with open(os.path.join(self.work_dir, "wandb.yaml"), "r") as f:
-                wandb_run_id = yaml.safe_load(f)["run_id"]
+            if self.cfg.resume_from.endswith('.pt'):
+                self.work_dir = cfg.resume_from.split('models')[0].rstrip('/')
+            else:
+                self.work_dir = cfg.resume_from
+            try:
+                with open(os.path.join(self.work_dir, "wandb.yaml"), "r") as f:
+                    wandb_run_id = yaml.safe_load(f)["run_id"]
+            except:
+                wandb_run_id = None
         else:
             self.work_dir = os.path.join(parent_dir, exp_name, datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
             wandb_run_id = None
         os.makedirs(self.work_dir, exist_ok=True)
         print(f'Workspace: {self.work_dir}')
         print(f'Running code in : {Path(__file__).parent.resolve().absolute()}')
-        # logger.info(f'Workspace: {self.work_dir}')
-        # logger.info(f'Running code in : {Path(__file__).parent.resolve().absolute()}')  
 
-        wandb_output_dir = tempfile.mkdtemp()
+        # ===== Persist and restore cfg as YAML =====
+        config_yaml_path = os.path.join(self.work_dir, "config.yaml")
+        if cfg.resume_from is not None:
+            # On resume, attempt to load the stored cfg and use it
+            if os.path.exists(config_yaml_path):
+                try:
+                    with open(config_yaml_path, "r") as f:
+                        loaded_cfg_dict = yaml.safe_load(f)
+                    loaded_cfg = omgcf.OmegaConf.create(loaded_cfg_dict)
+                    # Preserve current resume path and work_dir
+                    loaded_cfg.resume_from = cfg.resume_from
+                    loaded_cfg.work_dir = self.work_dir
+                    loaded_cfg.eval_only = cfg.eval_only
+                    loaded_cfg.device = cfg.device
+                    loaded_cfg.agent.device = cfg.device
+                    loaded_cfg.use_wandb = cfg.use_wandb
+                    loaded_cfg['eval_all'] = cfg.eval_all
+                    self.cfg = loaded_cfg
+                    cfg = self.cfg
+                    print("Loading cfg from", config_yaml_path)
+                except Exception as e:
+                    print(f"Warning: failed to load cfg from {config_yaml_path}: {e}. Using provided cfg.")
+            else:
+                print(f"Warning: {config_yaml_path} not found for resume. Using provided cfg.")
+        else:
+            # New run: save resolved cfg as YAML for future resume
+            try:
+                cfg_to_save = omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
+                with open(config_yaml_path, "w") as f:
+                    yaml.safe_dump(cfg_to_save, f, sort_keys=False)
+            except Exception as e:
+                print(f"Warning: failed to save cfg to {config_yaml_path}: {e}")
+                
+        exp_name += '_'.join([f"pr{str(self.cfg.p_randomgoal)}", f"phe{str(self.cfg.agent.hilp_expectile)}", f"phg{str(self.cfg.agent.hilp_discount)}", str(self.cfg.agent.command_injection), f"mix{str(self.cfg.agent.mix_ratio)}", str(self.cfg.use_history_action), str(self.cfg.agent.z_dim), self.cfg.load_replay_buffer.split("/")[-1], f"phh{str(self.cfg.agent.phi_hidden_dim)}", f"{str(self.cfg.agent.feature_type)}", f"sac{str(self.cfg.agent.use_sac_net)}", f"hor{str(self.cfg.agent.obs_horizon)}", f"rsz{str(self.cfg.agent.random_sample_z)}"])
+        self.exp_name = exp_name
+        
         cfg_dict = omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
         cfg_dict['work_dir'] = self.work_dir
         if self.cfg.use_wandb:
             wandb.init(project='hilp_zsrl', group=cfg.run_group, name=exp_name,
                         config=cfg_dict,
-                        dir=wandb_output_dir,
                         resume='allow',
-                        id=wandb_run_id
+                        id=wandb_run_id if not self.cfg.eval_only else None,
             )
+            run_id = wandb.run.id
+            with open(os.path.join(self.work_dir, "wandb.yaml"), "w") as f:
+                yaml.dump({"run_id": run_id}, f)
         self.timer = utils.Timer()
         self.global_step = 0
         self.global_episode = 0
         self.eval_rewards_history: tp.List[float] = []
+        print("CFG Device: ", cfg.device)
+        print("Self Device: ", self.device)
+        print("Eval Env Device: ", self.eval_env.device)
 
         print("loading Replay from %s", self.cfg.load_replay_buffer)
         hard_coded_act_spec = spaces.Box(low=-1, high=1, shape=(19,), dtype=np.float32)
-        # if "Mixture" in self.cfg.load_replay_buffer:
         dataset = HilbertRepresentationDataset(
             data_dir=str(cfg.load_replay_buffer),
             goal_future=float(cfg.future),
             p_randomgoal=float(cfg.p_randomgoal),
-            obs_horizon=int(cfg.hilbert_obs_horizon),
+            obs_horizon=int(cfg.agent.obs_horizon),
             full_loading=True,
             use_history_action=cfg.use_history_action,
             discount=float(cfg.discount),
             load_command=self.cfg.agent.command_injection,
         )
-        # else:
-        #     dataset = HilbertRepresentationDatasetLegacy(
-        #         data_dir=str(cfg.load_replay_buffer),
-        #         goal_future=float(cfg.future),
-        #         p_randomgoal=float(cfg.p_randomgoal),
-        #         obs_horizon=int(cfg.hilbert_obs_horizon),
-        #         types=cfg.hilbert_types,
-        #         max_episodes_per_type=cfg.hilbert_max_episodes_per_type,
-        #         full_loading=True,
-        #         use_history_action=cfg.use_history_action,
-        #         discount=float(cfg.discount),
-        #     )
         train_set, val_set = torch.utils.data.random_split(dataset, [0.95, 0.05])
         data_loader_conf = {
             "batch_size": self.cfg.batch_size,
             "shuffle": True,
-            "num_workers": 4,
+            "num_workers": 2,
             "pin_memory": True,
         }
         self.train_dataloader = DataLoader(train_set, **data_loader_conf)
-        self.val_dataloader = DataLoader(val_set, batch_size=self.cfg.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+        self.val_dataloader = DataLoader(val_set, batch_size=self.cfg.batch_size, shuffle=True, pin_memory=False)
         sample = dataset[0]
         print("Sample obs dim: ", sample['next_obs'].shape[-1])
         flatten_obs_dim = int(sample['next_obs'].shape[-1])
         self.flatten_obs_dim = flatten_obs_dim
-        self.obs_dim = int(flatten_obs_dim // self.cfg.hilbert_obs_horizon)
+        self.obs_dim = int(flatten_obs_dim // self.cfg.agent.obs_horizon)
         print("Obs dim per time step: ", self.obs_dim)
         agent_cfg = self.cfg.agent
         agent_cfg.obs_shape = (flatten_obs_dim,)
@@ -399,6 +293,9 @@ class Workspace:
         self.target_traj_idx = {}
         self.raw_cosine_sim = {}
         self.raw_diff_cosine_sim = {}
+        self.raw_diff_distance = {}
+        self.raw_distance = {}
+        
         for dirn in os.listdir(self.cfg.example_replay_path):
             full_path = os.path.join(self.cfg.example_replay_path, dirn)
             commandn = dirn.split('.')[0]
@@ -411,13 +308,21 @@ class Workspace:
             ep_end = episode_ends[max_traj_idx]
             self.target_traj_idx[commandn] = (max_traj_idx, ep_start, ep_end)
         if cfg.resume_from is not None:
-            models_dir = os.path.join(self.work_dir, "models")
-            assert os.path.exists(models_dir), f"Models dir {models_dir} does not exist"
-            models = os.listdir(models_dir)
-            models.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-            self._checkpoint_filepath = os.path.join(self.work_dir, "models", models[-1])
-            if os.path.exists(self._checkpoint_filepath):
-                self.load_checkpoint(self._checkpoint_filepath)
+            if cfg.resume_from.endswith('.pt'):
+                assert os.path.exists(cfg.resume_from), f"Resume from {cfg.resume_from} does not exist"
+                self.load_checkpoint(cfg.resume_from)
+            else:
+                models_dir = os.path.join(self.work_dir, "models")
+                assert os.path.exists(models_dir), f"Models dir {models_dir} does not exist"
+                print("Models Dir: ", models_dir)
+                models = [filen for filen in os.listdir(models_dir) if filen.endswith('.pt')]
+                models.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                self._checkpoint_filepath = os.path.join(self.work_dir, "models", models[-1])
+                if os.path.exists(self._checkpoint_filepath):
+                    self.load_checkpoint(self._checkpoint_filepath)
+        elif cfg.resume_phi_from is not None:
+            assert cfg.resume_phi_from.endswith('.pt'), f"Resume from {cfg.resume_phi_from} must be a .pt file"
+            self.load_phi_from_checkpoint(cfg.resume_phi_from)
 
     
     def _make_eval_env(self):
@@ -510,7 +415,8 @@ class Workspace:
 
     def train(self):
         if self.cfg.eval_only:
-            if self.cfg.resume_from is not None and not self.cfg.resume_from.endswith('.pt'):
+            assert self.cfg.resume_from is not None
+            if self.cfg.eval_all:
                 ckpts = os.listdir(os.path.join(self.work_dir, "models"))
                 ckpts = [ckpt for ckpt in ckpts if ckpt.endswith('.pt')]
                 ckpts.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
@@ -569,7 +475,10 @@ class Workspace:
         self.agent.feature_learner.train()
             
     def _proprocess_obs(self, obs):
-        pure_obs = obs[..., :self.obs_dim].reshape(1, -1)                
+        if self.cfg.agent.obs_horizon > 1:
+            pure_obs = obs[..., -self.cfg.agent.obs_horizon:, :self.obs_dim].reshape(1, -1)
+        else:
+            pure_obs = obs[..., -1, :self.obs_dim].reshape(1, -1)
         if self.cfg.use_history_action:
             obs_command = obs[:, -1, self.obs_dim:self.obs_dim + 11].reshape(1, -1)
             assert self.obs_dim + 13 == obs.shape[-1], f"obs_dim + 32 != obs.shape[-1], raw_obs_dim: {obs.shape[-1]} obs_dim: {self.obs_dim} sum: {self.obs_dim + 13} != {obs.shape[-1]}"
@@ -578,6 +487,40 @@ class Workspace:
             assert self.obs_dim + 32 == obs.shape[-1], f"obs_dim + 13 != obs.shape[-1], raw_obs_dim: {obs.shape[-1]} obs_dim: {self.obs_dim} sum: {self.obs_dim + 32} != {obs.shape[-1]}"
         return pure_obs, obs_command
 
+    def plot_traj_images(self, phi_list, image_parent, command_name, img_internal_id, z_actor=None):
+        phi_traj = torch.cat(phi_list, axis=0)
+        hilbert_traj = phi_traj.cpu().numpy()
+        # z_diff = torch.diff(hilbert_traj, dim=0)
+        # z_diff_normed = math.sqrt(self.cfg.agent.z_dim) * F.normalize(z_diff, dim=1)
+        # z_diff_normed = z_diff_normed.cpu().numpy()
+        goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj, goal_vector=hilbert_traj[-1])
+        # plot_per_step_z(
+        #     latent=z_diff_normed,
+        #     eid=img_internal_id,
+        #     command_name=command_name,
+        #     out_dir=image_parent,   
+        # )
+        plot_tripanel_heatmaps_with_line(
+            goal_z_cosine_sim_list,
+            goal_distance_list,
+            goal_absdist_list,
+            [f"goal={goal_z_cosine_sim_list[g_idx].shape[-1]}_{img_internal_id}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
+            image_parent,
+            title_cos=f'{command_name} {img_internal_id} Z Cosine Similarity',
+            title_dist=f'{command_name} {img_internal_id} Latent Space Distance',
+        )
+        if z_actor is not None:
+            goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj, goal_vector=z_actor.cpu().numpy())
+            plot_tripanel_heatmaps_with_line(
+                goal_z_cosine_sim_list,
+                goal_distance_list,
+                goal_absdist_list,
+                [f"goal=z_actor_{command_name}_{img_internal_id}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
+                image_parent,
+                title_cos=f'z_actor_{command_name} {img_internal_id} Z Cosine Similarity',
+                title_dist=f'z_actor_{command_name} {img_internal_id} Latent Space Distance',
+            )
+
     def _env_rollout(self, 
         command_vec,
         command_name,
@@ -585,6 +528,7 @@ class Workspace:
         rewards_json_path,
         eval_steps,
         goal_type,
+        image_parent,
         command_horizon=None,
         goals_list=None,
         z_actor=None,
@@ -612,9 +556,14 @@ class Workspace:
         dones = np.zeros(self.eval_env.num_envs, dtype=np.bool_)
         rewards_recorder = {}
         rewards_recorder['env_rewards'] = 0
-        rewards_recorder['z_rewards'] = 0
+        rewards_recorder['zdiff_rewards'] = 0
         rewards_recorder['env_rew_list'] = []
-        rewards_recorder['z_rew_list'] = []
+        rewards_recorder['zdiff_rew_list'] = []
+        rewards_recorder['zstate_rewards'] = 0
+        rewards_recorder['zstate_rew_list'] = []
+        phi_list = []
+        full_traj_phi = []
+        img_internal_id = 0
         while not dones.any() and timestep < eval_steps:
             with torch.inference_mode():
                 if goal_type == 'raw_cmd':
@@ -627,26 +576,33 @@ class Workspace:
                         print(f"Switch goal state: {last_index} -> {timestep // command_horizon} / {timestep} / {eval_steps}")
                         last_index = timestep // command_horizon
                         last_index = min(last_index, len(goals_list) - 1)
+                        if len(phi_list) > 0:
+                            self.plot_traj_images(phi_list, image_parent, command_name, img_internal_id, z_actor=z_actor)
+                            phi_list = []
                     meta = self.agent.get_goal_meta(goal_array=goals_list[last_index].squeeze(0), obs_array=None if "state" in goal_type else pure_obs.squeeze(0))
                     z_actor = torch.tensor(meta['z'], device=self.eval_env.device).reshape(1, -1)       
                     z_hilbert = z_actor
-                elif goal_type == "fit":
+                    img_internal_id += 1
+                elif "fit" in goal_type:
                     assert z_actor is not None, "z_actor must be provided"    
                     z_hilbert = z_actor
+                # print(pure_obs.shape, z_actor.shape)
                 actions, _ = self.agent.actor.act_inference(pure_obs, z_actor)
+                phi = self.agent.feature_learner.feature_net(pure_obs)
+                phi_list.append(phi)
+                full_traj_phi.append(phi)
             last_obs = pure_obs
             obs, critic_obs, reward, dones, _ = self.eval_env.step(actions)
             pure_obs, obs_command = self._proprocess_obs(obs)
             self.eval_env.commands[:, :10] = command_vec
             with torch.inference_mode():
-                z_reward = self.agent.get_z_rewards(last_obs, pure_obs, z_hilbert.cpu().numpy())
+                zdiff_reward, zstate_reward = self.agent.get_z_rewards(last_obs, pure_obs, z_hilbert.cpu().numpy())
             rewards_recorder['env_rew_list'].append(float(reward.item()))
-            rewards_recorder['z_rew_list'].append(float(z_reward))
-            rewards_recorder['env_rewards'] += reward.item()
-            rewards_recorder['z_rewards'] += z_reward
+            rewards_recorder['zdiff_rew_list'].append(float(zdiff_reward))
+            rewards_recorder['zstate_rew_list'].append(float(zstate_reward))
             # print(f"z_reward: {z_reward}, env_reward: {reward.item()}")
             if dones.any():
-                print(f"command: {command_name}, episode env reward: {reward.item()}, episode z reward: {rewards_recorder['z_rewards']}, ep_len: {len(rewards_recorder['env_rew_list'])}")
+                print(f"goal: {goal_type}, command: {command_name}, env reward: {np.sum(rewards_recorder['env_rew_list'])}, zdiff reward: {np.sum(rewards_recorder['zdiff_rew_list'])}, zstate reward: {np.sum(rewards_recorder['zstate_rew_list'])}, ep_len: {len(rewards_recorder['env_rew_list'])}")
             if self.cfg.save_video:
                 # ===== 相机跟踪与旋转 =====
                 look_at = np.array(self.eval_env.root_states[0, :3].cpu(), dtype=np.float64)
@@ -683,16 +639,22 @@ class Workspace:
             self.eval_env.interrupt_mask[:] = self.eval_env.disturb_masks[:]
             self.eval_env.standing_envs_mask[:] = True
             timestep += 1
+        if len(phi_list) > 0:
+            self.plot_traj_images(phi_list, image_parent, command_name, img_internal_id, z_actor=z_actor)
+        if "horizon" in goal_type:
+            self.plot_traj_images(full_traj_phi, image_parent, command_name, img_internal_id)
         if self.cfg.save_video:
             writer.close()
             print("Saved video to %s", video_path)
+        tmp_ = {}
+        for k, v in rewards_recorder.items():
+            tmp_[k.replace("list", "sum")] = np.sum(v)
+            tmp_[k.replace("list", "mean")] = np.mean(v)
+        rewards_recorder.update(tmp_)
         with open(rewards_json_path, 'w') as f:
             json.dump(rewards_recorder, f, indent=4)
-        mean_env_rewards = np.mean(rewards_recorder['env_rew_list'])
-        sum_env_rewards = np.sum(rewards_recorder['env_rew_list'])
-        sum_z_rewards = np.sum(rewards_recorder['z_rew_list'])
-        mean_z_rewards = np.mean(rewards_recorder['z_rew_list'])
         ep_len = len(rewards_recorder['env_rew_list'])
+        rewards_recorder = tmp_
         if goal_type == "raw_cmd":
             command_name = command_name + "_raw_cmd"
         elif "horizon" in goal_type:
@@ -702,118 +664,120 @@ class Workspace:
                 command_name = command_name + f"_diffg{command_horizon}"
             else:
                 raise ValueError(f"Invalid goal type: {goal_type}")
-        elif goal_type == "fit":
-            command_name = command_name + "_fit"
-        metrics = {f"{command_name}_env_rew": mean_env_rewards, f"{command_name}_z_rew": mean_z_rewards, f"{command_name}_ep_len": ep_len, f"{command_name}_sum_env_rew": sum_env_rewards, f"{command_name}_sum_z_rew": sum_z_rewards}
+        elif "fit" in goal_type:
+            command_name = command_name + f"_{goal_type}"
+        metrics = {f"{command_name}_ep_len": ep_len}
+        for k, v in rewards_recorder.items():
+            metrics[f"{command_name}_{k}"] = v
         if self.cfg.use_wandb:
             wandb.log({f"eval_detail/{k}": v for k, v in metrics.items()}, step=self.global_step)
         else:
             for k, v in metrics.items():
                 print(f"eval_detail/{k}: {v}")
-        return {"mean_env_rewards": mean_env_rewards, "mean_z_rewards": mean_z_rewards, "ep_len": ep_len, "sum_env_rewards": sum_env_rewards, "sum_z_rewards": sum_z_rewards}
+        return {k: v for k, v in rewards_recorder.items()}
+    
+    def get_traj_data_from_example(self, data_buffer, key):
+        command_vec = torch.tensor(data_buffer.meta['episode_command'][0], device=self.eval_env.device)
+        traj_idx, ep_start, ep_end = self.target_traj_idx[key]
+        ep_len = ep_end - ep_start
+        raw_state_data = data_buffer.data['proprio'][ep_start:ep_end]
+        ep_start_obs = data_buffer.meta['ep_start_obs'][traj_idx]
+        raw_state = np.concatenate([ep_start_obs[..., :raw_state_data.shape[-1]], raw_state_data], axis=0)
+        raw_index = np.arange(raw_state.shape[0] - self.cfg.agent.obs_horizon + 1)
+        horizon_index = raw_index[:, None] + np.arange(self.cfg.agent.obs_horizon)
+        raw_state = raw_state[horizon_index]
+        traj = raw_state.reshape(raw_state.shape[0], -1)
+        traj = traj[-ep_len:]
+        return traj, command_vec, traj_idx
 
     def eval(self):
         self.agent.feature_learner.eval()
         commands_horizons = [10, 20, 40, 80]
         eval_time = 10
-        # video_save_parent = self.work_dir / "eval_result" / f"{self.global_step}"
-        video_save_parent = os.path.join(self.work_dir, "eval_result", f"{self.global_step}")
-        os.makedirs(video_save_parent, exist_ok=True)
-        eval_steps = int(eval_time / self.eval_env.dt)
-        cos_sim_save_parent = os.path.join(video_save_parent, "images", "cos_sims")
-        phi_loss_save_parent = os.path.join(video_save_parent, "images", "phi_losses")
-        os.makedirs(cos_sim_save_parent, exist_ok=True)
-        os.makedirs(phi_loss_save_parent, exist_ok=True)
-        # 全局收集
-        phi_losses = []
-        phi_loss_mats = []        # 各 episode 的 φ-loss 矩阵
-        phi_loss_mats_names = []      
-        for key, data_buffer in self.example_data_buffers.items():
-            command_name = key
-            state_trajectorys = data_buffer.data['proprio'][..., :self.obs_dim]
-            traj_idx, ep_start, ep_end = self.target_traj_idx[command_name]
-            traj = state_trajectorys[ep_start:ep_end]
-            traj = traj.reshape(traj.shape[0], -1)
-            z, hilbert_traj = self.agent.get_traj_meta(traj)  # (traj_len, z_dim)
-            # draw a hot map of z, with metric as the cosine similarity between all z of different time steps
-            if command_name not in self.raw_cosine_sim:
-                self.raw_cosine_sim[command_name] = get_cosine_sim(traj)
-                self.raw_diff_cosine_sim[command_name] = get_cosine_sim(np.diff(traj, axis=0))
-            raw_cos_sim = self.raw_cosine_sim[command_name]
-            raw_diff_cos_sim = self.raw_diff_cosine_sim[command_name]
-            hilbert_cos_sim = get_cosine_sim(hilbert_traj)
-            z_cos_sim = get_cosine_sim(z)
-            fig, axs = plt.subplots(2, 2, figsize=(10, 8), dpi=400, constrained_layout=True)
-            common = dict(
-                vmin=-1, vmax=1, cmap='coolwarm',
-                origin='lower', aspect='auto', interpolation='nearest'
-            )
-
-            im00 = axs[0, 0].imshow(raw_cos_sim, **common)
-            axs[0, 0].set_title('raw state cosine similarity')
-            axs[0, 0].set_xlabel('time step'); axs[0, 0].set_ylabel('time step')
-
-            im01 = axs[0, 1].imshow(raw_diff_cos_sim, **common)
-            axs[0, 1].set_title('Δ raw state (t vs t-1) cosine similarity')
-            axs[0, 1].set_xlabel('time step'); axs[0, 1].set_ylabel('time step')
-
-            im10 = axs[1, 0].imshow(hilbert_cos_sim, **common)
-            axs[1, 0].set_title('Hilbert(traj) cosine similarity')
-            axs[1, 0].set_xlabel('time step'); axs[1, 0].set_ylabel('time step')
-
-            im11 = axs[1, 1].imshow(z_cos_sim, **common)
-            axs[1, 1].set_title('z cosine similarity')
-            axs[1, 1].set_xlabel('time step'); axs[1, 1].set_ylabel('time step')
-
-            # 共享色条：用同一标尺比较四张图
-            fig.colorbar(im11, ax=axs, location='right', shrink=0.9, label='cosine similarity')
-
-            fig.suptitle(f'{command_name}  ep={traj_idx}')
-            fig.savefig(f"{cos_sim_save_parent}/cos_sims_{command_name}_{traj_idx}.png", bbox_inches='tight')
-            plt.close(fig)
-
-            phi_loss_matrix = calc_phi_loss_upper(hilbert_traj, gamma=self.cfg.agent.hilp_discount)
-            phi_loss = collect_nonzero_losses(phi_loss_matrix)
-            phi_losses.extend(phi_loss)
-            # phi_loss_idx = collect_nonzero_losses_with_idx(phi_loss_matrix)
-            # phi_losses_with_idx.append(phi_loss_idx)
-            phi_loss_mats.append(phi_loss_matrix)
-            phi_loss_mats_names.append(f"{command_name}_{traj_idx}")
-        vmin, vmax = compute_global_color_limits(phi_loss_mats)
-        plot_phi_loss_heatmaps(phi_loss_mats, phi_loss_mats_names, phi_loss_save_parent, vmin, vmax)
-        print("="*20)
-        if len(phi_losses) > 0:
-            phi_losses = np.array(phi_losses)
-            phi_loss_stats = {
-                "mean_phi_losses": np.mean(phi_losses),
-                "max_phi_losses": np.max(phi_losses),
-                "min_phi_losses": np.min(phi_losses),
-                "std_phi_losses": np.std(phi_losses),
-                "mse_phi_losses": np.mean(phi_losses ** 2)
-            }
-            print(f"mean_phi_losses: {phi_loss_stats['mean_phi_losses']}")
-            print(f"max_phi_losses:  {phi_loss_stats['max_phi_losses']}")
-            print(f"min_phi_losses:  {phi_loss_stats['min_phi_losses']}")
-            print(f"std_phi_losses:  {phi_loss_stats['std_phi_losses']}")
-            print(f"mse_phi_losses: {phi_loss_stats['mse_phi_losses']}")
-            if self.cfg.use_wandb:
-                wandb.log({f"eval_phi_loss_stats/{k}": v for k, v in phi_loss_stats.items()}, step=self.global_step)
-            else:
-                for k, v in phi_loss_stats.items():
-                    print(f"eval_phi_loss_stats/{k}: {v}")
+        if self.cfg.eval_only:
+            eval_parent = self.work_dir.replace("exp_local", "eval_only")
+            eval_save_parent = os.path.join(eval_parent, f"{self.global_step}")
         else:
-            print("No phi losses collected.")
-        print("="*20)
+            eval_save_parent = os.path.join(self.work_dir, "eval_result", f"{self.global_step}")
+        print("Eval Save Parent: ", eval_save_parent)
+        shutil.rmtree(eval_save_parent, ignore_errors=True)
+        os.makedirs(eval_save_parent, exist_ok=True)
+        eval_steps = int(eval_time / self.eval_env.dt)
+        # cos_sim_save_parent = os.path.join(eval_save_parent, "images", "cos_sims")
+        # phi_loss_save_parent = os.path.join(eval_save_parent, "images", "phi_losses")
+        goal_cos_sim_save_parent = os.path.join(eval_save_parent, "images", "goal_cos_sims")
+        rollout_parent = os.path.join(eval_save_parent, "rollout")
+        shutil.rmtree(rollout_parent, ignore_errors=True)
+        # shutil.rmtree(cos_sim_save_parent, ignore_errors=True)
+        # shutil.rmtree(phi_loss_save_parent, ignore_errors=True)
+        shutil.rmtree(goal_cos_sim_save_parent, ignore_errors=True)
+        os.makedirs(rollout_parent, exist_ok=True)
+        # os.makedirs(cos_sim_save_parent, exist_ok=True)
+        # os.makedirs(phi_loss_save_parent, exist_ok=True)
+        os.makedirs(goal_cos_sim_save_parent, exist_ok=True)
+        # # 全局收集
+        # phi_losses = []
+        # phi_loss_mats = []        # 各 episode 的 φ-loss 矩阵
+        # phi_loss_mats_names = []      
+        traj_data = {}
+        for key, data_buffer in self.example_data_buffers.items():
+            traj_data[key] = self.get_traj_data_from_example(data_buffer, key)
+            
+        for key, (traj, command_vec, traj_idx) in traj_data.items():
+            current_goal_path = os.path.join(goal_cos_sim_save_parent, f"{key}")
+            os.makedirs(current_goal_path, exist_ok=True)
+            command_name = key
+            
+            z, hilbert_traj = self.agent.get_traj_meta(traj)  # (traj_len, z_dim)
+            goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj)
 
+            # # draw a hot map of z, with metric as the cosine similarity between all z of different time steps
+            # if command_name not in self.raw_cosine_sim:
+            #     self.raw_cosine_sim[command_name] = get_cosine_sim(traj)
+            #     raw_diff = np.diff(traj, axis=0)
+            #     self.raw_diff_cosine_sim[command_name] = get_cosine_sim(raw_diff)
+            #     self.raw_diff_distance[command_name] = np.linalg.norm(raw_diff, axis=-1)
+            #     self.raw_distance[command_name] = np.linalg.norm(traj, axis=-1)
+            # raw_cos_sim = self.raw_cosine_sim[command_name]
+            # raw_diff_cos_sim = self.raw_diff_cosine_sim[command_name]
+            # raw_diff_distance = self.raw_diff_distance[command_name]
+            # raw_distance = self.raw_distance[command_name]
+            # plot_per_step_z(
+            #     latent=z,
+            #     eid=traj_idx,
+            #     out_dir=cos_sim_save_parent,
+            #     command_name=command_name,
+            #     cos_raw=raw_cos_sim,
+            #     cos_raw_diff=raw_diff_cos_sim,
+            #     raw_diff_distance=raw_diff_distance,
+            #     raw_distance=raw_distance,   
+            # )
+            # phi_loss_matrix = calc_phi_loss_upper(hilbert_traj, gamma=self.cfg.agent.hilp_discount)
+            # phi_loss = collect_nonzero_losses(phi_loss_matrix)
+            # phi_losses.extend(phi_loss)
+            # phi_loss_mats.append(phi_loss_matrix)
+            # phi_loss_mats_names.append(f"phi_loss_latent_{command_name}_{traj_idx}.png")
+            plot_tripanel_heatmaps_with_line(
+                goal_z_cosine_sim_list,
+                goal_distance_list,
+                goal_absdist_list,
+                [f"goal={goal_z_cosine_sim_list[g_idx].shape[-1]}_{traj_idx}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
+                current_goal_path,
+                title_cos=f'{command_name}_{traj_idx} Z Cosine Similarity',
+                title_dist=f'{command_name}_{traj_idx} Latent Space Distance',
+            )
+        # vmin, vmax = compute_global_color_limits(phi_loss_mats)
+        # plot_matrix_heatmaps(phi_loss_mats, phi_loss_mats_names, phi_loss_save_parent, vmin, vmax)
+        
         if self.cfg.agent.command_injection or self.cfg.agent.use_raw_command:
-            eval_results = {'mean_env_rewards': [], 'mean_z_rewards': [], 'ep_len': [], 'sum_env_rewards': [], 'sum_z_rewards': []}
-            for key, data_buffer in self.example_data_buffers.items():
+            eval_results = defaultdict(list)
+            for key, (traj, command_vec, traj_idx) in traj_data.items():
                 command_name = key  
-                env_commands = data_buffer.meta['episode_command_A'][:]
-                # random_traj_id = np.random.randint(0, len(env_commands))
-                command_vec = torch.tensor(env_commands[0], device=self.eval_env.device)
-                video_path = os.path.join(video_save_parent, f"{command_name}_raw_cmd.mp4")
-                rewards_json_path = os.path.join(video_save_parent, f"{command_name}_raw_cmd.json")
+                video_path = os.path.join(rollout_parent, "cmd", f"{command_name}_raw_cmd.mp4")
+                rewards_json_path = os.path.join(rollout_parent, "cmd", f"{command_name}_raw_cmd.json")
+                image_parent = os.path.join(rollout_parent, "cmd", "images")
+                os.makedirs(image_parent, exist_ok=True)
+
                 rollout_results = self._env_rollout(
                     command_name=command_name, 
                     goal_type="raw_cmd",
@@ -821,6 +785,7 @@ class Workspace:
                     video_path=video_path,
                     rewards_json_path=rewards_json_path, 
                     eval_steps=eval_steps,
+                    image_parent=image_parent,
                 )
                 for k, v in rollout_results.items():
                     eval_results[k].append(v) 
@@ -831,11 +796,14 @@ class Workspace:
                 for k, v in eval_results.items():
                     print(f"eval_mean/{k}_raw_cmd: {v}")
         else:
-            eval_fit = {key: [] for key in ['mean_env_rewards', 'mean_z_rewards', 'ep_len', 'sum_env_rewards', 'sum_z_rewards']}
+            eval_fit_state = defaultdict(list)
+            eval_fit_diff = defaultdict(list)
+            eval_fit_diag_state = defaultdict(list)
+            eval_fit_diag_diff = defaultdict(list)
             for key, data_buffer in self.example_data_buffers.items():
                 command_name = key
-                env_commands = data_buffer.meta['episode_command_A'][:]
-                command_vec = torch.tensor(env_commands[0], device=self.eval_env.device)
+                env_commands = data_buffer.meta['episode_command'][0]
+                command_vec = torch.tensor(env_commands, device=self.eval_env.device)
                 episode_ends = data_buffer.episode_ends[:]
                 obs_t = []
                 next_obs_t = []
@@ -843,8 +811,18 @@ class Workspace:
                 for ep_id in range(len(episode_ends)):
                     ep_start = 0 if ep_id == 0 else episode_ends[ep_id - 1]
                     ep_end = episode_ends[ep_id]
-                    obs_array = data_buffer.data['proprio'][ep_start:ep_end - 1, :, :self.obs_dim]
-                    next_obs_array = data_buffer.data['proprio'][ep_start+1:ep_end, :, :self.obs_dim]
+                    ep_len = ep_end - ep_start
+                    ep_start_obs = data_buffer.meta['ep_start_obs'][ep_id]
+                    raw_state_data = data_buffer.data['proprio'][ep_start:ep_end]
+                    raw_state = np.concatenate([ep_start_obs[..., :raw_state_data.shape[-1]], raw_state_data], axis=0)
+                    raw_index = np.arange(raw_state.shape[0] - self.cfg.agent.obs_horizon + 1)
+                    horizon_index = raw_index[:, None] + np.arange(self.cfg.agent.obs_horizon)
+                    raw_state = raw_state[horizon_index]
+                    traj = raw_state.reshape(raw_state.shape[0], -1)
+                    traj = traj[-ep_len:]
+                    obs_array = traj[:-1]
+                    next_obs_array = traj[1:]
+
                     reward_array = data_buffer.data['rewards'][ep_start:ep_end - 1]
                     obs_t.append(torch.as_tensor(obs_array))
                     next_obs_t.append(torch.as_tensor(next_obs_array))
@@ -854,53 +832,100 @@ class Workspace:
                 next_obs_t = torch.cat(next_obs_t, 0).to(self.eval_env.device)
                 next_obs_t = next_obs_t.view(next_obs_t.shape[0], -1)
                 reward_t = torch.cat(reward_t, 0).to(self.eval_env.device)
+                # print("Obs T Device: ", obs_t.device, "Obs T shape:", obs_t.shape)
+                meta_state, diag_state = self.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t, feat_type='state')
+                meta_diff, diag_diff = self.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t, feat_type='diff')
 
-                meta = self.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t)
-                z_actor = torch.tensor(meta['z'], device=self.eval_env.device).reshape(1, -1)
-                fit_video_path = os.path.join(video_save_parent, f"fit_{command_name}.mp4")
-                fit_rewards_json_path = os.path.join(video_save_parent, f"fit_{command_name}.json")
+                z_actor_state = torch.tensor(meta_state['z'], device=self.eval_env.device).reshape(1, -1)
+                z_actor_diff = torch.tensor(meta_diff['z'], device=self.eval_env.device).reshape(1, -1)
+
+                fit_video_path_state = os.path.join(rollout_parent, f"fit_state_{command_name}.mp4")
+                fit_rewards_json_path_state = os.path.join(rollout_parent, f"fit_state_{command_name}.json")
+                fit_video_path_diff = os.path.join(rollout_parent, f"fit_diff_{command_name}.mp4")
+                fit_rewards_json_path_diff = os.path.join(rollout_parent, f"fit_diff_{command_name}.json")
+                image_state_parent = os.path.join(rollout_parent, "fit_state_images")
+                image_diff_parent = os.path.join(rollout_parent, "fit_diff_images")
+                os.makedirs(image_state_parent, exist_ok=True)
+                os.makedirs(image_diff_parent, exist_ok=True)
                 rollout_results = self._env_rollout(
                     command_name=command_name, 
-                    goal_type="fit",
+                    goal_type="fit_state",
                     command_vec=command_vec, 
-                    video_path=fit_video_path,
-                    rewards_json_path=fit_rewards_json_path, 
+                    video_path=fit_video_path_state,
+                    rewards_json_path=fit_rewards_json_path_state, 
                     eval_steps=eval_steps,
-                    z_actor=z_actor,
+                    z_actor=z_actor_state,
+                    image_parent=image_state_parent,
                 )
                 for k, v in rollout_results.items():
-                    eval_fit[k].append(v)
-            eval_fit = {key: np.mean(eval_fit[key]) for key in eval_fit.keys()}
+                    eval_fit_state[k].append(v)
+                for k, v in diag_state.items():
+                    eval_fit_diag_state[k].append(v)
+                if self.cfg.use_wandb:
+                    wandb.log({f"eval_fit_diag_state_detail/{command_name}_{k}": v for k, v in diag_state.items()}, step=self.global_step)
+                else:
+                    for k, v in diag_state.items():
+                        print(f"eval_fit_diag_state_detail/{command_name}_{k}: {v}")
+                rollout_results = self._env_rollout(
+                    command_name=command_name, 
+                    goal_type="fit_diff",
+                    command_vec=command_vec, 
+                    video_path=fit_video_path_diff,
+                    rewards_json_path=fit_rewards_json_path_diff, 
+                    eval_steps=eval_steps,
+                    z_actor=z_actor_diff,
+                    image_parent=image_diff_parent,
+                )
+                for k, v in rollout_results.items():
+                    eval_fit_diff[k].append(v)
+                for k, v in diag_diff.items():
+                    eval_fit_diag_diff[k].append(v)
+                if self.cfg.use_wandb:
+                    wandb.log({f"eval_fit_diag_diff_detail/{command_name}_{k}": v for k, v in diag_diff.items()}, step=self.global_step)
+                else:
+                    for k, v in diag_diff.items():
+                        print(f"eval_fit_diag_diff_detail/{command_name}_{k}: {v}")
+            eval_fit_state = {key: np.mean(eval_fit_state[key]) for key in eval_fit_state.keys()}
+            eval_fit_diff = {key: np.mean(eval_fit_diff[key]) for key in eval_fit_diff.keys()}
+            eval_fit_diag_state = {key: np.mean(eval_fit_diag_state[key]) for key in eval_fit_diag_state.keys()}
+            eval_fit_diag_diff = {key: np.mean(eval_fit_diag_diff[key]) for key in eval_fit_diag_diff.keys()}
             if self.cfg.use_wandb:
-                wandb.log({f"eval_fit_mean/{k}": v for k, v in eval_fit.items()}, step=self.global_step)
+                wandb.log({f"eval_fit/state_{k}": v for k, v in eval_fit_state.items()}, step=self.global_step)
+                wandb.log({f"eval_fit/diff_{k}": v for k, v in eval_fit_diff.items()}, step=self.global_step)
+                wandb.log({f"eval_fit/state_diag_{k}": v for k, v in eval_fit_diag_state.items()}, step=self.global_step)
+                wandb.log({f"eval_fit/diff_diag_{k}": v for k, v in eval_fit_diag_diff.items()}, step=self.global_step)
             else:
-                for k, v in eval_fit.items():
-                    print(f"eval_fit_mean/{k}: {v}")
+                for k, v in eval_fit_state.items():
+                    print(f"eval_fit/state_{k}: {v}")
+                for k, v in eval_fit_diff.items():
+                    print(f"eval_fit/diff_{k}: {v}")
+                for k, v in eval_fit_diag_state.items():
+                    print(f"eval_fit/state_diag_{k}: {v}")
+                for k, v in eval_fit_diag_diff.items():
+                    print(f"eval_fit/diff_diag_{k}: {v}")
 
-            eval_diff = {'mean_env_rewards': [], 'mean_z_rewards': [], 'ep_len': [], 'sum_env_rewards': [], 'sum_z_rewards': []}
-            eval_state = {'mean_env_rewards': [], 'mean_z_rewards': [], 'ep_len': [], 'sum_env_rewards': [], 'sum_z_rewards': []}
+            eval_diff = defaultdict(list)
+            eval_state = defaultdict(list)
             for command_horizon in commands_horizons:
-                diff_horizon_results = {'mean_env_rewards': [], 'mean_z_rewards': [], 'ep_len': [], 'sum_env_rewards': [], 'sum_z_rewards': []}
-                state_horizon_results = {'mean_env_rewards': [], 'mean_z_rewards': [], 'ep_len': [], 'sum_env_rewards': [], 'sum_z_rewards': []}
-                for key, data_buffer in self.example_data_buffers.items():
+                diff_horizon_results = defaultdict(list)
+                state_horizon_results = defaultdict(list)
+                for key, (traj, command_vec, traj_idx) in traj_data.items():
                     command_name = key
-                    env_commands = data_buffer.meta['episode_command_A'][:]
-                    command_vec = torch.tensor(env_commands[0], device=self.eval_env.device)
-                    diff_video_path = os.path.join(video_save_parent, f"diff_{command_name}_{command_horizon}.mp4")
-                    diff_rewards_json_path = os.path.join(video_save_parent, f"diff_{command_name}_{command_horizon}.json")
-                    state_video_path = os.path.join(video_save_parent, f"state_{command_name}_{command_horizon}.mp4")
-                    state_rewards_json_path = os.path.join(video_save_parent, f"state_{command_name}_{command_horizon}.json")
+                    diff_video_path = os.path.join(rollout_parent, f"diff_{command_name}_{command_horizon}.mp4")
+                    diff_rewards_json_path = os.path.join(rollout_parent, f"diff_{command_name}_{command_horizon}.json")
+                    state_video_path = os.path.join(rollout_parent, f"state_{command_name}_{command_horizon}.mp4")
+                    state_rewards_json_path = os.path.join(rollout_parent, f"state_{command_name}_{command_horizon}.json")
 
-                    traj_idx, ep_start, ep_end = self.target_traj_idx[command_name]
-                    data_start_idx = ep_start
-                    data_end_idx = ep_end
-                    len_trajectory = data_end_idx - data_start_idx
+                    len_trajectory = traj.shape[0]
+                    resample_steps_list = np.array([i for i in range(command_horizon, len_trajectory, command_horizon)])
 
-                    resample_steps_list = np.array([i for i in range(0, len_trajectory + command_horizon - 1, command_horizon)])
-                    resample_steps_list = resample_steps_list + data_start_idx
-                    goals_list = [data_buffer.data['proprio'][i, :, :self.obs_dim].reshape(1, -1) for i in resample_steps_list]
-                    goals_list.append(data_buffer.data['proprio'][data_end_idx-1, :, :self.obs_dim].reshape(1, -1))  
+                    goals_list = [traj[i].reshape(1, -1) for i in resample_steps_list]
+                    goals_list.append(traj[-1].reshape(1, -1))  
 
+                    image_diff_parent = os.path.join(rollout_parent, f"{command_horizon}_diff_images")
+                    image_state_parent = os.path.join(rollout_parent, f"{command_horizon}_state_images")
+                    os.makedirs(image_diff_parent, exist_ok=True)
+                    os.makedirs(image_state_parent, exist_ok=True)
                     rollout_results = self._env_rollout(
                         command_name=command_name, 
                         goal_type="diff_horizon",
@@ -910,6 +935,7 @@ class Workspace:
                         eval_steps=eval_steps,
                         command_horizon=command_horizon,
                         goals_list=goals_list,
+                        image_parent=image_diff_parent,
                     )
                     for k, v in rollout_results.items():
                         diff_horizon_results[k].append(v)
@@ -922,6 +948,7 @@ class Workspace:
                         eval_steps=eval_steps,
                         command_horizon=command_horizon,
                         goals_list=goals_list,
+                        image_parent=image_state_parent,
                     )
                     for k, v in rollout_results.items():
                         state_horizon_results[k].append(v)
@@ -943,18 +970,14 @@ class Workspace:
                         print(f"eval_state_horizon/{k}: {v}")
             eval_diff = {key: np.mean(eval_diff[key]) for key in eval_diff.keys()}
             eval_state = {key: np.mean(eval_state[key]) for key in eval_state.keys()}
-            eval_mean = {key: np.mean([eval_diff[key], eval_state[key]]) for key in eval_diff.keys()}
             if self.cfg.use_wandb:
                 wandb.log({f"eval_diff/{k}": v for k, v in eval_diff.items()}, step=self.global_step)
                 wandb.log({f"eval_state/{k}": v for k, v in eval_state.items()}, step=self.global_step)
-                wandb.log({f"eval_mean/{k}": v for k, v in eval_mean.items()}, step=self.global_step)
             else:
                 for k, v in eval_diff.items():
                     print(f"eval_diff/{k}: {v}")
                 for k, v in eval_state.items():
                     print(f"eval_state/{k}: {v}")
-                for k, v in eval_mean.items():
-                    print(f"eval_mean/{k}: {v}")
         self.agent.feature_learner.train()
 
     _CHECKPOINTED_KEYS = ('agent', 'global_step', 'global_episode')
@@ -982,8 +1005,7 @@ class Workspace:
         print(f"Loading checkpoint from {fp}")
         fp = Path(fp)
         with fp.open('rb') as f:
-            payload = torch.load(f)
-
+            payload = torch.load(f, map_location='cpu')
         if use_pixels:
             payload._storage['observation'] = payload._storage['pixel']
             del payload._storage['pixel']
@@ -999,6 +1021,14 @@ class Workspace:
                 if name == "global_episode":
                     print(f"Reloaded agent at global episode {self.global_episode}")
                     # logger.warning(f"Reloaded agent at global episode {self.global_episode}")
+
+    def load_phi_from_checkpoint(self, fp: tp.Union[Path, str]) -> None:
+        print(f"Loading phi from checkpoint from {fp}")
+        fp = Path(fp)
+        with fp.open('rb') as f:
+            payload = torch.load(f, map_location='cpu')
+        feature_learner_state_dict = payload['agent'].feature_learner.state_dict()
+        self.agent.feature_learner.load_state_dict(feature_learner_state_dict)
 
 
 @hydra.main(config_path='.', config_name='base_config')

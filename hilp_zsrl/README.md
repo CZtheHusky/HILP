@@ -47,6 +47,10 @@ PYTHONPATH=. python -m debugpy --listen 5678 --wait-for-client  url_benchmark/tr
 
 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000
 
+PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000 agent.z_dim=24
+
+PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000 agent.feature_type=diff goal_eval=True
+
 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/cpfs/user/caozhe/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000
 # HILP on RND Cheetah
 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.98 agent.q_loss=False seed=0 task=cheetah_run expl_agent=rnd load_replay_buffer=PATH_TO_DATASET/datasets/cheetah/rnd/replay.pt replay_buffer_episodes=5000
