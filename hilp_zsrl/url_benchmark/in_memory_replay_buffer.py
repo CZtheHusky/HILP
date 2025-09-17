@@ -58,6 +58,7 @@ class EpisodeBatch(tp.Generic[T]):
     meta: tp.Dict[str, T] = dataclasses.field(default_factory=dict)
     _physics: tp.Optional[T] = None
     future_obs: tp.Optional[T] = None
+    valid_future_obs: tp.Optional[T] = None
     privileged_obs: tp.Optional[T] = None
     commands: tp.Optional[T] = None
 
@@ -249,13 +250,14 @@ class ReplayBuffer:
             future_obs = self.get_obs('observation', ep_idx, future_idx - 1)
             curr_obs = self.get_obs('observation', ep_idx, step_idx - 1)
             future_obs = np.where((np.random.rand(batch_size) < self._p_currgoal / (1. - self._p_randomgoal)).reshape(future_obs.shape[0], *[1] * (len(future_obs.shape) - 1)), curr_obs, future_obs)
+            valid_future_obs = future_obs.copy()
             random_obs = self.get_obs('observation', random_ep_idx, random_step_idx - 1)
             future_obs = np.where((np.random.rand(batch_size) < self._p_randomgoal).reshape(future_obs.shape[0], *[1] * (len(future_obs.shape) - 1)), random_obs, future_obs)
         additional = {}
         if with_physics:
             additional["_physics"] = phy
         return EpisodeBatch(obs=obs, action=action, reward=reward, discount=discount,
-                            next_obs=next_obs, future_obs=future_obs, meta=meta, **additional)
+                            next_obs=next_obs, future_obs=future_obs, valid_future_obs=valid_future_obs, meta=meta, **additional)
 
     def load(self, env: tp.Any, replay_dir: Path, relabel: bool = True) -> None:
         print(f'Loading replay buffer from {replay_dir}')

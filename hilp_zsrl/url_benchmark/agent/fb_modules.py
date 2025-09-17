@@ -149,7 +149,7 @@ class ForwardMap(nn.Module):
     """ forward representation class"""
 
     def __init__(self, obs_dim, z_dim, action_dim, feature_dim, hidden_dim,
-                 preprocess=False, add_trunk=True) -> None:
+                 preprocess=False, add_trunk=True, output_dim=None) -> None:
         super().__init__()
         self.obs_dim = obs_dim
         self.z_dim = z_dim
@@ -171,7 +171,7 @@ class ForwardMap(nn.Module):
                              hidden_dim, "irelu")
             feature_dim = hidden_dim
 
-        seq = [feature_dim, hidden_dim, "irelu", self.z_dim]
+        seq = [feature_dim, hidden_dim, "irelu", self.z_dim if output_dim is None else output_dim]
         self.F1 = mlp(*seq)
         self.F2 = mlp(*seq)
 

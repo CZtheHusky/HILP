@@ -174,22 +174,22 @@ class Workspace:
         if self.cfg.eval_only:
             self.eval_env = self._make_eval_env()
             self._init_env_cam(self.eval_env)
-        # else:
-        #     self.train_env = self._make_train_env()  # 环境仅用于读取规格与评估
-        #     rep_schema = ReplaySchema(
-        #         obs_key="proprio",
-        #         action_key="actions",
-        #         reward_key="rewards",
-        #         obs_horizon=self.cfg.agent.obs_horizon,
-        #         cast_dtype=np.float32,
-        #     )
-        #     self.replay_buffer = StepReplayBuffer(
-        #         capacity_steps=self.cfg.replay_buffer_max_step,
-        #         schema=rep_schema,
-        #         discount=self.cfg.discount,
-        #         future=self.cfg.future,
-        #         p_randomgoal=self.cfg.p_randomgoal,
-        #     )
+        else:
+            self.train_env = self._make_train_env()  # 环境仅用于读取规格与评估
+            rep_schema = ReplaySchema(
+                obs_key="proprio",
+                action_key="actions",
+                reward_key="rewards",
+                obs_horizon=self.cfg.agent.obs_horizon,
+                cast_dtype=np.float32,
+            )
+            self.replay_buffer = StepReplayBuffer(
+                capacity_steps=self.cfg.replay_buffer_max_step,
+                schema=rep_schema,
+                discount=self.cfg.discount,
+                future=self.cfg.future,
+                p_randomgoal=self.cfg.p_randomgoal,
+            )
         exp_name = 'online'
         if cfg.resume_from is not None:
             if self.cfg.resume_from.endswith('.pt'):
@@ -242,13 +242,7 @@ class Workspace:
                     yaml.safe_dump(cfg_to_save, f, sort_keys=False)
             except Exception as e:
                 print(f"Warning: failed to save cfg to {config_yaml_path}: {e}")
-        
-        if self.cfg.mix_ratio > 0 and self.cfg.random_sample_z:
-            pass
-        else:
-            self.cfg.mix_ratio = 0
-            print("Masking mix_ratio to 0, because random_sample_z is False")
-
+                
         exp_name += '_'.join([f"pr{str(self.cfg.p_randomgoal)}", f"phe{str(self.cfg.agent.hilp_expectile)}", f"phg{str(self.cfg.agent.hilp_discount)}", str(self.cfg.agent.command_injection), f"mix{str(self.cfg.agent.mix_ratio)}", str(self.cfg.agent.z_dim), f"phh{str(self.cfg.agent.phi_hidden_dim)}", f"{str(self.cfg.agent.feature_type)}", f"hor{str(self.cfg.agent.obs_horizon)}", f"rsz{str(self.cfg.agent.random_sample_z)}"])
         self.exp_name = exp_name
         cfg_dict = omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
@@ -309,7 +303,7 @@ class Workspace:
                 self._checkpoint_filepath = os.path.join(self.work_dir, "models", models[-1])
                 if os.path.exists(self._checkpoint_filepath):
                     self.load_checkpoint(self._checkpoint_filepath)
-            # self.replay_buffer = self.replay_buffer.load(os.path.join(self.work_dir, "replay_buffer.pt"))
+            self.replay_buffer = self.replay_buffer.load(os.path.join(self.work_dir, "replay_buffer.pt"))
 
     
     def _make_eval_env(self):
@@ -497,8 +491,8 @@ class Workspace:
             elif self.cfg.init_rb_path is not None:
                 self.replay_buffer.load_from_rb(self.cfg.init_rb_path)
             else:
-                self.prepare_phi_data(is_init=True)
-            self.train_phi(is_init=True)
+                self.collect_data(is_init=True)
+            self.train_phi()
         while True:
             metrics_summon = defaultdict(list)
             metrics = self.agent.update_all(self.replay_buffer)
@@ -511,7 +505,7 @@ class Workspace:
                 _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
                 self.save_checkpoint(_checkpoint_filepath)
             if (self.global_step + 1) % self.cfg.rollout_every_steps == 0:
-                self.prepare_phi_data(is_init=False)
+                self.collect_data(is_init=False)
                 self.train_phi(is_init=False)
             else:
                 self.global_step += 1
@@ -537,21 +531,11 @@ class Workspace:
         phi_traj = torch.cat(phi_list, axis=0)
         hilbert_traj = phi_traj.cpu().numpy()
         goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj, goal_vector=hilbert_traj[-1])
-        middle_goal_z_cosine_sim_list, middle_goal_distance_list, middle_goal_absdist_list = calc_z_vector_matrixes(hilbert_traj, goal_vector=hilbert_traj[hilbert_traj.shape[0] // 2])
         plot_tripanel_heatmaps_with_line(
             goal_z_cosine_sim_list,
             goal_distance_list,
             goal_absdist_list,
-            [f"goal={goal_z_cosine_sim_list[g_idx].shape[-1]}_{command_name}_{img_internal_id}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
-            image_parent,
-            title_cos=f'{command_name} {img_internal_id} Z Cosine Similarity',
-            title_dist=f'{command_name} {img_internal_id} Latent Space Distance',
-        )
-        plot_tripanel_heatmaps_with_line(
-            middle_goal_z_cosine_sim_list,
-            middle_goal_distance_list,
-            middle_goal_absdist_list,
-            [f"middle_goal={middle_goal_z_cosine_sim_list[g_idx].shape[-1]}_{command_name}_{img_internal_id}.png" for g_idx in range(len(middle_goal_z_cosine_sim_list))],
+            [f"goal={goal_z_cosine_sim_list[g_idx].shape[-1]}_{img_internal_id}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
             image_parent,
             title_cos=f'{command_name} {img_internal_id} Z Cosine Similarity',
             title_dist=f'{command_name} {img_internal_id} Latent Space Distance',
@@ -672,7 +656,7 @@ class Workspace:
 
         return episodes, np.mean(env_valid_steps)
 
-    def prepare_phi_data(self, is_init=False):
+    def collect_data(self, is_init=False):
         print("Before collect data, num steps in replay buffer: ", len(self.replay_buffer))
         if is_init:
             total_num = self.cfg.init_rollout_num
@@ -684,6 +668,8 @@ class Workspace:
         for _ in range(total_num):
             episodes, mean_len = self._collect_episode()
             collection_mean_len.append(mean_len)
+            for episode in episodes:
+                self.replay_buffer.add_episode(episode["data"], episode["meta"])
             pbar.update(1)
             pbar.set_description(f"Steps: {len(self.replay_buffer)}, EP len: {mean_len}")
         if self.cfg.use_wandb:

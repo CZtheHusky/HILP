@@ -596,6 +596,22 @@ class SFHumanoidAgent:
         z = z.cpu().numpy()
         meta = OrderedDict()
         meta['z'] = z
+        # check if there is nan
+        if torch.isnan(z).any():
+            # find the nan
+            nan_idx = torch.isnan(z).any()
+            print(f"z is nan at index {nan_idx}")
+            # nan z_g, z_s
+            nan_z_g = z_g[nan_idx]
+            print(f"nan z_g: {nan_z_g}")
+            print(f"nan goal: {desired_goal[nan_idx]}")
+            try:
+                nan_z_s = z_s[nan_idx]
+                print(f"nan z_s: {nan_z_s}")
+                print(f"nan obs: {obs[nan_idx]}")
+            except:
+                pass
+            raise ValueError("z is nan")
         return meta
 
     def get_traj_meta(self, traj: np.ndarray) -> MetaDict:
@@ -977,7 +993,7 @@ class SFHumanoidAgent:
         future_obs = self.aug_and_encode(future_obs)
         next_obs = next_obs.detach()
 
-        if self.cfg.mix_ratio > 0:
+        if self.cfg.mix_ratio > 0 and self.cfg.random_sample_z:
             perm = torch.randperm(BS)
             with torch.no_grad():
                 if self.cfg.feature_type == 'state':
@@ -1002,6 +1018,7 @@ class SFHumanoidAgent:
             new_z = torch.matmul(new_z, inv_cov)  # batch_size x z_dim
             new_z = math.sqrt(self.cfg.z_dim) * F.normalize(new_z, dim=1)
             z_hilbert[mix_idxs] = new_z
+            z_actor[mix_idxs] = new_z
 
         metrics.update(self.update_sf(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z=z_hilbert.detach(), step=step, is_train=is_train))
         if not self.cfg.train_phi_only:
@@ -1012,5 +1029,4 @@ class SFHumanoidAgent:
             utils.soft_update_params(self.successor_net, self.successor_target_net, self.cfg.sf_target_tau)
         # sample_start = time.time()
         # print("Update SF time: ", sample_start - sample_end)
-
         return metrics

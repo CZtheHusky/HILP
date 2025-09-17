@@ -14,7 +14,6 @@ from hydra.core.config_store import ConfigStore
 import omegaconf
 
 from url_benchmark import utils
-from url_benchmark.in_memory_hum_buffer import StepReplayBuffer
 from .ddpg import MetaDict, make_aug_encoder
 from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, mlp, OnlineCov
 from url_benchmark.dmc import TimeStep
@@ -627,6 +626,22 @@ class SFHumanoidOnlineAgent:
         z = z.cpu().numpy()
         meta = OrderedDict()
         meta['z'] = z
+        # check if there is nan
+        if torch.isnan(z).any():
+            # find the nan
+            nan_idx = torch.isnan(z).any()
+            print(f"z is nan at index {nan_idx}")
+            # nan z_g, z_s
+            nan_z_g = z_g[nan_idx]
+            print(f"nan z_g: {nan_z_g}")
+            print(f"nan goal: {desired_goal[nan_idx]}")
+            try:
+                nan_z_s = z_s[nan_idx]
+                print(f"nan z_s: {nan_z_s}")
+                print(f"nan obs: {obs[nan_idx]}")
+            except:
+                pass
+            raise ValueError("z is nan")
         return meta
 
     def get_traj_meta(self, traj: np.ndarray) -> MetaDict:
@@ -753,7 +768,7 @@ class SFHumanoidOnlineAgent:
             global_step: int,
             time_step: TimeStep,
             finetune: bool = False,
-            replay_loader: tp.Optional[StepReplayBuffer] = None
+            replay_loader = None
     ) -> MetaDict:
         if global_step % self.cfg.update_z_every_step == 0:
             return self.init_meta()
@@ -797,44 +812,59 @@ class SFHumanoidOnlineAgent:
             self.phi_opt.step()
         return metrics
 
-    def update_sf_only(
+    def update_sf_actor(
         self,
         obs: torch.Tensor,
         action: torch.Tensor,
         discount: torch.Tensor,
         next_obs: torch.Tensor,
-        z: torch.Tensor,
-        is_train: bool = True
+        z_hilbert: torch.Tensor,
+        z_actor: torch.Tensor,
     ) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
         # compute target successor measure
         with torch.no_grad():
-            next_action, logp = self.actor.sample_and_logprob(next_obs, z)
-            next_F1, next_F2 = self.successor_target_net(next_obs, z, next_action)  # batch x z_dim
+            next_action, logp = self.actor.sample_and_logprob(next_obs, z_hilbert)
+            next_F1, next_F2 = self.successor_target_net(next_obs, z_hilbert, next_action)  # batch x z_dim
             if self.cfg.feature_type == 'state':
                 target_phi = self.feature_learner.feature_net(next_obs).detach()  # batch x z_dim
             elif self.cfg.feature_type == 'diff':
                 target_phi = self.feature_learner.feature_net(next_obs).detach() - self.feature_learner.feature_net(obs).detach()
             else:
                 target_phi = torch.cat([self.feature_learner.feature_net(obs).detach(), self.feature_learner.feature_net(next_obs).detach()], dim=-1)
-            next_Q1, next_Q2 = [torch.einsum('sd, sd -> s', next_Fi, z) for next_Fi in [next_F1, next_F2]]
+            next_Q1, next_Q2 = [torch.einsum('sd, sd -> s', next_Fi, z_hilbert) for next_Fi in [next_F1, next_F2]]
             next_F = torch.where((next_Q1 < next_Q2).reshape(-1, 1), next_F1, next_F2)
             target_F = target_phi + discount * next_F
 
-        F1, F2 = self.successor_net(obs, z, action)
+        F1, F2 = self.successor_net(obs, z_hilbert, action)
         if self.cfg.q_loss:
-            Q1, Q2 = [torch.einsum('sd, sd -> s', Fi, z) for Fi in [F1, F2]]
-            target_Q = torch.einsum('sd, sd -> s', target_F, z)
+            Q1, Q2 = [torch.einsum('sd, sd -> s', Fi, z_hilbert) for Fi in [F1, F2]]
+            target_Q = torch.einsum('sd, sd -> s', target_F, z_hilbert)
             sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
         else:
             sf_loss = F.mse_loss(F1, target_F) + F.mse_loss(F2, target_F)
 
+        action, log_prob = self.actor.sample_and_logprob(obs, z_actor)
+        F1, F2 = self.successor_net(obs, z_hilbert, action)
+        Q1 = torch.einsum('sd, sd -> s', F1, z_hilbert)
+        Q2 = torch.einsum('sd, sd -> s', F2, z_hilbert)
+        Q = torch.min(Q1, Q2)
+        alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
+        alpha = self.log_alpha.detach().exp()
+        actor_loss = (alpha * log_prob - Q.detach()).mean()
         if self.cfg.use_tb or self.cfg.use_wandb:
+            metrics['alpha_loss'] = alpha_loss.item()
+            metrics['alpha'] = self.log_alpha.detach().item()
+            metrics['actor_loss'] = actor_loss.item()
+            metrics['actor_logprob'] = log_prob.mean().item()
+            metrics['Q1'] = Q1.mean().item()
+            metrics['Q2'] = Q2.mean().item()
+            metrics['Q'] = Q.mean().item()
             metrics['target_F'] = target_F.mean().item()
             metrics['F1'] = F1.mean().item()
             metrics['phi'] = target_phi.mean().item()
             metrics['phi_norm'] = torch.norm(target_phi, dim=-1).mean().item()
-            metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
+            metrics['z_norm'] = torch.norm(z_hilbert, dim=-1).mean().item()
             metrics['sf_loss'] = sf_loss.item()
             # 在update_sf方法中添加
             metrics['F1_norm'] = torch.norm(F1, dim=-1).mean().item()
@@ -845,21 +875,35 @@ class SFHumanoidOnlineAgent:
             metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
             if isinstance(self.sf_opt, torch.optim.Adam):
                 metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]
-        if is_train:
-            if self.encoder_opt is not None:
-                self.encoder_opt.zero_grad(set_to_none=True)
-            self.sf_opt.zero_grad(set_to_none=True)
-            sf_loss.backward()
-            sf_grad = grad_norm_stats(self.successor_net, prefix='sf')
-            metrics.update(sf_grad)
-            self.sf_opt.step()
-            if self.encoder_opt is not None:
-                encoder_grad = grad_norm_stats(self.encoder, prefix='encoder')
-                metrics.update(encoder_grad)
-                self.encoder_opt.step()
+
+        if self.encoder_opt is not None:
+            self.encoder_opt.zero_grad(set_to_none=True)
+        self.sf_opt.zero_grad(set_to_none=True)
+        sf_loss.backward()
+        sf_grad = grad_norm_stats(self.successor_net, prefix='sf')
+        metrics.update(sf_grad)
+        self.sf_opt.step()
+        if self.encoder_opt is not None:
+            encoder_grad = grad_norm_stats(self.encoder, prefix='encoder')
+            metrics.update(encoder_grad)
+            self.encoder_opt.step()
+        self.alpha_opt.zero_grad(set_to_none=True)
+        alpha_grad = grad_norm_stats(self.log_alpha, prefix='alpha')
+        metrics.update(alpha_grad)
+        alpha_loss.backward()
+        self.alpha_opt.step()
+        # optimize actor
+        self.actor_opt.zero_grad(set_to_none=True)
+        actor_grad = grad_norm_stats(self.actor, prefix='actor')
+        metrics.update(actor_grad)
+        actor_loss.backward()
+        self.actor_opt.step()
+        if self.command_injection:
+            self.command_injection_opt.step()
+            self.command_injection_opt.zero_grad(set_to_none=True)
         return metrics
 
-    def update_sf(
+    def update_sf_phi(
         self,
         obs: torch.Tensor,
         action: torch.Tensor,
@@ -1003,38 +1047,8 @@ class SFHumanoidOnlineAgent:
         obs = self.aug(obs)
         return self.encoder(obs)
 
-
-    def prepare_batch(self, replay_loader: StepReplayBuffer, is_phi: bool = False) -> tp.Dict[str, torch.Tensor]:
-        start_time = time.time()
-        batch = replay_loader.sample(self.cfg.batch_size)
-        batch = batch.to(self.cfg.device)
-        obs = batch.obs
-        action = batch.action
-        discount = batch.discount
-        next_obs = batch.next_obs
-        future_obs = batch.future_obs
-        info = {"sample_time": time.time() - start_time}
-        obs = self.aug_and_encode(obs)
-        next_obs = self.aug_and_encode(next_obs)
-        future_obs = self.aug_and_encode(future_obs)
-        next_obs = next_obs.detach()        
-        try:
-            commands_obs = batch.commands
-        except:
-            commands_obs = None
-        # print("obs.shape", obs.shape)
-        # print("action.shape", action.shape)
-        # print("discount.shape", discount.shape)
-        # print("next_obs.shape", next_obs.shape)
-        # print("future_obs.shape", future_obs.shape)
-        if is_phi:
-            return obs, action, next_obs, future_obs, info
-        z_hilbert, z_actor = self.sample_z(self.cfg.batch_size, commands_obs, obs, next_obs)
-        z_hilbert = z_hilbert.to(self.cfg.device)
-        z_actor = z_actor.to(self.cfg.device)
-        if not z_hilbert.shape[-1] == self.cfg.z_dim:
-            raise RuntimeError("There's something wrong with the logic here")
-        if self.cfg.mix_ratio > 0:
+    def mix_z(self, obs: torch.Tensor, next_obs: torch.Tensor, z_hilbert: torch.Tensor, z_actor: torch.Tensor) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+        if self.cfg.mix_ratio > 0 and self.cfg.random_sample_z:
             perm = torch.randperm(self.cfg.batch_size)
             with torch.no_grad():
                 if self.cfg.feature_type == 'state':
@@ -1059,28 +1073,47 @@ class SFHumanoidOnlineAgent:
             new_z = torch.matmul(new_z, inv_cov)  # batch_size x z_dim
             new_z = math.sqrt(self.cfg.z_dim) * F.normalize(new_z, dim=1)
             z_hilbert[mix_idxs] = new_z
-        # print("z_hilbert.shape", z_hilbert.shape)
-        # print("z_actor.shape", z_actor.shape)
-        return obs, action, discount, next_obs, future_obs, z_hilbert, z_actor, info
+            z_actor[mix_idxs] = new_z
+        return z_hilbert, z_actor
+
+    def prepare_batch(self, batch, is_phi: bool = False) -> tp.Dict[str, torch.Tensor]:
+        batch = batch.to(self.cfg.device)
+        obs = batch.obs
+        action = batch.action
+        discount = batch.discount
+        next_obs = batch.next_obs
+        try:
+            future_obs = batch.future_obs
+            future_obs = self.aug_and_encode(future_obs)
+        except:
+            future_obs = None
+
+        obs = self.aug_and_encode(obs)
+        next_obs = self.aug_and_encode(next_obs)
+        next_obs = next_obs.detach()        
+        try:
+            commands_obs = batch.commands
+        except:
+            commands_obs = None
+        if is_phi:
+            return obs, action, next_obs, future_obs
+        z_hilbert, z_actor = self.sample_z(self.cfg.batch_size, commands_obs, obs, next_obs)
+        z_hilbert, z_actor = self.mix_z(obs, next_obs, z_hilbert, z_actor)
+        z_hilbert = z_hilbert.to(self.cfg.device)
+        z_actor = z_actor.to(self.cfg.device)
+        if not z_hilbert.shape[-1] == self.cfg.z_dim:
+            raise RuntimeError("There's something wrong with the logic here")
+        return obs, action, discount, next_obs, future_obs, z_hilbert, z_actor
 
 
-    def update_all(self, replay_loader: StepReplayBuffer) -> tp.Dict[str, float]:
-        metrics: tp.Dict[str, float] = {}
-        obs, action, discount, next_obs, future_obs, z_hilbert, z_actor, info = self.prepare_batch(replay_loader)
-        metrics.update(info)
-
-        metrics.update(self.update_sf(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z=z_hilbert.detach()))
-        # update actor
-        metrics.update(self.update_actor(obs.detach(), z_hilbert, z_actor))
-        utils.soft_update_params(self.successor_net, self.successor_target_net, self.cfg.sf_target_tau)
+    def update_policy(self, batch) -> tp.Dict[str, float]:
+        obs, action, discount, next_obs, future_obs, z_hilbert, z_actor = self.prepare_batch(batch)
+        metrics = self.update_sf_actor(obs=obs, action=action, discount=discount, next_obs=next_obs, z_hilbert=z_hilbert.detach(), z_actor=z_actor)
         return metrics
     
-    def update_phi(self, replay_loader: StepReplayBuffer) -> tp.Dict[str, float]:
-        metrics: tp.Dict[str, float] = {}
-        obs, action, next_obs, future_obs, info = self.prepare_batch(replay_loader, is_phi=True)
-        metrics.update(info)
-
-        metrics.update(self.update_feature(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs))
+    def update_phi(self, batch) -> tp.Dict[str, float]:
+        obs, action, next_obs, future_obs = self.prepare_batch(batch, is_phi=True)
+        metrics = self.update_feature(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
         return metrics
 
 
@@ -1095,13 +1128,9 @@ def grad_norm_stats(
     统计当前已计算的梯度的范数信息。
     - global_norm: 所有参数梯度拼接后的整体 p-范数（p=norm_type）
     - max_per_param_norm: 每个参数张量梯度的 p-范数中的最大值
-    - max_param_name: 触发 max_per_param_norm 的参数名
     - max_abs_grad: 所有梯度条目中的最大绝对值（∞-范数层面）
-    - per_param_norms: (可选) 每个参数名 -> 其梯度 p-范数
-
     注意：若使用混合精度且用了 GradScaler，请在调用前先对优化器 unscale：
         scaler.unscale_(optimizer)
-
     Args:
         model: 含有 .named_parameters() 的模块
         norm_type: 范数类型，常用 2.0 或 np.inf
@@ -1110,7 +1139,7 @@ def grad_norm_stats(
 
     Returns:
         dict，键包括：
-            global_norm, max_per_param_norm, max_param_name, max_abs_grad, (可选) per_param_norms
+            global_norm, max_per_param_norm, max_abs_grad
     """
     if isinstance(norm_type, float) and math.isinf(norm_type):
         norm_type = float('inf')

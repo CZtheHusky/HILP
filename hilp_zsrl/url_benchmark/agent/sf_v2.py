@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class SFAgentConfig:
+class SFV2AgentConfig:
     # @package agent
-    _target_: str = "url_benchmark.agent.sf.SFAgent"
+    _target_: str = "url_benchmark.agent.sf_v2.SFV2Agent"
     name: str = "sf"
     obs_type: str = omegaconf.MISSING  # to be specified later
     image_wh: int = omegaconf.MISSING  # to be specified later
@@ -65,12 +65,13 @@ class SFAgentConfig:
     add_trunk: bool = False
 
     feature_type: str = 'state'  # 'state', 'diff', 'concat'
+    goal_type: str = "delta"  # 'delta', 'state'
     hilp_discount: float = 0.98
     hilp_expectile: float = 0.5
 
 
 cs = ConfigStore.instance()
-cs.store(group="agent", name="sf", node=SFAgentConfig)
+cs.store(group="agent", name="sf_v2", node=SFV2AgentConfig)
 
 
 class FeatureLearner(nn.Module):
@@ -429,11 +430,12 @@ class SVDP(FeatureLearner):
         return loss
 
 
-class SFAgent:
+class SFV2Agent:
 
     def __init__(self, **kwargs: tp.Any):
-        cfg = SFAgentConfig(**kwargs)
+        cfg = SFV2AgentConfig(**kwargs)
         self.cfg = cfg
+        cfg.feature_type == 'diff'
         assert len(cfg.action_shape) == 1
         self.action_dim = cfg.action_shape[0]
         self.solved_meta: tp.Any = None
@@ -459,11 +461,11 @@ class SFAgent:
                                preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
         self.successor_net = ForwardMap(self.obs_dim, cfg.z_dim, self.action_dim,
                                         cfg.feature_dim, cfg.hidden_dim,
-                                        preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
+                                        preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk, output_dim=1).to(cfg.device)
         # build up the target network
         self.successor_target_net = ForwardMap(self.obs_dim, cfg.z_dim, self.action_dim,
                                                cfg.feature_dim, cfg.hidden_dim,
-                                               preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
+                                               preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk, output_dim=1).to(cfg.device)
 
         learner = dict(icm=ICM, transition=TransitionModel, latent=TransitionLatentModel,
                        contrastive=ContrastiveFeature, autoencoder=AutoEncoder, lap=Laplacian,
@@ -524,8 +526,12 @@ class SFAgent:
         with torch.no_grad():
             z_g = self.feature_learner.feature_net(desired_goal)
             z_s = self.feature_learner.feature_net(obs)
-
-        z = (z_g - z_s)
+        if self.cfg.goal_type == 'delta':
+            z = (z_g - z_s)
+        elif self.cfg.goal_type == 'state':
+            z = z_g
+        else:
+            raise ValueError(f"Invalid goal type: {self.cfg.goal_type}")
         z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
         z = z.squeeze(0).cpu().numpy()
         meta = OrderedDict()
@@ -533,6 +539,8 @@ class SFAgent:
         return meta
 
     def infer_meta_from_obs_and_rewards(self, obs: torch.Tensor, reward: torch.Tensor, next_obs: torch.Tensor, feature_type: str = None):
+        return {}, {}
+        assert feature_type is None or feature_type == 'diff'
         with torch.no_grad():
             obs = self.encoder(obs)
             next_obs = self.encoder(next_obs)
@@ -594,12 +602,19 @@ class SFAgent:
         meta['z'] = z.squeeze().cpu().numpy()
         return meta, diag
 
-    def sample_z(self, size):
-        gaussian_rdv = torch.randn((size, self.cfg.z_dim), dtype=torch.float32)
-        z = math.sqrt(self.cfg.z_dim) * F.normalize(gaussian_rdv, dim=1)
+    def sample_z(self, obs, future_obs, size):
+        if self.cfg.goal_type == 'delta':
+            z = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(obs)
+        elif self.cfg.goal_type == 'state':
+            z = self.feature_learner.feature_net(future_obs)
+        z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
         return z
+        # gaussian_rdv = torch.randn((size, self.cfg.z_dim), dtype=torch.float32)
+        # z = math.sqrt(self.cfg.z_dim) * F.normalize(gaussian_rdv, dim=1)
+        # return z
 
     def init_meta(self) -> MetaDict:
+        raise NotImplementedError
         if self.solved_meta is not None:
             print('solved_meta')
             return self.solved_meta
@@ -661,24 +676,18 @@ class SFAgent:
                 stddev = utils.schedule(self.cfg.stddev_schedule, step)
                 dist = self.actor(next_obs, z, stddev)
                 next_action = dist.sample(clip=self.cfg.stddev_clip)
-            next_F1, next_F2 = self.successor_target_net(next_obs, z, next_action)  # batch x z_dim
-            if self.cfg.feature_type == 'state':
-                target_phi = self.feature_learner.feature_net(next_obs).detach()  # batch x z_dim
-            elif self.cfg.feature_type == 'diff':
-                target_phi = self.feature_learner.feature_net(next_obs).detach() - self.feature_learner.feature_net(obs).detach()
-            else:
-                target_phi = torch.cat([self.feature_learner.feature_net(obs).detach(), self.feature_learner.feature_net(next_obs).detach()], dim=-1)
-            next_Q1, next_Q2 = [torch.einsum('sd, sd -> s', next_Fi, z) for next_Fi in [next_F1, next_F2]]
-            next_F = torch.where((next_Q1 < next_Q2).reshape(-1, 1), next_F1, next_F2)
-            target_F = target_phi + discount * next_F
+            next_Q1, next_Q2 = self.successor_target_net(next_obs, z, next_action)  # batch x z_dim
+            # target_phi = self.feature_learner.feature_net(next_obs).detach() - self.feature_learner.feature_net(obs).detach()
+            d_s = self.feature_learner.feature_net(future_obs).detach() - self.feature_learner.feature_net(obs).detach()
+            d_next_s = self.feature_learner.feature_net(future_obs).detach() - self.feature_learner.feature_net(next_obs).detach()
+            d_s = torch.norm(d_s, dim=-1)
+            d_next_s = torch.norm(d_next_s, dim=-1)
+            r = d_s - d_next_s
+            next_Q = torch.min(next_Q1, next_Q2)
+            target_Q = r + discount.squeeze(-1) * next_Q
 
-        F1, F2 = self.successor_net(obs, z, action)
-        if self.cfg.q_loss:
-            Q1, Q2 = [torch.einsum('sd, sd -> s', Fi, z) for Fi in [F1, F2]]
-            target_Q = torch.einsum('sd, sd -> s', target_F, z)
-            sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
-        else:
-            sf_loss = F.mse_loss(F1, target_F) + F.mse_loss(F2, target_F)
+        Q1, Q2 = self.successor_net(obs, z, action)
+        sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
 
         # compute feature loss
         if self.cfg.feature_learner == 'hilp':
@@ -688,18 +697,15 @@ class SFAgent:
             info = None
 
         if self.cfg.use_tb or self.cfg.use_wandb:
-            metrics['target_F'] = target_F.mean().item()
-            metrics['F1'] = F1.mean().item()
-            metrics['phi'] = target_phi.mean().item()
-            metrics['phi_norm'] = torch.norm(target_phi, dim=-1).mean().item()
             metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
             metrics['sf_loss'] = sf_loss.item()
-            # 在update_sf方法中添加
-            metrics['F1_norm'] = torch.norm(F1, dim=-1).mean().item()
-            metrics['F2_norm'] = torch.norm(F2, dim=-1).mean().item()  
-            metrics['target_F_norm'] = torch.norm(target_F, dim=-1).mean().item()
-            metrics['next_F_norm'] = torch.norm(next_F, dim=-1).mean().item()
-            metrics['target_F_std'] = target_F.std().item()  # 目标的方差
+            metrics["Q_1"] = Q1.mean().item()
+            metrics["Q_2"] = Q2.mean().item()
+            metrics["next_Q"] = next_Q.mean().item()
+            metrics['r'] = r.mean().item()
+            metrics['r_max'] = r.max().item()
+            metrics['r_min'] = r.min().item()
+            metrics['r_std'] = r.std().item()
             metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
             if phi_loss is not None:
                 metrics['phi_loss'] = phi_loss.item()
@@ -738,9 +744,7 @@ class SFAgent:
             action = dist.sample(clip=self.cfg.stddev_clip)
 
         log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-        F1, F2 = self.successor_net(obs, z, action)
-        Q1 = torch.einsum('sd, sd -> s', F1, z)
-        Q2 = torch.einsum('sd, sd -> s', F2, z)
+        Q1, Q2 = self.successor_net(obs, z, action)
         Q = torch.min(Q1, Q2)
         actor_loss = (self.cfg.temp * log_prob - Q).mean() if self.cfg.boltzmann else -Q.mean()
 
@@ -776,7 +780,7 @@ class SFAgent:
             next_obs = batch.next_obs
             future_obs = batch.future_obs
 
-            z = self.sample_z(self.cfg.batch_size).to(self.cfg.device)
+            z = self.sample_z(obs, future_obs, self.cfg.batch_size).to(self.cfg.device)
             if not z.shape[-1] == self.cfg.z_dim:
                 raise RuntimeError("There's something wrong with the logic here")
 
@@ -784,32 +788,6 @@ class SFAgent:
             next_obs = self.aug_and_encode(next_obs)
             future_obs = self.aug_and_encode(future_obs)
             next_obs = next_obs.detach()
-
-            if self.cfg.mix_ratio > 0:
-                perm = torch.randperm(self.cfg.batch_size)
-                with torch.no_grad():
-                    if self.cfg.feature_type == 'state':
-                        desired_obs = next_obs[perm]
-                        phi = self.feature_learner.feature_net(desired_obs)
-                    elif self.cfg.feature_type == 'diff':
-                        desired_obs = obs[perm]
-                        desired_next_obs = next_obs[perm]
-                        phi = self.feature_learner.feature_net(desired_next_obs) - self.feature_learner.feature_net(desired_obs)
-                    else:
-                        desired_obs = obs[perm]
-                        desired_next_obs = next_obs[perm]
-                        phi = torch.cat([self.feature_learner.feature_net(desired_obs), self.feature_learner.feature_net(desired_next_obs)], dim=-1)
-                # compute inverse of cov of phi
-                cov = torch.matmul(phi.T, phi) / phi.shape[0]
-                inv_cov = torch.linalg.pinv(cov)
-
-                mix_idxs: tp.Any = np.where(np.random.uniform(size=self.cfg.batch_size) < self.cfg.mix_ratio)[0]
-                with torch.no_grad():
-                    new_z = phi[mix_idxs]
-
-                new_z = torch.matmul(new_z, inv_cov)  # batch_size x z_dim
-                new_z = math.sqrt(self.cfg.z_dim) * F.normalize(new_z, dim=1)
-                z[mix_idxs] = new_z
 
             metrics.update(self.update_sf(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z=z, step=step))
 

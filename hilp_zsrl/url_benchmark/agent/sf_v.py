@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class SFAgentConfig:
+class SFVAgentConfig:
     # @package agent
-    _target_: str = "url_benchmark.agent.sf.SFAgent"
+    _target_: str = "url_benchmark.agent.sf_v.SFVAgent"
     name: str = "sf"
     obs_type: str = omegaconf.MISSING  # to be specified later
     image_wh: int = omegaconf.MISSING  # to be specified later
@@ -70,7 +70,7 @@ class SFAgentConfig:
 
 
 cs = ConfigStore.instance()
-cs.store(group="agent", name="sf", node=SFAgentConfig)
+cs.store(group="agent", name="sf_v", node=SFVAgentConfig)
 
 
 class FeatureLearner(nn.Module):
@@ -429,11 +429,12 @@ class SVDP(FeatureLearner):
         return loss
 
 
-class SFAgent:
+class SFVAgent:
 
     def __init__(self, **kwargs: tp.Any):
-        cfg = SFAgentConfig(**kwargs)
+        cfg = SFVAgentConfig(**kwargs)
         self.cfg = cfg
+        cfg.feature_type == 'diff'
         assert len(cfg.action_shape) == 1
         self.action_dim = cfg.action_shape[0]
         self.solved_meta: tp.Any = None
@@ -533,6 +534,7 @@ class SFAgent:
         return meta
 
     def infer_meta_from_obs_and_rewards(self, obs: torch.Tensor, reward: torch.Tensor, next_obs: torch.Tensor, feature_type: str = None):
+        assert feature_type is None or feature_type == 'diff'
         with torch.no_grad():
             obs = self.encoder(obs)
             next_obs = self.encoder(next_obs)
@@ -662,24 +664,18 @@ class SFAgent:
                 dist = self.actor(next_obs, z, stddev)
                 next_action = dist.sample(clip=self.cfg.stddev_clip)
             next_F1, next_F2 = self.successor_target_net(next_obs, z, next_action)  # batch x z_dim
-            if self.cfg.feature_type == 'state':
-                target_phi = self.feature_learner.feature_net(next_obs).detach()  # batch x z_dim
-            elif self.cfg.feature_type == 'diff':
-                target_phi = self.feature_learner.feature_net(next_obs).detach() - self.feature_learner.feature_net(obs).detach()
-            else:
-                target_phi = torch.cat([self.feature_learner.feature_net(obs).detach(), self.feature_learner.feature_net(next_obs).detach()], dim=-1)
+            target_phi = self.feature_learner.feature_net(next_obs).detach() - self.feature_learner.feature_net(obs).detach()
+            r = torch.norm(target_phi, dim=-1)
             next_Q1, next_Q2 = [torch.einsum('sd, sd -> s', next_Fi, z) for next_Fi in [next_F1, next_F2]]
             next_F = torch.where((next_Q1 < next_Q2).reshape(-1, 1), next_F1, next_F2)
-            target_F = target_phi + discount * next_F
+            next_Q = torch.einsum('sd, sd -> s', next_F, z)
+            next_Q = next_Q.detach()
+            target_Q = r + discount.squeeze(-1) * next_Q
 
         F1, F2 = self.successor_net(obs, z, action)
-        if self.cfg.q_loss:
-            Q1, Q2 = [torch.einsum('sd, sd -> s', Fi, z) for Fi in [F1, F2]]
-            target_Q = torch.einsum('sd, sd -> s', target_F, z)
-            sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
-        else:
-            sf_loss = F.mse_loss(F1, target_F) + F.mse_loss(F2, target_F)
-
+        Q1, Q2 = [torch.einsum('sd, sd -> s', Fi, z) for Fi in [F1, F2]]
+        
+        sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
         # compute feature loss
         if self.cfg.feature_learner == 'hilp':
             phi_loss, info = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
@@ -688,18 +684,18 @@ class SFAgent:
             info = None
 
         if self.cfg.use_tb or self.cfg.use_wandb:
-            metrics['target_F'] = target_F.mean().item()
-            metrics['F1'] = F1.mean().item()
+            # metrics['target_F'] = target_F.mean().item()
+            # metrics['F1'] = F1.mean().item()
             metrics['phi'] = target_phi.mean().item()
             metrics['phi_norm'] = torch.norm(target_phi, dim=-1).mean().item()
             metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
             metrics['sf_loss'] = sf_loss.item()
             # 在update_sf方法中添加
-            metrics['F1_norm'] = torch.norm(F1, dim=-1).mean().item()
-            metrics['F2_norm'] = torch.norm(F2, dim=-1).mean().item()  
-            metrics['target_F_norm'] = torch.norm(target_F, dim=-1).mean().item()
-            metrics['next_F_norm'] = torch.norm(next_F, dim=-1).mean().item()
-            metrics['target_F_std'] = target_F.std().item()  # 目标的方差
+            # metrics['F1_norm'] = torch.norm(F1, dim=-1).mean().item()
+            # metrics['F2_norm'] = torch.norm(F2, dim=-1).mean().item()  
+            # metrics['target_F_norm'] = torch.norm(target_F, dim=-1).mean().item()
+            # metrics['next_F_norm'] = torch.norm(next_F, dim=-1).mean().item()
+            # metrics['target_F_std'] = target_F.std().item()  # 目标的方差
             metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
             if phi_loss is not None:
                 metrics['phi_loss'] = phi_loss.item()
@@ -740,7 +736,7 @@ class SFAgent:
         log_prob = dist.log_prob(action).sum(-1, keepdim=True)
         F1, F2 = self.successor_net(obs, z, action)
         Q1 = torch.einsum('sd, sd -> s', F1, z)
-        Q2 = torch.einsum('sd, sd -> s', F2, z)
+        Q2 = torch.einsum('sd, sd -> s', F2, z)        
         Q = torch.min(Q1, Q2)
         actor_loss = (self.cfg.temp * log_prob - Q).mean() if self.cfg.boltzmann else -Q.mean()
 

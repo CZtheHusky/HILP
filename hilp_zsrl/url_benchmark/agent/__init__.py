@@ -9,3 +9,11 @@ from .sf_hum import SFHumanoidAgentConfig as SFHumanoidAgentConfig
 from .sf_hum_online import SFHumanoidOnlineAgent as SFHumanoidOnlineAgent
 from .sf_hum_online import SFHumanoidOnlineAgentConfig as SFHumanoidOnlineAgentConfig
 from .gctd3 import GCTD3Agent as GCTD3Agent
+from .sf_v import SFVAgent as SFVAgent
+from .sf_v import SFVAgentConfig as SFVAgentConfig
+from .sf_v2 import SFV2Agent as SFV2Agent
+from .sf_v2 import SFV2AgentConfig as SFV2AgentConfig
+from .sf_v0 import SFV0Agent as SFV0Agent
+from .sf_v0 import SFV0AgentConfig as SFV0AgentConfig
+from .sf_v1 import SFV1Agent as SFV1Agent
+from .sf_v1 import SFV1AgentConfig as SFV1AgentConfig

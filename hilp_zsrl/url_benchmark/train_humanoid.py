@@ -117,7 +117,7 @@ class Config:
     
     # eval
     num_eval_episodes: int = 10
-    eval_every_steps: int = 10000
+    eval_every_steps: int = 20000
     num_final_eval_episodes: int = 50
     custom_reward: tp.Optional[str] = None  # activates custom eval if not None
     # training
@@ -230,7 +230,11 @@ class Workspace:
                     yaml.safe_dump(cfg_to_save, f, sort_keys=False)
             except Exception as e:
                 print(f"Warning: failed to save cfg to {config_yaml_path}: {e}")
-                
+        if self.cfg.mix_ratio > 0 and self.cfg.random_sample_z:
+            pass
+        else:
+            self.cfg.mix_ratio = 0
+            print("Masking mix_ratio to 0, because random_sample_z is False")
         exp_name += '_'.join([f"pr{str(self.cfg.p_randomgoal)}", f"phe{str(self.cfg.agent.hilp_expectile)}", f"phg{str(self.cfg.agent.hilp_discount)}", str(self.cfg.agent.command_injection), f"mix{str(self.cfg.agent.mix_ratio)}", str(self.cfg.use_history_action), str(self.cfg.agent.z_dim), self.cfg.load_replay_buffer.split("/")[-1], f"phh{str(self.cfg.agent.phi_hidden_dim)}", f"{str(self.cfg.agent.feature_type)}", f"sac{str(self.cfg.agent.use_sac_net)}", f"hor{str(self.cfg.agent.obs_horizon)}", f"rsz{str(self.cfg.agent.random_sample_z)}"])
         self.exp_name = exp_name
         
@@ -302,7 +306,7 @@ class Workspace:
             example_data_buffer = DataBuffer.copy_from_path(full_path)
             self.example_data_buffers[commandn] = example_data_buffer
             episode_ends = example_data_buffer.episode_ends[:]
-            episode_lengths = np.diff(episode_ends)
+            episode_lengths = np.diff(np.concatenate([[0], episode_ends]))
             max_traj_idx = np.argmax(episode_lengths)
             ep_start = 0 if max_traj_idx == 0 else episode_ends[max_traj_idx - 1]
             ep_end = episode_ends[max_traj_idx]
@@ -433,6 +437,7 @@ class Workspace:
                 if self.global_step % self.cfg.eval_every_steps == 0:
                     _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
                     self.save_checkpoint(_checkpoint_filepath)
+                    self.remove_outdated_cktps()
                     self.eval() 
                     self.eval_data(num_batches=eval_num_batches)
                 metrics = self.agent.update_batch(batch, self.global_step)
@@ -500,11 +505,21 @@ class Workspace:
         #     command_name=command_name,
         #     out_dir=image_parent,   
         # )
+        middle_goal_z_cosine_sim_list, middle_goal_distance_list, middle_goal_absdist_list = calc_z_vector_matrixes(hilbert_traj, goal_vector=hilbert_traj[hilbert_traj.shape[0] // 2])
         plot_tripanel_heatmaps_with_line(
             goal_z_cosine_sim_list,
             goal_distance_list,
             goal_absdist_list,
-            [f"goal={goal_z_cosine_sim_list[g_idx].shape[-1]}_{img_internal_id}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
+            [f"goal={goal_z_cosine_sim_list[g_idx].shape[-1]}_{command_name}_{img_internal_id}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
+            image_parent,
+            title_cos=f'{command_name} {img_internal_id} Z Cosine Similarity',
+            title_dist=f'{command_name} {img_internal_id} Latent Space Distance',
+        )
+        plot_tripanel_heatmaps_with_line(
+            middle_goal_z_cosine_sim_list,
+            middle_goal_distance_list,
+            middle_goal_absdist_list,
+            [f"middle_goal={middle_goal_z_cosine_sim_list[g_idx].shape[-1]}_{command_name}_{img_internal_id}.png" for g_idx in range(len(middle_goal_z_cosine_sim_list))],
             image_parent,
             title_cos=f'{command_name} {img_internal_id} Z Cosine Similarity',
             title_dist=f'{command_name} {img_internal_id} Latent Space Distance',
@@ -555,11 +570,8 @@ class Workspace:
         last_index = -1
         dones = np.zeros(self.eval_env.num_envs, dtype=np.bool_)
         rewards_recorder = {}
-        rewards_recorder['env_rewards'] = 0
-        rewards_recorder['zdiff_rewards'] = 0
         rewards_recorder['env_rew_list'] = []
         rewards_recorder['zdiff_rew_list'] = []
-        rewards_recorder['zstate_rewards'] = 0
         rewards_recorder['zstate_rew_list'] = []
         phi_list = []
         full_traj_phi = []
@@ -666,9 +678,11 @@ class Workspace:
                 raise ValueError(f"Invalid goal type: {goal_type}")
         elif "fit" in goal_type:
             command_name = command_name + f"_{goal_type}"
-        metrics = {f"{command_name}_ep_len": ep_len}
+        rewards_recorder['ep_len'] = ep_len
+        metrics = {}
         for k, v in rewards_recorder.items():
             metrics[f"{command_name}_{k}"] = v
+            
         if self.cfg.use_wandb:
             wandb.log({f"eval_detail/{k}": v for k, v in metrics.items()}, step=self.global_step)
         else:
@@ -698,7 +712,7 @@ class Workspace:
             eval_parent = self.work_dir.replace("exp_local", "eval_only")
             eval_save_parent = os.path.join(eval_parent, f"{self.global_step}")
         else:
-            eval_save_parent = os.path.join(self.work_dir, "eval_result", f"{self.global_step}")
+            eval_save_parent = os.path.join(self.work_dir, "eval_result")
         print("Eval Save Parent: ", eval_save_parent)
         shutil.rmtree(eval_save_parent, ignore_errors=True)
         os.makedirs(eval_save_parent, exist_ok=True)
@@ -995,6 +1009,13 @@ class Workspace:
         payload = {k: self.__dict__[k] for k in self._CHECKPOINTED_KEYS}
         with fp.open('wb') as f:
             torch.save(payload, f, pickle_protocol=4)
+
+    def remove_outdated_cktps(self):
+        models_dir = os.path.join(self.work_dir, "models")
+        models = os.listdir(models_dir)
+        models.sort(key=lambda x: int(x.split('.')[0]))
+        for model in models[-20:]:
+            os.remove(os.path.join(models_dir, model))
 
     def load_checkpoint(self, fp: tp.Union[Path, str], use_pixels=False) -> None:
         """从磁盘加载 checkpoint。
