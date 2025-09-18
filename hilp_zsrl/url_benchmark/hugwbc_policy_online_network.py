@@ -54,7 +54,9 @@ def MLP(input_dim: int,
         output_dim: int, 
         hidden_dims: List[int], 
         activation: str, 
-        output_activation: Optional[str] = None) -> List[nn.Module]:
+        output_activation: Optional[str] = None,
+        first_activation: Optional[str] = None,
+        ) -> List[nn.Module]:
     """Create MLP layers.
     
     Args:
@@ -72,7 +74,11 @@ def MLP(input_dim: int,
     
     # Input layer
     layers.append(nn.Linear(input_dim, hidden_dims[0]))
-    layers.append(activation_fn)
+    if first_activation is not None:
+        first_activation_fn = get_activation(first_activation)
+        layers.append(first_activation_fn)
+    else:
+        layers.append(activation_fn)
     
     # Hidden layers
     for i in range(len(hidden_dims)):
@@ -110,6 +116,7 @@ class BaseAdaptModel(nn.Module):
                  latent_dim: int,
                  actor_hidden_dims: List[int],
                  activation: str,
+                 first_activation: Optional[str] = None,
                  output_activation: Optional[str] = None,
                  clock_dim: int = 0):
         """Initialize BaseAdaptModel.
@@ -122,6 +129,7 @@ class BaseAdaptModel(nn.Module):
             latent_dim: Latent space dimension for memory encoding (32)
             actor_hidden_dims: Hidden layer dimensions for low-level network
             activation: Activation function name
+            first_activation: First activation function name (optional)
             output_activation: Output activation function name (optional)
         """
         super().__init__()
@@ -147,7 +155,7 @@ class BaseAdaptModel(nn.Module):
                            proprioception_dim + self.cmd_dim + self.clock_dim)
         self.low_level_net = nn.Sequential(
             *MLP(control_input_dim, 2 * act_dim, actor_hidden_dims, 
-                activation, output_activation)
+                activation, output_activation, first_activation=first_activation)
         )
 
     def forward(self, 
@@ -240,6 +248,7 @@ class MlpAdaptModel(BaseAdaptModel):
                  cmd_dim: int,
                  terrain_dim: int,
                  latent_dim: int = 32,
+                 first_activation: Optional[str] = None,
                  actor_hidden_dims: List[int] = [256, 128, 32],
                  activation: str = 'elu',
                  output_activation: Optional[str] = None,
@@ -270,6 +279,7 @@ class MlpAdaptModel(BaseAdaptModel):
             terrain_dim=terrain_dim,
             latent_dim=latent_dim,
             actor_hidden_dims=actor_hidden_dims,
+            first_activation=first_activation,
             activation=activation,
             output_activation=output_activation,
             clock_dim=clock_dim
@@ -284,7 +294,7 @@ class MlpAdaptModel(BaseAdaptModel):
         # Output: [batch, latent_dim]
         memory_input_dim = proprioception_dim * self.short_length
         self.mem_encoder = nn.Sequential(
-            *MLP(memory_input_dim, latent_dim, mlp_hidden_dims, activation)
+            *MLP(memory_input_dim, latent_dim, mlp_hidden_dims, activation, first_activation=first_activation)
         )
     
     def memory_encoder(self, pro_obs_seq: torch.Tensor, **kwargs) -> torch.Tensor:
@@ -340,6 +350,7 @@ class HugWBCPolicyNetwork(nn.Module):
                  
                  # Activation functions
                  activation: str = 'elu',
+                 first_activation: Optional[str] = None,
                  output_activation: Optional[str] = None,
                  clock_dim: int = 0,
                  # Action noise parameters
@@ -389,6 +400,7 @@ class HugWBCPolicyNetwork(nn.Module):
             terrain_dim=terrain_dim,
             latent_dim=latent_dim,
             actor_hidden_dims=actor_hidden_dims,
+            first_activation=first_activation,
             activation=activation,
             output_activation=output_activation,
             max_length=max_length,
@@ -534,11 +546,12 @@ class HugWBCConfig:
     MAX_LENGTH = 5
     
     # Hidden layer dimensions
-    ACTOR_HIDDEN_DIMS = [256, 128, 32]
-    MLP_HIDDEN_DIMS = [256, 128]
+    ACTOR_HIDDEN_DIMS = [1024, 1024, 1024]
+    MLP_HIDDEN_DIMS = [1024, 1024]
     
     # Activation functions
     ACTIVATION = 'elu'
+    FIRST_ACTIVATION = 'tanh'
     OUTPUT_ACTIVATION = None
     
     # Action noise parameters
@@ -568,6 +581,7 @@ def create_sac_policy(z_dim: int = 32, horizon: int = 5, proprio_dim: int = 63, 
         act_dim=config.ACT_DIM,
         clock_dim=config.CLOCK_DIM,
         terrain_dim=config.TERRAIN_DIM,
+        first_activation=config.FIRST_ACTIVATION,
         latent_dim=config.LATENT_DIM,
         max_length=config.MAX_LENGTH,
         actor_hidden_dims=config.ACTOR_HIDDEN_DIMS,

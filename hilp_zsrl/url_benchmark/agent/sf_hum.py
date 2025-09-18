@@ -19,8 +19,11 @@ from .ddpg import MetaDict, make_aug_encoder
 from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, mlp, OnlineCov
 from url_benchmark.dmc import TimeStep
 from url_benchmark.hugwbc_policy_network import create_hugwbc_policy
-from url_benchmark.hugwbc_policy_sac_network import create_sac_policy
+# from url_benchmark.hugwbc_policy_sac_network import create_sac_policy
+from url_benchmark.hugwbc_policy_online_network import create_sac_policy
 import time
+from typing import Dict, Any, Iterable, Tuple, Optional
+
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +75,6 @@ class SFHumanoidAgentConfig:
     hilp_discount: float = 0.98
     hilp_expectile: float = 0.5
     train_phi_only: bool = False
-    use_large_phi_net: bool = False
     use_sac_net: bool = False
     obs_horizon: int = 5
     random_sample_z: bool = True
@@ -99,7 +101,7 @@ class Identity(FeatureLearner):
 
 
 class HILP(FeatureLearner):
-    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim, cfg, use_large_phi_net=False) -> None:
+    def __init__(self, obs_dim, action_dim, z_dim, hidden_dim, cfg) -> None:
         super().__init__(obs_dim, action_dim, z_dim, hidden_dim)
 
         self.z_dim = z_dim
@@ -111,10 +113,7 @@ class HILP(FeatureLearner):
             assert z_dim % 2 == 0
             feature_dim = z_dim // 2
 
-        if use_large_phi_net:
-            layers = [obs_dim, hidden_dim, "ntanh", hidden_dim, "ntanh", hidden_dim, "relu", feature_dim]
-        else:
-            layers = [obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", feature_dim]
+        layers = [obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", hidden_dim, "relu", hidden_dim, "relu", feature_dim]
 
         self.phi1 = mlp(*layers)
         self.phi2 = mlp(*layers)
@@ -185,13 +184,12 @@ class HILP(FeatureLearner):
         value_loss1 = self.expectile_loss(adv, q1 - v1, self.cfg.hilp_expectile).mean()
         value_loss2 = self.expectile_loss(adv, q2 - v2, self.cfg.hilp_expectile).mean()
         value_loss = value_loss1 + value_loss2
-        if self.training:   # we shall not update parameters during evaluation
-            utils.soft_update_params(self.phi1, self.target_phi1, 0.005)
-            utils.soft_update_params(self.phi2, self.target_phi2, 0.005)
-            with torch.no_grad():
-                phi1 = self.phi1(obs)
-                self.running_mean = 0.995 * self.running_mean + 0.005 * phi1.mean(dim=0)
-                self.running_std = 0.995 * self.running_std + 0.005 * phi1.std(dim=0)
+        utils.soft_update_params(self.phi1, self.target_phi1, 0.005)
+        utils.soft_update_params(self.phi2, self.target_phi2, 0.005)
+        with torch.no_grad():
+            phi1 = self.phi1(obs)
+            self.running_mean = 0.995 * self.running_mean + 0.005 * phi1.mean(dim=0)
+            self.running_std = 0.995 * self.running_std + 0.005 * phi1.std(dim=0)
 
         return value_loss, {
             'hilp/value_loss': value_loss,
@@ -494,7 +492,7 @@ class SFHumanoidAgent:
             extra_kwargs = dict(
                 cfg=self.cfg,
             )
-        self.feature_learner = learner(self.obs_dim, self.action_dim, cfg.z_dim, cfg.phi_hidden_dim, use_large_phi_net=cfg.use_large_phi_net, **extra_kwargs).to(cfg.device)
+        self.feature_learner = learner(self.obs_dim, self.action_dim, cfg.z_dim, cfg.phi_hidden_dim, **extra_kwargs).to(cfg.device)
 
         print("Successor net: ", self.successor_net)
         print("feature learner: ", self.feature_learner)
@@ -540,35 +538,89 @@ class SFHumanoidAgent:
     def init_from(self, other) -> None:
         # 1) 只复制权重/缓冲，不替换模块对象
         device = torch.device(self.cfg.device)
-        print("Agent Device: ", device)
-        names = ["encoder", "actor"]
-        if getattr(self.cfg, "init_sf", False):
-            names += ["successor_net", "feature_learner", "successor_target_net"]
+        print("Agent Device:", device)
 
-        for name in names:
-            src = getattr(other, name)
-            dst = getattr(self, name)
-            # 这行不会改变 dst 的 device；只是把 src 的权重值 copy 到 dst
-            dst.load_state_dict(src.state_dict(), strict=True)
+        # -------- helpers: 自动收集 --------
+        def _collect_modules(obj):
+            for k, v in obj.__dict__.items():
+                if isinstance(v, nn.Module):
+                    yield k, v
 
-        # 2) 复制优化器状态 + 统一设备
-        #    注意：Optimizer 的 state 张量需要手动搬运到当前模型所在设备
-        #    目标设备：优先 self.cfg.device，其次已有参数的 device
+        def _collect_free_params(obj):
+            for k, v in obj.__dict__.items():
+                if isinstance(v, torch.nn.Parameter):
+                    yield k, v
 
+        def _collect_optimizers(obj):
+            for k, v in obj.__dict__.items():
+                if isinstance(v, torch.optim.Optimizer):
+                    yield k, v
 
-        for key, opt in self.__dict__.items():
-            if isinstance(opt, torch.optim.Optimizer):
-                src_opt = getattr(other, key)
-                opt.load_state_dict(copy.deepcopy(src_opt.state_dict()))
-                # 把优化器 state 里的所有张量搬到目标设备
-                for state in opt.state.values():
-                    for k, v in state.items():
-                        if isinstance(v, torch.Tensor):
-                            state[k] = v.to(device, non_blocking=True)
+        # -------- 1) 复制所有子模块权重/缓冲（自动发现） --------
+        for name, dst_mod in _collect_modules(self):
+            src_mod = getattr(other, name, None)
+            if isinstance(src_mod, nn.Module):
+                try:
+                    # strict=False 更健壮，允许 shape/键有少量出入
+                    dst_mod.load_state_dict(src_mod.state_dict(), strict=True)
+                    # 也可打印一下 missed/unused keys 方便调试：
+                    # print(f"[{name}] loaded.")
+                except Exception as e:
+                    print(f"Error loading module '{name}': {e}")
 
-        # 3) 统一把整个 agent 移到目标设备，并同步内部 device 字段
-        if hasattr(self, "device"):
-            self.device = str(device)
+        # -------- 1.1) 复制“游离”的 nn.Parameter --------
+        for name, dst_p in _collect_free_params(self):
+            src_p = getattr(other, name, None)
+            if isinstance(src_p, torch.nn.Parameter):
+                try:
+                    with torch.no_grad():
+                        dst_p.copy_(src_p.data)
+                    # print(f"[param {name}] copied.")
+                except Exception as e:
+                    print(f"Error copying param '{name}': {e}")
+
+        # -------- 2) 统一迁移所有子模块到 device --------
+        for _, m in _collect_modules(self):
+            m.to(device)
+        # 游离参数也迁移（通常你不会有很多，但以防万一）
+        for name, p in _collect_free_params(self):
+            if p.device != device:
+                with torch.no_grad():
+                    p.data = p.data.to(device)
+
+        # -------- 3) 复制优化器状态并把其 state 迁移到 device（自动发现） --------
+        for key, opt in _collect_optimizers(self):
+            src_opt = getattr(other, key, None)
+            if isinstance(src_opt, torch.optim.Optimizer):
+                try:
+                    opt.load_state_dict(copy.deepcopy(src_opt.state_dict()))
+                    # 把优化器 state 张量搬到目标设备
+                    for state in opt.state.values():
+                        for sk, sv in state.items():
+                            if isinstance(sv, torch.Tensor):
+                                state[sk] = sv.to(device, non_blocking=True)
+                    # print(f"[optimizer {key}] loaded & moved.")
+                except Exception as e:
+                    print(f"Error loading optimizer '{key}': {e}")
+
+        # -------- 4) 记录设备（若你需要） --------
+        self.device = str(device)
+
+        # -------- 5) 可选：一致性自检（调试期很有用） --------
+        def _check_opt(opt, name):
+            for group in opt.param_groups:
+                for p in group["params"]:
+                    if p.requires_grad:
+                        assert p.device == device, f"{name}: param on {p.device}, expected {device}"
+                        if p.grad is not None:
+                            assert p.grad.device == device, f"{name}: grad on {p.grad.device}, expected {device}"
+            for s in opt.state.values():
+                for k, v in s.items():
+                    if isinstance(v, torch.Tensor):
+                        assert v.device == device, f"{name}: state[{k}] on {v.device}, expected {device}"
+
+        for key, opt in _collect_optimizers(self):
+            _check_opt(opt, key)
 
     def get_goal_meta(self, goal_array: np.ndarray, obs_array: np.ndarray = None) -> MetaDict:
         assert self.cfg.feature_learner == 'hilp'
@@ -593,9 +645,6 @@ class SFHumanoidAgent:
                 z_g = self.feature_learner.feature_net(desired_goal)
                 z = z_g
         z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
-        z = z.cpu().numpy()
-        meta = OrderedDict()
-        meta['z'] = z
         # check if there is nan
         if torch.isnan(z).any():
             # find the nan
@@ -612,6 +661,9 @@ class SFHumanoidAgent:
             except:
                 pass
             raise ValueError("z is nan")
+        z = z.cpu().numpy()
+        meta = OrderedDict()
+        meta['z'] = z
         return meta
 
     def get_traj_meta(self, traj: np.ndarray) -> MetaDict:
@@ -744,22 +796,13 @@ class SFHumanoidAgent:
             return self.init_meta()
         return meta
 
-    def act(self, obs, meta, step, eval_mode) -> tp.Any:
-        obs = torch.as_tensor(obs, device=self.cfg.device, dtype=torch.float32).unsqueeze(0)  # type: ignore
+    @torch.no_grad()
+    def act_inference(self, observations, z_vector) -> tp.Any:
+        obs = torch.as_tensor(observations, device=self.cfg.device, dtype=torch.float32)
         h = self.encoder(obs)
-        z = torch.as_tensor(meta['z'], device=self.cfg.device).unsqueeze(0)  # type: ignore
-        # if self.cfg.boltzmann:
-        #     dist = self.actor(h, z)
-        # else:
-        #     stddev = utils.schedule(self.cfg.stddev_schedule, step)
-        #     dist = self.actor(h, z, stddev)
-        if eval_mode:
-            action, mem = self.actor.act_inference(h, z)
-        else:
-            action = self.actor.act(h, z)
-            if step < self.cfg.num_expl_steps:
-                action.uniform_(-1.0, 1.0)
-        return action.cpu().numpy()[0]
+        z = torch.as_tensor(z_vector, device=self.cfg.device)
+        action = self.actor.act_inference(h, z)
+        return action
 
     def update_sf(
         self,
@@ -776,9 +819,7 @@ class SFHumanoidAgent:
         # compute target successor measure
         if not self.cfg.train_phi_only:
             with torch.no_grad():
-                self.actor.update_distribution(next_obs, z)
-                dist = self.actor.distribution
-                next_action = dist.sample()
+                next_action, logp = self.actor.sample_and_logprob(next_obs, z)
                 next_F1, next_F2 = self.successor_target_net(next_obs, z, next_action)  # batch x z_dim
                 if self.cfg.feature_type == 'state':
                     target_phi = self.feature_learner.feature_net(next_obs).detach()  # batch x z_dim
@@ -836,34 +877,38 @@ class SFHumanoidAgent:
                     self.encoder_opt.zero_grad(set_to_none=True)
                 self.sf_opt.zero_grad(set_to_none=True)
                 sf_loss.backward()
+                sf_grad = grad_norm_stats(self.successor_net, prefix='sf')
+                metrics.update(sf_grad)
                 self.sf_opt.step()
                 if self.encoder_opt is not None:
                     self.encoder_opt.step()
-            if self.phi_opt is not None:
-                self.phi_opt.zero_grad(set_to_none=True)
-                phi_loss.backward(retain_graph=True)
+                    encoder_grad = grad_norm_stats(self.encoder, prefix='encoder')
+                    metrics.update(encoder_grad)
+                if self.phi_opt is not None:
+                    self.phi_opt.zero_grad(set_to_none=True)
+                    phi_loss.backward(retain_graph=True)
+                    phi_grad = grad_norm_stats(self.feature_learner, prefix='phi')
+                    metrics.update(phi_grad)
             if self.phi_opt is not None:
                 self.phi_opt.step()
         return metrics
 
     def update_actor(self, obs: torch.Tensor, z_hilbert: torch.Tensor, z_actor: torch.Tensor, step: int, privileged_obs: torch.Tensor, is_train: bool = True) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
-        self.actor.update_distribution(obs, z_actor, privileged_obs, sync_update=True)
-        dist = self.actor.distribution
-        action = dist.rsample()
-        privileged_recon_loss = self.actor.actor.privileged_recon_loss
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
+        action, log_prob = self.actor.sample_and_logprob(obs, z_actor)
         F1, F2 = self.successor_net(obs, z_hilbert, action)
         Q1 = torch.einsum('sd, sd -> s', F1, z_hilbert)
         Q2 = torch.einsum('sd, sd -> s', F2, z_hilbert)
         Q = torch.min(Q1, Q2)
         # actor_loss = (self.cfg.temp * log_prob - Q).mean() if self.cfg.boltzmann else -Q.mean()
         actor_loss = (self.cfg.temp * log_prob - Q).mean()
-        total_loss = privileged_recon_loss + actor_loss
+        # total_loss = privileged_recon_loss + actor_loss
         if is_train:
             # optimize actor
             self.actor_opt.zero_grad(set_to_none=True)
-            total_loss.backward()
+            actor_grad = grad_norm_stats(self.actor, prefix='actor')
+            metrics.update(actor_grad)
+            actor_loss.backward()
             self.actor_opt.step()
             if self.command_injection:
                 # 使用torch.norm计算梯度范数
@@ -887,8 +932,6 @@ class SFHumanoidAgent:
         if self.cfg.use_tb or self.cfg.use_wandb:
             metrics['actor_loss'] = actor_loss.item()
             metrics['actor_logprob'] = log_prob.mean().item()
-            metrics['privileged_recon_loss'] = privileged_recon_loss.item()
-            metrics['total_loss'] = total_loss.item()
             metrics['Q1'] = Q1.mean().item()
             metrics['Q2'] = Q2.mean().item()
             metrics['Q'] = Q.mean().item()
@@ -1030,3 +1073,81 @@ class SFHumanoidAgent:
         # sample_start = time.time()
         # print("Update SF time: ", sample_start - sample_end)
         return metrics
+
+
+@torch.no_grad()
+def grad_norm_stats(
+    model: torch.nn.Module,
+    prefix: str,
+    norm_type: float = 2.0,
+    only_requires_grad: bool = True,
+) -> Dict[str, Any]:
+    """
+    统计当前已计算的梯度的范数信息。
+    - global_norm: 所有参数梯度拼接后的整体 p-范数（p=norm_type）
+    - max_per_param_norm: 每个参数张量梯度的 p-范数中的最大值
+    - max_abs_grad: 所有梯度条目中的最大绝对值（∞-范数层面）
+    注意：若使用混合精度且用了 GradScaler，请在调用前先对优化器 unscale：
+        scaler.unscale_(optimizer)
+    Args:
+        model: 含有 .named_parameters() 的模块
+        norm_type: 范数类型，常用 2.0 或 np.inf
+        include_per_param: 是否返回每个参数的范数字典（可能略慢）
+        only_requires_grad: 只考虑 requires_grad=True 的参数
+
+    Returns:
+        dict，键包括：
+            global_norm, max_per_param_norm, max_abs_grad
+    """
+    if isinstance(norm_type, float) and math.isinf(norm_type):
+        norm_type = float('inf')
+
+    max_per_param = 0.0
+    max_abs_grad = 0.0
+
+    # 按 p-范数聚合得到 global_norm
+    # p == inf 时：global = max(abs(grad))
+    # 否则：global = (sum(|g|^p))^(1/p)
+    if norm_type == float('inf'):
+        global_accum: Optional[torch.Tensor] = None  # 标量张量：当前最大值
+    else:
+        global_accum = torch.zeros((), device=next(model.parameters()).device)
+
+    for name, p in model.named_parameters():
+        if only_requires_grad and not p.requires_grad:
+            continue
+        g = p.grad
+        if g is None:
+            continue
+
+        # 每参数的 p-范数
+        if norm_type == float('inf'):
+            param_norm = g.detach().abs().max().item()
+            # 更新 global_accum
+            cur_max = g.detach().abs().max()
+            global_accum = cur_max if global_accum is None else torch.maximum(global_accum, cur_max)
+        else:
+            # torch.linalg.vector_norm 在新版本更好；兼容性用 torch.norm
+            param_norm = torch.norm(g.detach(), p=norm_type).item()
+            # 累加 |g|^p
+            global_accum = global_accum + torch.sum(g.detach().abs().pow(norm_type))
+
+        # 追踪最大 per-param 范数
+        if param_norm > max_per_param:
+            max_per_param = float(param_norm)
+
+        # 追踪最大绝对梯度条目（无关 p）
+        max_abs_grad = max(max_abs_grad, g.detach().abs().max().item())
+
+    # 汇总 global norm
+    if norm_type == float('inf'):
+        global_norm = float(global_accum.item() if global_accum is not None else 0.0)
+    else:
+        global_norm = float(global_accum.pow(1.0 / norm_type).item())
+
+    out = {
+        f"{prefix}_global_norm": global_norm,
+        f"{prefix}_max_per_param_norm": max_per_param,
+        f"{prefix}_max_abs_grad": max_abs_grad,
+    }
+    return out

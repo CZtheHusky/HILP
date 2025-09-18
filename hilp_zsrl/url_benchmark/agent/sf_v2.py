@@ -602,13 +602,14 @@ class SFV2Agent:
         meta['z'] = z.squeeze().cpu().numpy()
         return meta, diag
 
+    @torch.no_grad()
     def sample_z(self, obs, future_obs, size):
         if self.cfg.goal_type == 'delta':
             z = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(obs)
         elif self.cfg.goal_type == 'state':
             z = self.feature_learner.feature_net(future_obs)
         z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
-        return z
+        return z.detach()
         # gaussian_rdv = torch.randn((size, self.cfg.z_dim), dtype=torch.float32)
         # z = math.sqrt(self.cfg.z_dim) * F.normalize(gaussian_rdv, dim=1)
         # return z
@@ -678,13 +679,14 @@ class SFV2Agent:
                 next_action = dist.sample(clip=self.cfg.stddev_clip)
             next_Q1, next_Q2 = self.successor_target_net(next_obs, z, next_action)  # batch x z_dim
             # target_phi = self.feature_learner.feature_net(next_obs).detach() - self.feature_learner.feature_net(obs).detach()
-            d_s = self.feature_learner.feature_net(future_obs).detach() - self.feature_learner.feature_net(obs).detach()
-            d_next_s = self.feature_learner.feature_net(future_obs).detach() - self.feature_learner.feature_net(next_obs).detach()
+            d_s = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(obs)
+            d_next_s = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(next_obs)
             d_s = torch.norm(d_s, dim=-1)
             d_next_s = torch.norm(d_next_s, dim=-1)
             r = d_s - d_next_s
             next_Q = torch.min(next_Q1, next_Q2)
-            target_Q = r + discount.squeeze(-1) * next_Q
+            target_Q = r.unsqueeze(-1) + discount * next_Q
+            target_Q = target_Q.detach()
 
         Q1, Q2 = self.successor_net(obs, z, action)
         sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
@@ -699,8 +701,8 @@ class SFV2Agent:
         if self.cfg.use_tb or self.cfg.use_wandb:
             metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
             metrics['sf_loss'] = sf_loss.item()
-            metrics["Q_1"] = Q1.mean().item()
-            metrics["Q_2"] = Q2.mean().item()
+            # metrics["Q_1"] = Q1.mean().item()
+            # metrics["Q_2"] = Q2.mean().item()
             metrics["next_Q"] = next_Q.mean().item()
             metrics['r'] = r.mean().item()
             metrics['r_max'] = r.max().item()

@@ -608,7 +608,9 @@ class Workspace:
             with torch.inference_mode():
                 actions = self.agent.act_inference(pure_obs, z_actor)
             # Step environment
+            self.train_env.use_disturb = False
             obs, critic_obs, step_rewards, dones, infos = self.train_env.step(actions)
+            
             pure_obs, obs_command = self._proprocess_obs(obs)
 
             self.train_env.commands.copy_(current_commands)
@@ -772,6 +774,7 @@ class Workspace:
                 phi_list.append(phi)
                 full_traj_phi.append(phi)
             last_obs = pure_obs
+            self.eval_env.use_disturb = False
             obs, critic_obs, reward, dones, _ = self.eval_env.step(actions)
             pure_obs, obs_command = self._proprocess_obs(obs)
             self.eval_env.commands[:, :10] = command_vec
@@ -811,13 +814,6 @@ class Workspace:
                     )
                     rgb = _to_rgb_frame(img_any, self.H, self.W)
                     writer.append_data(rgb)
-            # ===== 干扰和中断设置 =====
-            self.eval_env.use_disturb = True
-            self.eval_env.disturb_masks[:] = True
-            self.eval_env.disturb_isnoise[:] = True
-            self.eval_env.disturb_rad_curriculum[:] = 1.0
-            self.eval_env.interrupt_mask[:] = self.eval_env.disturb_masks[:]
-            self.eval_env.standing_envs_mask[:] = True
             timestep += 1
         if len(phi_list) > 0:
             self.plot_traj_images(phi_list, image_parent, command_name, img_internal_id, z_actor=z_actor)

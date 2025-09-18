@@ -137,7 +137,7 @@ class DmcReward(BaseReward):
 
 def make_agent(
         obs_type: str, image_wh, obs_spec, action_spec, num_expl_steps: int, cfg: omgcf.DictConfig
-) -> tp.Union[agents.FBDDPGAgent, agents.DDPGAgent]:
+) -> tp.Union[agents.SFV2Agent]:
     cfg.obs_type = obs_type
     cfg.image_wh = image_wh
     cfg.obs_shape = obs_spec.shape
@@ -346,7 +346,7 @@ class Workspace:
             self.video_recorder.init(self.eval_env, enabled=video_enabled)
             current_phi = []
             while not time_step.last():
-                if self.cfg.goal_eval and self.cfg.agent.name == 'sf' and self.cfg.agent.feature_learner == 'hilp':
+                if self.cfg.goal_eval and self.cfg.agent.feature_learner == 'hilp':
                     # Recompute z every step
                     meta = self.agent.get_goal_meta(goal_array=goal, obs_array=time_step.observation)
                 with torch.no_grad(), utils.eval_mode(self.agent):

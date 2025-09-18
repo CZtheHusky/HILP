@@ -122,6 +122,7 @@ class Config:
     custom_reward: tp.Optional[str] = None  # activates custom eval if not None
     # training
     num_grad_steps: int = 100000000
+    dataset_ratio: float = 1.0
     log_every_steps: int = 1000
     num_seed_frames: int = 0
     replay_buffer_episodes: int = 5000  # 从离线缓冲区加载的 episode 数上限
@@ -230,10 +231,10 @@ class Workspace:
                     yaml.safe_dump(cfg_to_save, f, sort_keys=False)
             except Exception as e:
                 print(f"Warning: failed to save cfg to {config_yaml_path}: {e}")
-        if self.cfg.mix_ratio > 0 and self.cfg.random_sample_z:
+        if self.cfg.agent.mix_ratio > 0 and self.cfg.agent.random_sample_z:
             pass
         else:
-            self.cfg.mix_ratio = 0
+            self.cfg.agent.mix_ratio = 0
             print("Masking mix_ratio to 0, because random_sample_z is False")
         exp_name += '_'.join([f"pr{str(self.cfg.p_randomgoal)}", f"phe{str(self.cfg.agent.hilp_expectile)}", f"phg{str(self.cfg.agent.hilp_discount)}", str(self.cfg.agent.command_injection), f"mix{str(self.cfg.agent.mix_ratio)}", str(self.cfg.use_history_action), str(self.cfg.agent.z_dim), self.cfg.load_replay_buffer.split("/")[-1], f"phh{str(self.cfg.agent.phi_hidden_dim)}", f"{str(self.cfg.agent.feature_type)}", f"sac{str(self.cfg.agent.use_sac_net)}", f"hor{str(self.cfg.agent.obs_horizon)}", f"rsz{str(self.cfg.agent.random_sample_z)}"])
         self.exp_name = exp_name
@@ -268,16 +269,17 @@ class Workspace:
             use_history_action=cfg.use_history_action,
             discount=float(cfg.discount),
             load_command=self.cfg.agent.command_injection,
+            dataset_ratio=float(cfg.dataset_ratio),
         )
-        train_set, val_set = torch.utils.data.random_split(dataset, [0.95, 0.05])
+        # train_set, val_set = torch.utils.data.random_split(dataset, [0.95, 0.05])
         data_loader_conf = {
             "batch_size": self.cfg.batch_size,
             "shuffle": True,
             "num_workers": 2,
             "pin_memory": True,
         }
-        self.train_dataloader = DataLoader(train_set, **data_loader_conf)
-        self.val_dataloader = DataLoader(val_set, batch_size=self.cfg.batch_size, shuffle=True, pin_memory=False)
+        self.train_dataloader = DataLoader(dataset, **data_loader_conf)
+        # self.val_dataloader = DataLoader(val_set, batch_size=self.cfg.batch_size, shuffle=True, pin_memory=False)
         sample = dataset[0]
         print("Sample obs dim: ", sample['next_obs'].shape[-1])
         flatten_obs_dim = int(sample['next_obs'].shape[-1])
@@ -432,14 +434,14 @@ class Workspace:
             return
         while True:
             metrics_summon = defaultdict(list)
-            eval_num_batches = self.cfg.eval_every_steps // 20
+            # eval_num_batches = self.cfg.eval_every_steps // 20
             for batch in tqdm(self.train_dataloader):
                 if self.global_step % self.cfg.eval_every_steps == 0:
                     _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
                     self.save_checkpoint(_checkpoint_filepath)
                     self.remove_outdated_cktps()
                     self.eval() 
-                    self.eval_data(num_batches=eval_num_batches)
+                    # self.eval_data(num_batches=eval_num_batches)
                 metrics = self.agent.update_batch(batch, self.global_step)
                 for k, v in metrics.items():
                     metrics_summon[k].append(v)
@@ -460,24 +462,24 @@ class Workspace:
         _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
         self.save_checkpoint(self._checkpoint_filepath)  # make sure we save the final checkpoint
 
-    @torch.no_grad()
-    def eval_data(self, num_batches=100):
-        self.agent.feature_learner.eval()
-        summon_metrics = defaultdict(list)
-        for idx, batch in tqdm(enumerate(self.val_dataloader), total=num_batches):
-            if idx >= num_batches:
-                break
-            metrics = self.agent.update_batch(batch, self.global_step, is_train=False)
-            for k, v in metrics.items():
-                summon_metrics[k].append(v)
-        for k, v in summon_metrics.items():
-            summon_metrics[k] = np.mean(v)
-        if self.cfg.use_wandb:
-            wandb.log({f"eval/{k}": v for k, v in summon_metrics.items()}, step=self.global_step)
-        else:
-            for k, v in summon_metrics.items():
-                print(f"eval/{k}: {v}")
-        self.agent.feature_learner.train()
+    # @torch.no_grad()
+    # def eval_data(self, num_batches=100):
+    #     self.agent.feature_learner.eval()
+    #     summon_metrics = defaultdict(list)
+    #     for idx, batch in tqdm(enumerate(self.val_dataloader), total=num_batches):
+    #         if idx >= num_batches:
+    #             break
+    #         metrics = self.agent.update_batch(batch, self.global_step, is_train=False)
+    #         for k, v in metrics.items():
+    #             summon_metrics[k].append(v)
+    #     for k, v in summon_metrics.items():
+    #         summon_metrics[k] = np.mean(v)
+    #     if self.cfg.use_wandb:
+    #         wandb.log({f"eval/{k}": v for k, v in summon_metrics.items()}, step=self.global_step)
+    #     else:
+    #         for k, v in summon_metrics.items():
+    #             print(f"eval/{k}: {v}")
+    #     self.agent.feature_learner.train()
             
     def _proprocess_obs(self, obs):
         if self.cfg.agent.obs_horizon > 1:
@@ -599,11 +601,12 @@ class Workspace:
                     assert z_actor is not None, "z_actor must be provided"    
                     z_hilbert = z_actor
                 # print(pure_obs.shape, z_actor.shape)
-                actions, _ = self.agent.actor.act_inference(pure_obs, z_actor)
+                actions = self.agent.actor.act_inference(pure_obs, z_actor)
                 phi = self.agent.feature_learner.feature_net(pure_obs)
                 phi_list.append(phi)
                 full_traj_phi.append(phi)
             last_obs = pure_obs
+            self.eval_env.use_disturb = False
             obs, critic_obs, reward, dones, _ = self.eval_env.step(actions)
             pure_obs, obs_command = self._proprocess_obs(obs)
             self.eval_env.commands[:, :10] = command_vec
@@ -644,12 +647,6 @@ class Workspace:
                     rgb = _to_rgb_frame(img_any, self.H, self.W)
                     writer.append_data(rgb)
             # ===== 干扰和中断设置 =====
-            self.eval_env.use_disturb = True
-            self.eval_env.disturb_masks[:] = True
-            self.eval_env.disturb_isnoise[:] = True
-            self.eval_env.disturb_rad_curriculum[:] = 1.0
-            self.eval_env.interrupt_mask[:] = self.eval_env.disturb_masks[:]
-            self.eval_env.standing_envs_mask[:] = True
             timestep += 1
         if len(phi_list) > 0:
             self.plot_traj_images(phi_list, image_parent, command_name, img_internal_id, z_actor=z_actor)
@@ -706,7 +703,7 @@ class Workspace:
 
     def eval(self):
         self.agent.feature_learner.eval()
-        commands_horizons = [10, 20, 40, 80]
+        commands_horizons = [10, 20, 40]
         eval_time = 10
         if self.cfg.eval_only:
             eval_parent = self.work_dir.replace("exp_local", "eval_only")
@@ -744,33 +741,6 @@ class Workspace:
             
             z, hilbert_traj = self.agent.get_traj_meta(traj)  # (traj_len, z_dim)
             goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj)
-
-            # # draw a hot map of z, with metric as the cosine similarity between all z of different time steps
-            # if command_name not in self.raw_cosine_sim:
-            #     self.raw_cosine_sim[command_name] = get_cosine_sim(traj)
-            #     raw_diff = np.diff(traj, axis=0)
-            #     self.raw_diff_cosine_sim[command_name] = get_cosine_sim(raw_diff)
-            #     self.raw_diff_distance[command_name] = np.linalg.norm(raw_diff, axis=-1)
-            #     self.raw_distance[command_name] = np.linalg.norm(traj, axis=-1)
-            # raw_cos_sim = self.raw_cosine_sim[command_name]
-            # raw_diff_cos_sim = self.raw_diff_cosine_sim[command_name]
-            # raw_diff_distance = self.raw_diff_distance[command_name]
-            # raw_distance = self.raw_distance[command_name]
-            # plot_per_step_z(
-            #     latent=z,
-            #     eid=traj_idx,
-            #     out_dir=cos_sim_save_parent,
-            #     command_name=command_name,
-            #     cos_raw=raw_cos_sim,
-            #     cos_raw_diff=raw_diff_cos_sim,
-            #     raw_diff_distance=raw_diff_distance,
-            #     raw_distance=raw_distance,   
-            # )
-            # phi_loss_matrix = calc_phi_loss_upper(hilbert_traj, gamma=self.cfg.agent.hilp_discount)
-            # phi_loss = collect_nonzero_losses(phi_loss_matrix)
-            # phi_losses.extend(phi_loss)
-            # phi_loss_mats.append(phi_loss_matrix)
-            # phi_loss_mats_names.append(f"phi_loss_latent_{command_name}_{traj_idx}.png")
             plot_tripanel_heatmaps_with_line(
                 goal_z_cosine_sim_list,
                 goal_distance_list,
@@ -780,8 +750,6 @@ class Workspace:
                 title_cos=f'{command_name}_{traj_idx} Z Cosine Similarity',
                 title_dist=f'{command_name}_{traj_idx} Latent Space Distance',
             )
-        # vmin, vmax = compute_global_color_limits(phi_loss_mats)
-        # plot_matrix_heatmaps(phi_loss_mats, phi_loss_mats_names, phi_loss_save_parent, vmin, vmax)
         
         if self.cfg.agent.command_injection or self.cfg.agent.use_raw_command:
             eval_results = defaultdict(list)
@@ -836,7 +804,6 @@ class Workspace:
                     traj = traj[-ep_len:]
                     obs_array = traj[:-1]
                     next_obs_array = traj[1:]
-
                     reward_array = data_buffer.data['rewards'][ep_start:ep_end - 1]
                     obs_t.append(torch.as_tensor(obs_array))
                     next_obs_t.append(torch.as_tensor(next_obs_array))
@@ -852,6 +819,33 @@ class Workspace:
 
                 z_actor_state = torch.tensor(meta_state['z'], device=self.eval_env.device).reshape(1, -1)
                 z_actor_diff = torch.tensor(meta_diff['z'], device=self.eval_env.device).reshape(1, -1)
+
+                for key, (traj, command_vec, traj_idx) in traj_data.items():
+                    current_goal_path = os.path.join(goal_cos_sim_save_parent, f"{key}")
+                    os.makedirs(current_goal_path, exist_ok=True)
+                    command_name = key
+                    
+                    z, hilbert_traj = self.agent.get_traj_meta(traj)  # (traj_len, z_dim)
+                    goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj, goal_vector=z_actor_state.cpu().numpy())
+                    plot_tripanel_heatmaps_with_line(
+                        goal_z_cosine_sim_list,
+                        goal_distance_list,
+                        goal_absdist_list,
+                        [f"goal=z_fit_state_{traj_idx}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
+                        current_goal_path,
+                        title_cos=f'{command_name}_zfit_{traj_idx} Z Cosine Similarity',
+                        title_dist=f'{command_name}_zfit_{traj_idx} Latent Space Distance',
+                    )
+                    goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj, goal_vector=z_actor_diff.cpu().numpy())
+                    plot_tripanel_heatmaps_with_line(
+                        goal_z_cosine_sim_list,
+                        goal_distance_list,
+                        goal_absdist_list,
+                        [f"goal=z_fit_diff_{traj_idx}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
+                        current_goal_path,
+                        title_cos=f'{command_name}_zfit_{traj_idx} Z Cosine Similarity',
+                        title_dist=f'{command_name}_zfit_{traj_idx} Latent Space Distance',
+                    )
 
                 fit_video_path_state = os.path.join(rollout_parent, f"fit_state_{command_name}.mp4")
                 fit_rewards_json_path_state = os.path.join(rollout_parent, f"fit_state_{command_name}.json")
@@ -1014,7 +1008,7 @@ class Workspace:
         models_dir = os.path.join(self.work_dir, "models")
         models = os.listdir(models_dir)
         models.sort(key=lambda x: int(x.split('.')[0]))
-        for model in models[-20:]:
+        for model in models[:-20]:
             os.remove(os.path.join(models_dir, model))
 
     def load_checkpoint(self, fp: tp.Union[Path, str], use_pixels=False) -> None:

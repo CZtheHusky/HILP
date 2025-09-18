@@ -124,6 +124,7 @@ class HilbertRepresentationDataset(Dataset):
                  use_history_action: bool = True,
                  discount: float = None,
                  load_command: bool = False,
+                 dataset_ratio: float = 1.0,
         ):
         print(f"Sampling method, p_randomgoal: {p_randomgoal}, future: {goal_future}, discount: {discount} horizon: {obs_horizon} use_history_action: {use_history_action}")
         self.data_dir = data_dir
@@ -134,19 +135,22 @@ class HilbertRepresentationDataset(Dataset):
         self._discount = np.array(discount, dtype=np.float32)
         self.use_history_action = use_history_action
         self._load_command = load_command
-
-        self._buffers: List[Tuple[str, dict]] = []
-        for dirn in tqdm(os.listdir(self.data_dir)):
-            sub_path = os.path.join(self.data_dir, dirn)
-            if not os.path.isdir(sub_path):
-                continue
-            if sub_path.endswith("zarr"):
-                self._load_data_from_rb(sub_path, use_history_action)
-            else:
-                for zarr_dir in os.listdir(sub_path):
-                    if not zarr_dir.endswith("zarr"):
-                        continue
-                    self._load_data_from_rb(os.path.join(sub_path, zarr_dir), use_history_action)
+        self.dataset_ratio = float(dataset_ratio)
+        self._buffers: List[Tuple[str, dict]] = []   
+        if self.data_dir.endswith("zarr"):
+            self._load_data_from_rb(self.data_dir, use_history_action)
+        else:
+            for dirn in tqdm(os.listdir(self.data_dir)):
+                sub_path = os.path.join(self.data_dir, dirn)
+                if not os.path.isdir(sub_path):
+                    continue
+                if sub_path.endswith("zarr"):
+                    self._load_data_from_rb(sub_path, use_history_action)
+                else:
+                    for zarr_dir in os.listdir(sub_path):
+                        if not zarr_dir.endswith("zarr"):
+                            continue
+                        self._load_data_from_rb(os.path.join(sub_path, zarr_dir), use_history_action)
 
         # infer dims
         first_buf = self._buffers[0][1]
@@ -158,13 +162,13 @@ class HilbertRepresentationDataset(Dataset):
         for buf_id, (tname, buf) in enumerate(self._buffers):
             ep_ends = np.asarray(buf['episode_ends'])
             if "ep_start_obs" not in buf:
-                ep_start_delta = 4
+                ep_start_delta = obs_horizon - 1
             else:
-                ep_start_delta = 0
+                ep_start_delta = max(0, obs_horizon - 5)
             num_eps_total = len(ep_ends)
-            for ep_idx in range(num_eps_total):
+            for ep_idx in range(int(num_eps_total * self.dataset_ratio)):
                 ep_end = int(ep_ends[ep_idx])
-                ep_start = 0 if ep_idx == 0 else ep_ends[ep_idx - 1] + ep_start_delta
+                ep_start = 0 if ep_idx == 0 else ep_ends[ep_idx - 1]
                 ep_len = ep_end - ep_start
                 if ep_len < self.req_horizon:
                     continue
@@ -184,23 +188,31 @@ class HilbertRepresentationDataset(Dataset):
     def _load_data_from_rb(self, zpath, use_history_action):
         buf = DataBuffer.create_from_path(zpath, mode="r")
         print(buf)
+        if self.dataset_ratio < 1.0:
+            num_episodes = int(len(buf.episode_ends) * self.dataset_ratio)
+            data_ends = buf.episode_ends[num_episodes - 1]
+        else:
+            data_ends = buf.episode_ends[-1]
+            num_episodes = len(buf.episode_ends)
         new_buffer_dict = {
-            "proprio": buf["proprio"][:],
+            "proprio": buf["proprio"][:data_ends],
         }
         if use_history_action:
-            new_buffer_dict['actions'] = buf['actions'][:]
+            new_buffer_dict['actions'] = buf['actions'][:data_ends]
         obs_dim = int(buf["proprio"].shape[-1] + buf["actions"].shape[-1] if use_history_action else buf["proprio"].shape[-1])
-        new_buffer_dict['ep_start_obs'] = buf.meta['ep_start_obs'][..., :obs_dim]
+        new_buffer_dict['ep_start_obs'] = buf.meta['ep_start_obs'][:num_episodes, :, :obs_dim]
         if self._full_loading:
             if not use_history_action:
-                new_buffer_dict['actions'] = buf['actions'][:]
+                new_buffer_dict['actions'] = buf['actions'][:data_ends]
             # new_buffer_dict['rewards'] = buf['rewards'][:]
-            new_buffer_dict['privileged_obs'] = buf['privileged'][:, :3]
+            new_buffer_dict['privileged_obs'] = buf['privileged'][:data_ends, :3]
             if self._load_command:
-                new_buffer_dict['commands'] = buf['commands'][:]
-        new_buffer_dict["episode_ends"] = buf.episode_ends[:]
+                new_buffer_dict['commands'] = buf['commands'][:data_ends]
+        new_buffer_dict["episode_ends"] = buf.episode_ends[:num_episodes]
         episode_id = np.repeat(np.arange(len(new_buffer_dict["episode_ends"])), np.diff([0, *new_buffer_dict["episode_ends"]]))
         new_buffer_dict['episode_id'] = episode_id
+        for k, v in new_buffer_dict.items():
+            print("Loaded buffer: ", zpath, k, v.shape)
         self._buffers.append((zpath, new_buffer_dict))
 
     def __len__(self):
@@ -214,19 +226,6 @@ class HilbertRepresentationDataset(Dataset):
         horizon_end = t + 1
         proprio = buf['proprio'][horizon_start:horizon_end]
         valid_len = proprio.shape[0]
-        # if self.use_history_action:
-        #     history_action = np.zeros((valid_len, buf['actions'].shape[-1]))
-        #     if valid_len > 1:
-        #         his_a_start = max(ep_start, t - self.req_horizon)
-        #         his_a_end = t
-        #         history_len = his_a_end - his_a_start
-        #         history_action[-history_len:] = buf['actions'][his_a_start:his_a_end]
-        #     obs = np.concatenate([proprio, history_action], axis=-1)
-        # else:
-        #     obs = proprio
-        # if valid_len < self.req_horizon:
-        #     obs = np.concatenate([buf['ep_start_obs'][ep_id, -(self.req_horizon - valid_len):, :obs.shape[-1]], obs], axis=0)
-        # return obs.reshape(-1)
         if self.use_history_action:
             # 预分配 + 原地写，避免 concatenate
             act_dim = buf["actions"].shape[-1]
@@ -246,7 +245,7 @@ class HilbertRepresentationDataset(Dataset):
         else:
             obs = np.empty((self.req_horizon, proprio.shape[-1]), dtype=proprio.dtype)
             pad = self.req_horizon - valid_len
-            obs[pad:pad+valid_len] = proprio
+            obs[pad:] = proprio
             if pad > 0:
                 obs[:pad] = buf["ep_start_obs"][ep_id, -pad:, :obs.shape[-1]]
 

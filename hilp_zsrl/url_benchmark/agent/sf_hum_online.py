@@ -623,9 +623,6 @@ class SFHumanoidOnlineAgent:
                 z_g = self.feature_learner.feature_net(desired_goal)
                 z = z_g
         z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
-        z = z.cpu().numpy()
-        meta = OrderedDict()
-        meta['z'] = z
         # check if there is nan
         if torch.isnan(z).any():
             # find the nan
@@ -642,6 +639,9 @@ class SFHumanoidOnlineAgent:
             except:
                 pass
             raise ValueError("z is nan")
+        z = z.cpu().numpy()
+        meta = OrderedDict()
+        meta['z'] = z
         return meta
 
     def get_traj_meta(self, traj: np.ndarray) -> MetaDict:

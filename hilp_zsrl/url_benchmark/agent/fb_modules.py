@@ -163,7 +163,8 @@ class ForwardMap(nn.Module):
                 self.trunk: nn.Module = nn.Identity()
                 feature_dim = 2 * feature_dim
             else:
-                self.trunk = mlp(2 * feature_dim, hidden_dim, "irelu")
+                self.trunk = mlp(2 * feature_dim, hidden_dim, "irelu", hidden_dim, "irelu",
+                             hidden_dim, "irelu")
                 feature_dim = hidden_dim
         else:
             self.trunk = mlp(self.obs_dim + self.z_dim + self.action_dim, hidden_dim, "ntanh",
