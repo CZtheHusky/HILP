@@ -7,6 +7,7 @@ import torch
 from url_benchmark.replay_buffer import DataBuffer
 from collections import defaultdict
 from tqdm import tqdm
+import traceback
 
 # ----------------------------
 # 批次容器，与原版兼容
@@ -225,7 +226,9 @@ class StepReplayBuffer:
             overwrited_ep_id = self._ep_id[index_end]
             current_abs_start = index_end
             current_abs_end = self._abs_ep_last_step[index_end]
-            self._step_no[current_abs_start:current_abs_end] -= self._step_no[current_abs_start]
+            if current_abs_end > current_abs_start:
+                self._ep_last_step_no[current_abs_start:current_abs_end] -= self._step_no[current_abs_start]
+                self._step_no[current_abs_start:current_abs_end] -= self._step_no[current_abs_start]
             if overwrited_ep_id in ep_ids:
                 ep_ids.remove(overwrited_ep_id)
         for ep_iid in ep_ids:
@@ -330,8 +333,14 @@ class StepReplayBuffer:
             target_step = np.minimum(step_now + offsets, step_last)
             delta = target_step - step_now  # >= 1
             j = idx + delta
-
-            future_obs = self._gather_obs_window(j)
+            try:
+                future_obs = self._gather_obs_window(j) 
+            except Exception as e:
+                print(f"Error in gathering future obs: {e}")
+                print(f"idx: {idx}, step_now: {step_now}, step_last: {step_last}, offsets: {offsets}, target_step: {target_step}, delta: {delta}, j: {j}")
+                print("Traceback:")
+                traceback.print_exc()
+                raise e
             # valid_future_obs = future_obs.copy()
 
             # 随机目标（跨 episode）

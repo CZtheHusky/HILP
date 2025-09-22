@@ -3,6 +3,7 @@ import math
 import logging
 import dataclasses
 from collections import OrderedDict
+from re import X
 import typing as tp
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from url_benchmark.in_memory_replay_buffer import ReplayBuffer
 from .ddpg import MetaDict, make_aug_encoder
 from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, mlp, OnlineCov
 from url_benchmark.dmc import TimeStep
-
+from url_benchmark.potential_goal_fit import fit_goal_latent
 
 logger = logging.getLogger(__name__)
 
@@ -184,15 +185,15 @@ class HILP(FeatureLearner):
             self.running_std = 0.995 * self.running_std + 0.005 * phi1.std(dim=0)
 
         return value_loss, {
-            'hilp/value_loss': value_loss,
-            'hilp/v_mean': v.mean(),
-            'hilp/v_max': v.max(),
-            'hilp/v_min': v.min(),
-            'hilp/abs_adv_mean': torch.abs(adv).mean(),
-            'hilp/adv_mean': adv.mean(),
-            'hilp/adv_max': adv.max(),
-            'hilp/adv_min': adv.min(),
-            'hilp/accept_prob': (adv >= 0).float().mean(),
+            'hilp/value_loss': value_loss.item(),
+            'hilp/v_mean': v.mean().item(),
+            'hilp/v_max': v.max().item(),
+            'hilp/v_min': v.min().item(),
+            'hilp/abs_adv_mean': torch.abs(adv).mean().item(),
+            'hilp/adv_mean': adv.mean().item(),
+            'hilp/adv_max': adv.max().item(),
+            'hilp/adv_min': adv.min().item(),
+            'hilp/accept_prob': (adv >= 0).float().mean().item(),
         }
 
 
@@ -539,64 +540,29 @@ class SFV2Agent:
         return meta
 
     def infer_meta_from_obs_and_rewards(self, obs: torch.Tensor, reward: torch.Tensor, next_obs: torch.Tensor, feature_type: str = None):
-        return {}, {}
-        assert feature_type is None or feature_type == 'diff'
         with torch.no_grad():
             obs = self.encoder(obs)
             next_obs = self.encoder(next_obs)
 
         with torch.no_grad():
-            if (feature_type is None and self.cfg.feature_type == 'state') or feature_type == 'state':
-                phi = self.feature_learner.feature_net(obs)
-            elif (feature_type is None and self.cfg.feature_type == 'diff') or feature_type == 'diff':
-                phi = self.feature_learner.feature_net(next_obs) - self.feature_learner.feature_net(obs)
-            else:
-                phi = torch.cat([self.feature_learner.feature_net(obs), self.feature_learner.feature_net(next_obs)], dim=-1)
-        z = torch.linalg.lstsq(phi, reward).solution
-        with torch.no_grad():
-            r_vec = reward.view(-1)  # (N,)
-            y_hat = phi @ z  # (N,)
-            resid = r_vec - y_hat
-
-            N, D = phi.shape
-            sse = (resid ** 2).sum()
-            rmse = torch.sqrt((resid ** 2).mean())
-            # 避免除零
-            denom = torch.clamp((r_vec - r_vec.mean()).pow(2).sum(), min=1e-12)
-            r2 = 1.0 - sse / denom
-
-            # 数值稳定性
-            svals = torch.linalg.svdvals(phi)  # (min(N,D),)
-            s_min = torch.clamp_min(svals.min(), 1e-12)
-            cond = (svals.max() / s_min)
-            # 有效秩（基于阈值）
-            rank = int((svals > 1e-6).sum().item())
-
-            # 置信区间（可选；N > D 时有意义）
-            ci_low = None; ci_high = None
-            if N > D:
-                sigma2 = (sse / (N - D)).item()
-                # (ΦᵀΦ)^{-1}
-                xtx = phi.T @ phi
-                cov = sigma2 * torch.linalg.pinv(xtx)
-                se = torch.sqrt(torch.clamp(torch.diag(cov), min=0.0))
-                ci_low = (z - 1.96 * se)
-                ci_high = (z + 1.96 * se)
-
-            diag = {
-                "N": N, "D": D,
-                "SSE": float(sse.item()),
-                "RMSE": float(rmse.item()),
-                "R2": float(r2.item()),
-                "cond": float(cond.item()),
-                "rank": rank,
-            }
-            # 如果你愿意，也可以把 ci 的范数或最大/最小值记录一下：
-            if ci_low is not None:
-                diag.update({
-                    "z_se_max": float(se.max().item()),
-                    "z_se_mean": float(se.mean().item()),
-                })
+            # if (feature_type is None and self.cfg.feature_type == 'state') or feature_type == 'state':
+            #     phi = self.feature_learner.feature_net(obs)
+            # elif (feature_type is None and self.cfg.feature_type == 'diff') or feature_type == 'diff':
+            #     phi = self.feature_learner.feature_net(next_obs) - self.feature_learner.feature_net(obs)
+            # else:
+            #     phi = torch.cat([self.feature_learner.feature_net(obs), self.feature_learner.feature_net(next_obs)], dim=-1)
+            x = self.feature_learner.feature_net(obs)
+            xp = self.feature_learner.feature_net(next_obs)
+            r = reward.view(-1)
+        z, diag = fit_goal_latent(
+            x, xp, r,
+            optimizer="lbfgs",          # 中小数据更快更稳
+            lbfgs_max_iter=200,
+            restarts=8,                 # 多重重启更稳（含闭式解初始化）
+            use_lstsq_init=True,
+            standardize=True,           # 强烈建议
+            device=self.cfg.device
+        )
         z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=0)
         meta = OrderedDict()
         meta['z'] = z.squeeze().cpu().numpy()
@@ -696,7 +662,7 @@ class SFV2Agent:
             phi_loss, info = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
         else:
             phi_loss = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
-            info = None
+            info = {}
 
         if self.cfg.use_tb or self.cfg.use_wandb:
             metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
@@ -715,9 +681,7 @@ class SFV2Agent:
             if isinstance(self.sf_opt, torch.optim.Adam):
                 metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]
 
-            if info is not None:
-                for key, val in info.items():
-                    metrics[key] = val.item()
+            metrics.update(info)
 
         # optimize SF
         if self.encoder_opt is not None:
@@ -726,12 +690,12 @@ class SFV2Agent:
         if self.phi_opt is not None:
             self.phi_opt.zero_grad(set_to_none=True)
             phi_loss.backward(retain_graph=True)
+            self.phi_opt.step()
+
         sf_loss.backward()
         self.sf_opt.step()
         if self.encoder_opt is not None:
             self.encoder_opt.step()
-        if self.phi_opt is not None:
-            self.phi_opt.step()
 
         return metrics
 

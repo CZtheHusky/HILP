@@ -192,15 +192,15 @@ class HILP(FeatureLearner):
             self.running_std = 0.995 * self.running_std + 0.005 * phi1.std(dim=0)
 
         return value_loss, {
-            'hilp/value_loss': value_loss,
-            'hilp/v_mean': v.mean(),
-            'hilp/v_max': v.max(),
-            'hilp/v_min': v.min(),
-            'hilp/abs_adv_mean': torch.abs(adv).mean(),
-            'hilp/adv_mean': adv.mean(),
-            'hilp/adv_max': adv.max(),
-            'hilp/adv_min': adv.min(),
-            'hilp/accept_prob': (adv >= 0).float().mean(),
+            'hilp/value_loss': value_loss.item(),
+            'hilp/v_mean': v.mean().item(),
+            'hilp/v_max': v.max().item(),
+            'hilp/v_min': v.min().item(),
+            'hilp/abs_adv_mean': torch.abs(adv).mean().item(),
+            'hilp/adv_mean': adv.mean().item(),
+            'hilp/adv_max': adv.max().item(),
+            'hilp/adv_min': adv.min().item(),
+            'hilp/accept_prob': (adv >= 0).float().mean().item(),
         }
 
 
@@ -884,12 +884,11 @@ class SFHumanoidAgent:
                     self.encoder_opt.step()
                     encoder_grad = grad_norm_stats(self.encoder, prefix='encoder')
                     metrics.update(encoder_grad)
-                if self.phi_opt is not None:
-                    self.phi_opt.zero_grad(set_to_none=True)
-                    phi_loss.backward(retain_graph=True)
-                    phi_grad = grad_norm_stats(self.feature_learner, prefix='phi')
-                    metrics.update(phi_grad)
             if self.phi_opt is not None:
+                self.phi_opt.zero_grad(set_to_none=True)
+                phi_loss.backward(retain_graph=True)
+                phi_grad = grad_norm_stats(self.feature_learner, prefix='phi')
+                metrics.update(phi_grad)
                 self.phi_opt.step()
         return metrics
 

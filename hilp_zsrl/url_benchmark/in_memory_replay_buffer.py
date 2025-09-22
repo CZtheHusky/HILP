@@ -209,13 +209,22 @@ class ReplayBuffer:
                 rets.append(self._storage[storage_key][ep_idx, np.maximum(0, step_idx - (self._frame_stack - i - 1))])
             return np.concatenate(rets, axis=1)
 
+    def sample_episode(self):
+        if self._is_fixed_episode_length:
+            ep_idx = np.random.randint(0, len(self), size=1)
+            random_ep_idx = np.random.randint(0, len(self), size=1)
+        else:
+            if self._episodes_selection_probability is None:
+                self._episodes_selection_probability = self._episodes_length / self._episodes_length.sum()
+            ep_idx = np.random.choice(np.arange(len(self._episodes_length)), size=1, p=self._episodes_selection_probability)
+        return ep_idx
+
     def sample(self, batch_size, custom_reward: tp.Optional[tp.Any] = None, with_physics: bool = False, is_val: bool = False) -> EpisodeBatch:
         if not hasattr(self, "_batch_names"):
             self._batch_names = set(field.name for field in dataclasses.fields(ExtendedTimeStep))
         if not isinstance(self._future, float):
             assert isinstance(self._future, bool)
             self._future = float(self._future)
-
         if self._is_fixed_episode_length:
             ep_idx = np.random.randint(0, len(self), size=batch_size)
             random_ep_idx = np.random.randint(0, len(self), size=batch_size)
@@ -224,7 +233,6 @@ class ReplayBuffer:
                 self._episodes_selection_probability = self._episodes_length / self._episodes_length.sum()
             ep_idx = np.random.choice(np.arange(len(self._episodes_length)), size=batch_size, p=self._episodes_selection_probability)
             random_ep_idx = np.random.choice(np.arange(len(self._episodes_length)), size=batch_size, p=self._episodes_selection_probability)
-
         eps_lengths = self._episodes_length[ep_idx]
         random_eps_lengths = self._episodes_length[random_ep_idx]
         # add +1 for the first dummy transition
@@ -258,6 +266,38 @@ class ReplayBuffer:
             additional["_physics"] = phy
         return EpisodeBatch(obs=obs, action=action, reward=reward, discount=discount,
                             next_obs=next_obs, future_obs=future_obs, valid_future_obs=valid_future_obs, meta=meta, **additional)
+
+    def sample_transitions_with_indices(self, batch_size: int, custom_reward: tp.Optional[tp.Any] = None) -> tp.Dict[str, np.ndarray]:
+        """Sample a batch of transitions and also return (ep_idx, step_idx) for each sampled transition.
+        step_idx corresponds to the next_obs time index in the stored episode (i.e., the transition s_t->s_{t+1} uses step_idx=t+1).
+        """
+        if not hasattr(self, "_batch_names"):
+            self._batch_names = set(field.name for field in dataclasses.fields(ExtendedTimeStep))
+        if not isinstance(self._future, float):
+            assert isinstance(self._future, bool)
+            self._future = float(self._future)
+        if self._is_fixed_episode_length:
+            ep_idx = np.random.randint(0, len(self), size=batch_size)
+        else:
+            if self._episodes_selection_probability is None:
+                self._episodes_selection_probability = self._episodes_length / self._episodes_length.sum()
+            ep_idx = np.random.choice(np.arange(len(self._episodes_length)), size=batch_size, p=self._episodes_selection_probability)
+        eps_lengths = self._episodes_length[ep_idx]
+        step_idx = np.random.randint(0, eps_lengths) + 1  # 1..len
+        assert (step_idx <= eps_lengths).all()
+        # Fetch data exactly like sample()
+        next_obs = self.get_obs("observation", ep_idx, step_idx)
+        phy = self._storage['physics'][ep_idx, step_idx]
+        if custom_reward is not None:
+            reward = np.array([[custom_reward.from_physics(p)] for p in phy], dtype=np.float32)
+        else:
+            reward = self._storage['reward'][ep_idx, step_idx]
+        return {
+            'next_obs': next_obs,
+            'reward': reward,
+            'ep_idx': ep_idx.astype(np.int64),
+            'step_idx': step_idx.astype(np.int64),
+        }
 
     def load(self, env: tp.Any, replay_dir: Path, relabel: bool = True) -> None:
         print(f'Loading replay buffer from {replay_dir}')

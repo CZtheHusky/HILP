@@ -258,17 +258,17 @@ class HilbertRepresentationDataset(Dataset):
         obs_t = self.get_obs(buf, t)
         next_obs_t = self.get_obs(buf, t + 1)
 
-        k = np.random.geometric(p=1-self.goal_future)
-        assert k > 0, f"k {k} must be greater than 0"
-        future_idx = min(t + k, ep_end)
-        future_obs_t = self.get_obs(buf, future_idx)
+
 
         if np.random.rand() <= self.p_randomgoal:
             rbi, rt, _ = self._step_index[np.random.randint(0, self.total_samples)]
             rprop = self.get_obs(self._buffers[rbi][1], rt)
             goal_obs_t = rprop
         else:
-            goal_obs_t = future_obs_t
+            k = np.random.geometric(p=1-self.goal_future)
+            assert k > 0, f"k {k} must be greater than 0"
+            future_idx = min(t + k, ep_end)
+            goal_obs_t = self.get_obs(buf, future_idx)
 
         out = {
             'obs': obs_t.astype(np.float32),
@@ -285,6 +285,104 @@ class HilbertRepresentationDataset(Dataset):
         if self._discount is not None:
             out['discount'] = self._discount
         return out
+   
+
+
+
+class HilbertRepreTestDataset(Dataset):
+    def __init__(self, data_dir: str,
+                 goal_future: float = 0.98,
+                 p_randomgoal: float = 0.5,
+                 obs_horizon: int = 5,
+                 full_loading: bool = False,
+                 use_history_action: bool = True,
+                 discount: float = None,
+                 load_command: bool = False,
+                 dataset_ratio: float = 1.0,
+        ):
+        print(f"Sampling method, p_randomgoal: {p_randomgoal}, future: {goal_future}, discount: {discount} horizon: {obs_horizon} use_history_action: {use_history_action}")
+        self.data_dir = data_dir
+        self.goal_future = float(goal_future)
+        self.p_randomgoal = float(p_randomgoal)
+        self.req_horizon = 1
+        self._full_loading = bool(full_loading)
+        self._discount = np.array(discount, dtype=np.float32)
+        self.use_history_action = use_history_action
+        self._load_command = load_command
+        self.dataset_ratio = float(dataset_ratio)
+        self._buffers: List[Tuple[str, dict]] = []   
+        assert self.data_dir.endswith("pt")
+        local_ds = torch.load(self.data_dir)
+        buffer_dict = {
+            "proprio": local_ds._storage["observation"][:, :1000].reshape(-1, 24),
+            'actions': local_ds._storage["action"][:, :1000].reshape(-1, 6),
+            'physics': local_ds._storage["physics"][:, :1000].reshape(-1, 18),
+        }
+        episode_len = local_ds._episodes_length
+        episode_ends = np.cumsum(episode_len)
+        buffer_dict['episode_ends'] = episode_ends
+        episode_id = np.repeat(np.arange(len(episode_ends)), np.diff([0, *episode_ends]))
+        buffer_dict['episode_id'] = episode_id
+
+
+        feat_dim = buffer_dict["proprio"].shape[-1]
+        self.obs_dim = feat_dim
+
+        self._step_index: List[Tuple[int, int, int]] = []
+        ep_ends = np.asarray(buffer_dict['episode_ends'])
+        num_eps_total = len(ep_ends)
+        for ep_idx in range(int(num_eps_total * self.dataset_ratio)):
+            ep_end = int(ep_ends[ep_idx])
+            ep_start = 0 if ep_idx == 0 else ep_ends[ep_idx - 1]
+            for t in range(ep_start, ep_end - 1):
+                self._step_index.append((t, ep_end - 1))
+        self.total_samples = len(self._step_index)
+        self._step_index = np.asarray(self._step_index, dtype=np.int32)
+        self.action_dim: Optional[int] = buffer_dict["actions"].shape[-1]
+        self.buffer_dict = buffer_dict
+
+    def __len__(self):
+        return self.total_samples
+
+    def get_obs(self, t):
+        proprio = self.buffer_dict['proprio'][t]
+        return proprio.reshape(-1)
+
+    def __getitem__(self, idx):
+        t, ep_end = self._step_index[idx]
+
+        obs_t = self.get_obs(t)
+        next_obs_t = self.get_obs(t + 1)
+        if np.random.rand() <= self.p_randomgoal:
+            rt, _ = self._step_index[np.random.randint(0, self.total_samples)]
+            rprop = self.get_obs(rt)
+            goal_obs_t = rprop
+        else:
+            k = np.random.geometric(p=1-self.goal_future)
+            assert k > 0, f"k {k} must be greater than 0"
+            future_idx = min(t + k, ep_end)
+            goal_obs_t = self.get_obs(future_idx)
+
+        out = {
+            'obs': obs_t.astype(np.float32),
+            'next_obs': next_obs_t.astype(np.float32),
+            'future_obs': goal_obs_t.astype(np.float32),
+        }
+        out['actions'] = self.buffer_dict['actions'][t].astype(np.float32)
+        if self._discount is not None:
+            out['discount'] = self._discount
+        return out
+    
+    def sample_transitions(self, batch_size: int):
+        idxs = np.random.randint(0, self.total_samples, size=batch_size)
+        indexes = self._step_index[idxs]
+        t = indexes[:, 0]
+        t1 = t + 1
+        return {
+            'obs': self.buffer_dict['proprio'][t].astype(np.float32),
+            'next_obs': self.buffer_dict['proprio'][t1].astype(np.float32),
+            'physics': self.buffer_dict['physics'][t].astype(np.float32),
+        }
    
 
 class HilbertRepresentationDatasetLegacy(Dataset):

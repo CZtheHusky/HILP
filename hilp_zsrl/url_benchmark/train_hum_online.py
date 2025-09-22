@@ -1,6 +1,5 @@
 import platform
 import os
-from sympy.logic.boolalg import false
 os.environ["MPLBACKEND"] = "Agg"
 
 import matplotlib
@@ -64,13 +63,15 @@ from isaacgym import gymapi
 from url_benchmark.legged_gym_env_utils import build_isaac_namespace, _to_rgb_frame
 from collections import defaultdict
 from url_benchmark.replay_buffer import DataBuffer
-from url_benchmark.hilbert_dataset import HilbertRepresentationDataset
+from url_benchmark.phi_pretrain_dataset import PhiDataset
+from url_benchmark.dataset_utils import InfiniteDataLoaderWrapper
 from torch.utils.data import DataLoader
 # pbar import
 import datetime
 from url_benchmark.humanoid_utils import _safe_set_viewer_cam, get_cosine_sim, collect_nonzero_losses, calc_phi_loss_upper, calc_z_vector_matrixes, plot_matrix_heatmaps, compute_global_color_limits, plot_tripanel_heatmaps_with_line, plot_per_step_z
 from url_benchmark.in_memory_hum_buffer import StepReplayBuffer, EpisodeBatch, ReplaySchema
 from tqdm import trange
+from collections import deque
 
 
 def merge_keys(dict1, dict2):
@@ -114,20 +115,21 @@ class Config:
     use_history_action: bool = False
     
     # eval
-    save_every_steps: int = 40000
-    rollout_every_steps: int = 20000
-    rollout_num: int = 100
-    init_rollout_num: int = 200
-    phi_net_pretrain_steps: int = 10000
-    replay_buffer_save_interval: int = 100000
-    init_phi_steps: int = 60000
+    save_every_steps: int = 20000
+    rollout_every_steps: int = 40000
+    phi_rollout_num: int = 200
+    phi_net_pretrain_steps: int = 40000
     # training
     zero_boot_strap: bool = True
     num_grad_steps: int = 10000000000
     log_every_steps: int = 1000
     num_seed_frames: int = 0
-    replay_buffer_max_step: int = 400000000
+    minimal_train_buffer_size: int = 10000
+    sac_optim_steps: int = 100
+    replay_buffer_max_step: int = int(1e7)
     update_encoder: bool = True
+    phi_total_episodes: int = int(1e6)
+    num_workers: int = 2
     batch_size: int = omgcf.II("agent.batch_size")
     # dataset
     # legged-gym dataset (Hilbert zarr) options
@@ -171,25 +173,6 @@ class Workspace:
         self.device = torch.device(cfg.device)
         task = cfg.task
         self.domain = task.split('_', maxsplit=1)[0]
-        if self.cfg.eval_only:
-            self.eval_env = self._make_eval_env()
-            self._init_env_cam(self.eval_env)
-        # else:
-        #     self.train_env = self._make_train_env()  # 环境仅用于读取规格与评估
-        #     rep_schema = ReplaySchema(
-        #         obs_key="proprio",
-        #         action_key="actions",
-        #         reward_key="rewards",
-        #         obs_horizon=self.cfg.agent.obs_horizon,
-        #         cast_dtype=np.float32,
-        #     )
-        #     self.replay_buffer = StepReplayBuffer(
-        #         capacity_steps=self.cfg.replay_buffer_max_step,
-        #         schema=rep_schema,
-        #         discount=self.cfg.discount,
-        #         future=self.cfg.future,
-        #         p_randomgoal=self.cfg.p_randomgoal,
-        #     )
         exp_name = 'online'
         if cfg.resume_from is not None:
             if self.cfg.resume_from.endswith('.pt'):
@@ -243,13 +226,27 @@ class Workspace:
             except Exception as e:
                 print(f"Warning: failed to save cfg to {config_yaml_path}: {e}")
         
-        if self.cfg.mix_ratio > 0 and self.cfg.random_sample_z:
-            pass
+        if self.cfg.eval_only:
+            self.eval_env = self._make_eval_env()
+            self._init_env_cam(self.eval_env)
         else:
-            self.cfg.mix_ratio = 0
-            print("Masking mix_ratio to 0, because random_sample_z is False")
+            self.train_env = self._make_train_env()  # 环境仅用于读取规格与评估
+            rep_schema = ReplaySchema(
+                obs_key="proprio",
+                action_key="actions",
+                reward_key="rewards",
+                obs_horizon=self.cfg.agent.obs_horizon,
+                cast_dtype=np.float32,
+            )
+            self.replay_buffer = StepReplayBuffer(
+                capacity_steps=self.cfg.replay_buffer_max_step,
+                schema=rep_schema,
+                discount=self.cfg.discount,
+                future=self.cfg.future,
+                p_randomgoal=self.cfg.p_randomgoal,
+            )
 
-        exp_name += '_'.join([f"pr{str(self.cfg.p_randomgoal)}", f"phe{str(self.cfg.agent.hilp_expectile)}", f"phg{str(self.cfg.agent.hilp_discount)}", str(self.cfg.agent.command_injection), f"mix{str(self.cfg.agent.mix_ratio)}", str(self.cfg.agent.z_dim), f"phh{str(self.cfg.agent.phi_hidden_dim)}", f"{str(self.cfg.agent.feature_type)}", f"hor{str(self.cfg.agent.obs_horizon)}", f"rsz{str(self.cfg.agent.random_sample_z)}"])
+        exp_name += '_'.join([f"pr{str(self.cfg.p_randomgoal)}", f"phe{str(self.cfg.agent.hilp_expectile)}", f"phg{str(self.cfg.agent.hilp_discount)}", str(self.cfg.agent.z_dim), f"phh{str(self.cfg.agent.phi_hidden_dim)}", f"{str(self.cfg.agent.feature_type)}", f"hor{str(self.cfg.agent.obs_horizon)}"])
         self.exp_name = exp_name
         cfg_dict = omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
         cfg_dict['work_dir'] = self.work_dir
@@ -263,8 +260,9 @@ class Workspace:
             with open(os.path.join(self.work_dir, "wandb.yaml"), "w") as f:
                 yaml.dump({"run_id": run_id}, f)
         self.timer = utils.Timer()
+        self.phi_step = 0
+        self.policy_step = 0
         self.global_step = 0
-        self.global_episode = 0
         self.eval_rewards_history: tp.List[float] = []
         print("CFG Device: ", cfg.device)
         print("Self Device: ", self.device)
@@ -309,7 +307,10 @@ class Workspace:
                 self._checkpoint_filepath = os.path.join(self.work_dir, "models", models[-1])
                 if os.path.exists(self._checkpoint_filepath):
                     self.load_checkpoint(self._checkpoint_filepath)
-            # self.replay_buffer = self.replay_buffer.load(os.path.join(self.work_dir, "replay_buffer.pt"))
+            self.replay_buffer = self.replay_buffer.load(os.path.join(self.work_dir, "replay_buffer.pt"))
+        print("=" * 50)
+        print("Work dir:", self.work_dir)
+        print("=" * 50)
 
     
     def _make_eval_env(self):
@@ -434,21 +435,78 @@ class Workspace:
         return next_obs_t[torch.argmax(reward_t)].detach().cpu().numpy()
 
     def train_phi(self, is_init: bool = False):
+        print("Training Phi")
+        self.prepare_phi_dataset()
         metrics_summon = defaultdict(list)
-        pbar = tqdm(range(self.cfg.init_phi_steps if is_init else self.cfg.phi_net_pretrain_steps), desc="Training Phi", position=1, leave=True)
+        train_steps = self.cfg.phi_net_pretrain_steps
+        pbar = trange(train_steps, desc="Training Phi", position=1, leave=True)
         self.agent.feature_learner.train()
-        for _ in pbar:
-            metrics = self.agent.update_phi(self.replay_buffer)
+        for batch in self.phi_dataloader:
+            metrics = self.agent.update_phi(batch)
             for k, v in metrics.items():
                 metrics_summon[k].append(v)
-            if (self.global_step + 1) % self.cfg.log_every_steps == 0:
+            if (self.phi_step + 1) % self.cfg.log_every_steps == 0:
                 self.update_train_metrics(metrics_summon)
                 metrics_summon = defaultdict(list)
+            self.phi_step += 1
             self.global_step += 1
+            pbar.update(1)
+            pbar.set_description(f"Local, Phi Loss: {metrics['phi_loss']:.4f}")
             self.global_progress_bar.update(1)
-            self.global_progress_bar.set_description(f"Sample Time: {metrics['sample_time']:.2f}s")
+            self.global_progress_bar.set_description(f"Global,Training Phi")
+            if self.phi_step % train_steps == 0:
+                break
         _checkpoint_filepath = os.path.join(self.work_dir, f"phi_pretrained_tmp.pt")
         self.save_checkpoint(_checkpoint_filepath)
+        del self.phi_dataloader
+
+
+    def train_policy(self):
+        print("Training Policy")
+        # sac training
+        collection_mean_len = deque(maxlen=10)
+        loader_cfg = {
+            "batch_size": self.cfg.num_train_envs,
+            "shuffle": True,
+            "num_workers": self.cfg.num_workers,
+        }
+        if hasattr(self, "phi_dataset"):
+            policy_phi_dataloader = InfiniteDataLoaderWrapper(self.phi_dataset, loader_cfg)
+        else:
+            self.prepare_phi_dataset()
+            policy_phi_dataloader = InfiniteDataLoaderWrapper(self.phi_dataset, loader_cfg)
+        for batch in policy_phi_dataloader:
+            phi_obs = batch['obs'].to(self.cfg.device)
+            phi_future_obs = batch['future_obs'].to(self.cfg.device)
+            episodes, mean_len = self._collect_episode(random_sample=False, phi_obs=phi_obs, phi_future_obs=phi_future_obs)
+            collection_mean_len.append(mean_len)
+            for ep in episodes:
+                self.replay_buffer.add_episode(ep["data"], ep["meta"])
+            if self.replay_buffer.num_steps >= self.cfg.minimal_train_buffer_size:
+                metrics_summon = defaultdict(list)
+                self.replay_buffer._candidate_indices()
+                for _ in range(self.cfg.sac_optim_steps):
+                    sac_batch = self.replay_buffer.sample(self.cfg.batch_size)
+                    metrics = self.agent.update_batch(sac_batch)
+                    self.policy_step += 1
+                    self.global_step += 1
+                    self.global_progress_bar.update(1)
+                    self.global_progress_bar.set_description(f"Global, SAC Training")
+                    for k, v in metrics.items():
+                        metrics_summon[k].append(v)
+                    if self.policy_step % self.cfg.save_every_steps == 0:
+                        _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
+                        self.save_checkpoint(_checkpoint_filepath)
+                    if self.policy_step % self.cfg.rollout_every_steps == 0:
+                        policy_phi_dataloader.close_loader()
+                        return
+                metrics_summon['collection_mean_len'] = np.mean(collection_mean_len)
+                metrics_summon['replay_buffer_steps'] = self.replay_buffer.num_steps
+                metrics_summon['phi_dataset_ep_num'] = self.phi_dataset.meta_info['valid_episodes_num']
+                self.update_train_metrics(metrics_summon)
+        return 
+                
+                
 
     def train(self):
         if self.cfg.eval_only:
@@ -482,7 +540,7 @@ class Workspace:
                             evaled[ffn] = True
                             with open(os.path.join(self.work_dir, f"evaled.json"), "w") as f:
                                 json.dump(evaled, f)
-                    for ffn in filen[-10:]: # keep the last 10 checkpoints
+                    for ffn in filen[:-10]: # keep the last 10 checkpoints
                         os.remove(os.path.join(models_dir, ffn))
                     time.sleep(60)
                 except Exception as e:
@@ -492,33 +550,16 @@ class Workspace:
             return
         self.global_progress_bar = trange(self.cfg.num_grad_steps, position=0, initial=self.global_step, leave=True, desc="Training Global")
         if self.cfg.resume_from is None:
-            if self.cfg.inti_replay_path is not None:
-                self.replay_buffer = self.replay_buffer.load(self.cfg.inti_replay_path)
-            elif self.cfg.init_rb_path is not None:
-                self.replay_buffer.load_from_rb(self.cfg.init_rb_path)
-            else:
-                self.prepare_phi_data(is_init=True)
             self.train_phi(is_init=True)
+        elif not self.cfg.resume_from.endswith('phi_pretrained_tmp.pt'):
+            self.train_phi(is_init=False)
         while True:
-            metrics_summon = defaultdict(list)
-            metrics = self.agent.update_all(self.replay_buffer)
-            for k, v in metrics.items():
-                metrics_summon[k].append(v)
-            if (self.global_step + 1) % self.cfg.log_every_steps == 0:
-                self.update_train_metrics(metrics_summon)
-                metrics_summon = defaultdict(list)
-            if (self.global_step + 1) % self.cfg.save_every_steps == 0:
-                _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
-                self.save_checkpoint(_checkpoint_filepath)
-            if (self.global_step + 1) % self.cfg.rollout_every_steps == 0:
-                self.prepare_phi_data(is_init=False)
-                self.train_phi(is_init=False)
-            else:
-                self.global_step += 1
-                self.global_progress_bar.update(1)
-                self.global_progress_bar.set_description(f"Sample Time: {metrics['sample_time']:.2f}s")
-            if self.global_step > self.cfg.num_grad_steps:
+            self.train_policy()
+            self.train_phi()
+            if self.global_step >= self.cfg.num_grad_steps:
+                print("Training completed.")
                 break
+
             
     def _proprocess_obs(self, obs):
         if self.cfg.agent.obs_horizon > 1:
@@ -569,7 +610,7 @@ class Workspace:
             )
 
 
-    def _collect_episode(self):
+    def _collect_episode(self, random_sample=True, phi_obs=None, phi_future_obs=None):
         """Collect a single episode for all environments and return episodes list"""
         # Reset environment
         obs, critic_obs = self.train_env.reset()
@@ -580,10 +621,8 @@ class Workspace:
         cmd_A = self.train_env.commands.detach()
 
         last_obs_buffers = []
-        # last_critic_obs_buffers = []
         action_buffers = []
         reward_buffers = []
-        # done_buffers = []
         env_valid_steps = torch.zeros(self.train_env.num_envs, dtype=torch.int32, device=self.device)
         
         # Track active environments
@@ -595,15 +634,14 @@ class Workspace:
         #     [2, 2, 0.25, 1, 1, 1, 0.15, 2.0, 0.5, 0.5, 1]
         # )).to(self.device)
         last_obs, last_critic_obs, _, _, _ = self.train_env.step(torch.zeros(self.train_env.num_envs, self.train_env.num_actions, dtype=torch.float, device=self.train_env.device))
-        # ep_start_obs = last_obs[:, :-1].detach().cpu().numpy()
-        # assert len(last_critic_obs.shape) == 2
+        ep_start_obs = last_obs[:, :-1].detach().cpu().numpy()
         last_obs[:, :-1] = last_obs[:, -1:]
-        # assert len(last_obs.shape) == 3
-        # assert last_obs.shape[-1] == self.total_obs_dim, f"last_obs.shape: {last_obs.shape} != self.total_obs_dim: {self.total_obs_dim}"
-        # assert last_critic_obs.shape[-1] == self.total_privileged_dim
         current_commands = cmd_A.detach()
         pure_obs, obs_command = self._proprocess_obs(obs)
-        z_hilbert, z_actor = self.agent.sample_z(num_envs, rollout=True)
+        if random_sample:
+            z_actor = self.agent.sample_z(size=num_envs, random_sample=random_sample)
+        else:
+            z_actor = self.agent.sample_z(random_sample=False, obs=phi_obs, future_obs=phi_future_obs)
         while t < self.max_steps and active_mask.any():
             with torch.inference_mode():
                 actions = self.agent.act_inference(pure_obs, z_actor)
@@ -616,43 +654,29 @@ class Workspace:
             self.train_env.commands.copy_(current_commands)
 
             last_obs_buffers.append(last_obs[:, -1].detach().cpu().numpy())
-            # last_critic_obs_buffers.append(last_critic_obs[:, last_obs.shape[-1]:].detach().cpu().numpy())
             action_buffers.append(actions.detach().cpu().numpy())
             reward_buffers.append(step_rewards.cpu().numpy())
-            # done_buffers.append(dones.cpu().numpy())
             last_obs = obs.detach()
-            # last_critic_obs = critic_obs.detach()
             t += 1
-            # inactivate envs that are done at this step
             env_valid_steps[active_mask] += 1
             if dones.any():
                 active_mask[dones > 0] = False
-            # print(env_valid_steps.cpu().numpy())
-            # break when all envs finished early
             if (~active_mask).all():
                 break
         # finalize: build episodes
         episodes = []
         saved_rewards = []
         last_obs_buffers = np.stack(last_obs_buffers, axis=1)
-        # last_critic_obs_buffers = np.stack(last_critic_obs_buffers, axis=1)
         action_buffers = np.stack(action_buffers, axis=1)
         reward_buffers = np.stack(reward_buffers, axis=1).astype(np.float32)
-        # done_buffers = np.stack(done_buffers, axis=1).astype(bool)
         env_valid_steps = env_valid_steps.cpu().numpy()
         for eid in range(self.train_env.num_envs):
             env_steps = env_valid_steps[eid]
             traj_reward = reward_buffers[eid, :env_steps]
 
             traj_proprio = last_obs_buffers[eid, :env_steps, :self.proprio_dim]
-            # traj_cmd = last_obs_buffers[eid, :env_steps, -self.cmd_dim - self.clock_dim:-self.clock_dim]
-            # traj_clock = last_obs_buffers[eid, :env_steps, -self.clock_dim:]
-
-            # traj_privileged = last_critic_obs_buffers[eid, :env_steps, :self.privileged_dim]
-            # traj_terrain = last_critic_obs_buffers[eid, :env_steps, self.privileged_dim:]
 
             traj_action = action_buffers[eid, :env_steps]
-            # traj_done = done_buffers[eid, :env_steps]
 
             traj_rew = float(sum(traj_reward))
             traj_step_reward = np.mean(traj_reward)
@@ -664,8 +688,7 @@ class Workspace:
             }
 
             meta_entry = {
-                "episode_reward": traj_rew,
-                "episode_step_reward": traj_step_reward,
+                "ep_start_obs": ep_start_obs[eid],
             }
             meta_entry["episode_command"] = cmd_A[eid].cpu().numpy()
             meta_entry['z'] = z_actor[eid].cpu().numpy()
@@ -673,35 +696,44 @@ class Workspace:
             episodes.append({"data": data, "meta": meta_entry})
 
         return episodes, np.mean(env_valid_steps)
+    
 
-    def prepare_phi_data(self, is_init=False):
-        print("Before collect data, num steps in replay buffer: ", len(self.replay_buffer))
-        if is_init:
-            total_num = self.cfg.init_rollout_num
-        else:
-            total_num = self.cfg.rollout_num
+    def init_phi_dataset(self):
+        if not hasattr(self, 'phi_dataset'):       
+            self.phi_dataset = PhiDataset(
+                data_dir=os.path.join(self.work_dir, "phi_dataset"),
+                obs_horizon=self.cfg.agent.obs_horizon,
+                total_episodes=self.cfg.phi_total_episodes,
+                discount=self.cfg.discount,
+                goal_future=self.cfg.future,
+                p_randomgoal=self.cfg.p_randomgoal,
+            )
+
+    def prepare_phi_dataset(self):
+        self.init_phi_dataset()
+        total_num = self.cfg.phi_rollout_num
         collection_mean_len = []
         start_time = time.time()
         pbar = trange(total_num, desc="Collecting data", leave=True)
+        self.phi_dataset._in_memory_split()
         for _ in range(total_num):
-            episodes, mean_len = self._collect_episode()
+            episodes, mean_len = self._collect_episode(random_sample=True)
             collection_mean_len.append(mean_len)
             pbar.update(1)
             pbar.set_description(f"Steps: {len(self.replay_buffer)}, EP len: {mean_len}")
+            self.phi_dataset._collect_and_save(episodes)
+        self.phi_dataset._in_memory_finalize()
+        dataloader_cfg = {
+            "batch_size": self.cfg.batch_size,
+            "shuffle": True,
+            "num_workers": self.cfg.num_workers,
+        }
+        self.phi_dataloader = InfiniteDataLoaderWrapper(self.phi_dataset, dataloader_cfg)
+        end_time = time.time()
         if self.cfg.use_wandb:
-            wandb.log({f"train/collected_mean_len": np.mean(collection_mean_len), "train/collected_time": time.time() - start_time}, step=self.global_step)
+            wandb.log({f"train/phi_dataset_time": end_time - start_time, 'train/phi_collection_mean_len': np.mean(collection_mean_len)}, step=self.global_step)
         else:
-            print(f"train/collected_mean_len: {np.mean(collection_mean_len)}")
-            print(f"train/collected_time: {time.time() - start_time}")
-        self.replay_buffer._candidate_indices()
-        try:
-            replay_buffer_path = os.path.join(self.work_dir, f"replay_buffer.pt")
-            self.replay_buffer.save(replay_buffer_path)
-        except Exception as e:
-            print(f"Error saving replay buffer: {e}")
-            traceback.print_exc()
-        
-        
+            print(f"train/phi_dataset_time: {end_time - start_time}")
 
     def _env_rollout(self, 
         command_vec,
@@ -748,10 +780,7 @@ class Workspace:
         img_internal_id = 0
         while not dones.any() and timestep < eval_steps:
             with torch.inference_mode():
-                if goal_type == 'raw_cmd':
-                    assert self.agent.command_injection or self.agent.use_raw_command, f"command_injection or use_raw_command must be True"
-                    z_hilbert, z_actor = self.agent.sample_z(1, obs_command)
-                elif "horizon" in goal_type:
+                if "horizon" in goal_type:
                     assert command_horizon is not None and goals_list is not None, "command_horizon and goals_list must be provided"
                     assert "state" in goal_type or "diff" in goal_type, "goal_type must be state_horizon or diff_horizon"
                     if timestep // command_horizon != last_index and last_index < len(goals_list) - 1:
@@ -769,7 +798,7 @@ class Workspace:
                     assert z_actor is not None, "z_actor must be provided"    
                     z_hilbert = z_actor
                 # print(pure_obs.shape, z_actor.shape)
-                actions, _ = self.agent.actor.act_inference(pure_obs, z_actor)
+                actions = self.agent.act_inference(pure_obs, z_actor)
                 phi = self.agent.feature_learner.feature_net(pure_obs)
                 phi_list.append(phi)
                 full_traj_phi.append(phi)
@@ -906,218 +935,192 @@ class Workspace:
                 title_cos=f'{command_name}_{traj_idx} Z Cosine Similarity',
                 title_dist=f'{command_name}_{traj_idx} Latent Space Distance',
             )
-        if self.cfg.agent.command_injection or self.cfg.agent.use_raw_command:
-            eval_results = defaultdict(list)
-            for key, (traj, command_vec, traj_idx) in traj_data.items():
-                command_name = key  
-                video_path = os.path.join(rollout_parent, "cmd", f"{command_name}_raw_cmd.mp4")
-                rewards_json_path = os.path.join(rollout_parent, "cmd", f"{command_name}_raw_cmd.json")
-                image_parent = os.path.join(rollout_parent, "cmd", "images")
-                os.makedirs(image_parent, exist_ok=True)
+        eval_fit_state = defaultdict(list)
+        eval_fit_diff = defaultdict(list)
+        eval_fit_diag_state = defaultdict(list)
+        eval_fit_diag_diff = defaultdict(list)
+        for key, data_buffer in self.example_data_buffers.items():
+            command_name = key
+            env_commands = data_buffer.meta['episode_command'][0]
+            command_vec = torch.tensor(env_commands, device=self.eval_env.device)
+            episode_ends = data_buffer.episode_ends[:]
+            obs_t = []
+            next_obs_t = []
+            reward_t = []
+            for ep_id in range(len(episode_ends)):
+                ep_start = 0 if ep_id == 0 else episode_ends[ep_id - 1]
+                ep_end = episode_ends[ep_id]
+                ep_len = ep_end - ep_start
+                ep_start_obs = data_buffer.meta['ep_start_obs'][ep_id]
+                raw_state_data = data_buffer.data['proprio'][ep_start:ep_end]
+                raw_state = np.concatenate([ep_start_obs[..., :raw_state_data.shape[-1]], raw_state_data], axis=0)
+                raw_index = np.arange(raw_state.shape[0] - self.cfg.agent.obs_horizon + 1)
+                horizon_index = raw_index[:, None] + np.arange(self.cfg.agent.obs_horizon)
+                raw_state = raw_state[horizon_index]
+                traj = raw_state.reshape(raw_state.shape[0], -1)
+                traj = traj[-ep_len:]
+                obs_array = traj[:-1]
+                next_obs_array = traj[1:]
 
-                rollout_results = self._env_rollout(
-                    command_name=command_name, 
-                    goal_type="raw_cmd",
-                    command_vec=command_vec, 
-                    video_path=video_path,
-                    rewards_json_path=rewards_json_path, 
-                    eval_steps=eval_steps,
-                    image_parent=image_parent,
-                )
-                for k, v in rollout_results.items():
-                    eval_results[k].append(v) 
-            eval_results = {key: np.mean(eval_results[key]) for key in eval_results if len(eval_results[key]) > 0}
+                reward_array = data_buffer.data['rewards'][ep_start:ep_end - 1]
+                obs_t.append(torch.as_tensor(obs_array))
+                next_obs_t.append(torch.as_tensor(next_obs_array))
+                reward_t.append(torch.as_tensor(reward_array))
+            obs_t = torch.cat(obs_t, 0).to(self.eval_env.device)
+            obs_t = obs_t.view(obs_t.shape[0], -1)
+            next_obs_t = torch.cat(next_obs_t, 0).to(self.eval_env.device)
+            next_obs_t = next_obs_t.view(next_obs_t.shape[0], -1)
+            reward_t = torch.cat(reward_t, 0).to(self.eval_env.device)
+            # print("Obs T Device: ", obs_t.device, "Obs T shape:", obs_t.shape)
+            meta_state, diag_state = self.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t, feat_type='state')
+            meta_diff, diag_diff = self.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t, feat_type='diff')
+
+            z_actor_state = torch.tensor(meta_state['z'], device=self.eval_env.device).reshape(1, -1)
+            z_actor_diff = torch.tensor(meta_diff['z'], device=self.eval_env.device).reshape(1, -1)
+
+            fit_video_path_state = os.path.join(rollout_parent, f"fit_state_{command_name}.mp4")
+            fit_rewards_json_path_state = os.path.join(rollout_parent, f"fit_state_{command_name}.json")
+            fit_video_path_diff = os.path.join(rollout_parent, f"fit_diff_{command_name}.mp4")
+            fit_rewards_json_path_diff = os.path.join(rollout_parent, f"fit_diff_{command_name}.json")
+            image_state_parent = os.path.join(rollout_parent, "fit_state_images")
+            image_diff_parent = os.path.join(rollout_parent, "fit_diff_images")
+            os.makedirs(image_state_parent, exist_ok=True)
+            os.makedirs(image_diff_parent, exist_ok=True)
+            rollout_results = self._env_rollout(
+                command_name=command_name, 
+                goal_type="fit_state",
+                command_vec=command_vec, 
+                video_path=fit_video_path_state,
+                rewards_json_path=fit_rewards_json_path_state, 
+                eval_steps=eval_steps,
+                z_actor=z_actor_state,
+                image_parent=image_state_parent,
+            )
+            for k, v in rollout_results.items():
+                eval_fit_state[k].append(v)
+            for k, v in diag_state.items():
+                eval_fit_diag_state[k].append(v)
             if self.cfg.use_wandb:
-                wandb.log({f"eval_mean/{k}_raw_cmd": v for k, v in eval_results.items()}, step=self.global_step)
+                wandb.log({f"eval_fit_diag_state_detail/{command_name}_{k}": v for k, v in diag_state.items()}, step=self.global_step)
             else:
-                for k, v in eval_results.items():
-                    print(f"eval_mean/{k}_raw_cmd: {v}")
-        else:
-            eval_fit_state = defaultdict(list)
-            eval_fit_diff = defaultdict(list)
-            eval_fit_diag_state = defaultdict(list)
-            eval_fit_diag_diff = defaultdict(list)
-            for key, data_buffer in self.example_data_buffers.items():
-                command_name = key
-                env_commands = data_buffer.meta['episode_command'][0]
-                command_vec = torch.tensor(env_commands, device=self.eval_env.device)
-                episode_ends = data_buffer.episode_ends[:]
-                obs_t = []
-                next_obs_t = []
-                reward_t = []
-                for ep_id in range(len(episode_ends)):
-                    ep_start = 0 if ep_id == 0 else episode_ends[ep_id - 1]
-                    ep_end = episode_ends[ep_id]
-                    ep_len = ep_end - ep_start
-                    ep_start_obs = data_buffer.meta['ep_start_obs'][ep_id]
-                    raw_state_data = data_buffer.data['proprio'][ep_start:ep_end]
-                    raw_state = np.concatenate([ep_start_obs[..., :raw_state_data.shape[-1]], raw_state_data], axis=0)
-                    raw_index = np.arange(raw_state.shape[0] - self.cfg.agent.obs_horizon + 1)
-                    horizon_index = raw_index[:, None] + np.arange(self.cfg.agent.obs_horizon)
-                    raw_state = raw_state[horizon_index]
-                    traj = raw_state.reshape(raw_state.shape[0], -1)
-                    traj = traj[-ep_len:]
-                    obs_array = traj[:-1]
-                    next_obs_array = traj[1:]
-
-                    reward_array = data_buffer.data['rewards'][ep_start:ep_end - 1]
-                    obs_t.append(torch.as_tensor(obs_array))
-                    next_obs_t.append(torch.as_tensor(next_obs_array))
-                    reward_t.append(torch.as_tensor(reward_array))
-                obs_t = torch.cat(obs_t, 0).to(self.eval_env.device)
-                obs_t = obs_t.view(obs_t.shape[0], -1)
-                next_obs_t = torch.cat(next_obs_t, 0).to(self.eval_env.device)
-                next_obs_t = next_obs_t.view(next_obs_t.shape[0], -1)
-                reward_t = torch.cat(reward_t, 0).to(self.eval_env.device)
-                # print("Obs T Device: ", obs_t.device, "Obs T shape:", obs_t.shape)
-                meta_state, diag_state = self.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t, feat_type='state')
-                meta_diff, diag_diff = self.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t, feat_type='diff')
-
-                z_actor_state = torch.tensor(meta_state['z'], device=self.eval_env.device).reshape(1, -1)
-                z_actor_diff = torch.tensor(meta_diff['z'], device=self.eval_env.device).reshape(1, -1)
-
-                fit_video_path_state = os.path.join(rollout_parent, f"fit_state_{command_name}.mp4")
-                fit_rewards_json_path_state = os.path.join(rollout_parent, f"fit_state_{command_name}.json")
-                fit_video_path_diff = os.path.join(rollout_parent, f"fit_diff_{command_name}.mp4")
-                fit_rewards_json_path_diff = os.path.join(rollout_parent, f"fit_diff_{command_name}.json")
-                image_state_parent = os.path.join(rollout_parent, "fit_state_images")
-                image_diff_parent = os.path.join(rollout_parent, "fit_diff_images")
-                os.makedirs(image_state_parent, exist_ok=True)
-                os.makedirs(image_diff_parent, exist_ok=True)
-                rollout_results = self._env_rollout(
-                    command_name=command_name, 
-                    goal_type="fit_state",
-                    command_vec=command_vec, 
-                    video_path=fit_video_path_state,
-                    rewards_json_path=fit_rewards_json_path_state, 
-                    eval_steps=eval_steps,
-                    z_actor=z_actor_state,
-                    image_parent=image_state_parent,
-                )
-                for k, v in rollout_results.items():
-                    eval_fit_state[k].append(v)
                 for k, v in diag_state.items():
-                    eval_fit_diag_state[k].append(v)
-                if self.cfg.use_wandb:
-                    wandb.log({f"eval_fit_diag_state_detail/{command_name}_{k}": v for k, v in diag_state.items()}, step=self.global_step)
-                else:
-                    for k, v in diag_state.items():
-                        print(f"eval_fit_diag_state_detail/{command_name}_{k}: {v}")
+                    print(f"eval_fit_diag_state_detail/{command_name}_{k}: {v}")
+            rollout_results = self._env_rollout(
+                command_name=command_name, 
+                goal_type="fit_diff",
+                command_vec=command_vec, 
+                video_path=fit_video_path_diff,
+                rewards_json_path=fit_rewards_json_path_diff, 
+                eval_steps=eval_steps,
+                z_actor=z_actor_diff,
+                image_parent=image_diff_parent,
+            )
+            for k, v in rollout_results.items():
+                eval_fit_diff[k].append(v)
+            for k, v in diag_diff.items():
+                eval_fit_diag_diff[k].append(v)
+            if self.cfg.use_wandb:
+                wandb.log({f"eval_fit_diag_diff_detail/{command_name}_{k}": v for k, v in diag_diff.items()}, step=self.global_step)
+            else:
+                for k, v in diag_diff.items():
+                    print(f"eval_fit_diag_diff_detail/{command_name}_{k}: {v}")
+        eval_fit_state = {key: np.mean(eval_fit_state[key]) for key in eval_fit_state.keys()}
+        eval_fit_diff = {key: np.mean(eval_fit_diff[key]) for key in eval_fit_diff.keys()}
+        eval_fit_diag_state = {key: np.mean(eval_fit_diag_state[key]) for key in eval_fit_diag_state.keys()}
+        eval_fit_diag_diff = {key: np.mean(eval_fit_diag_diff[key]) for key in eval_fit_diag_diff.keys()}
+        if self.cfg.use_wandb:
+            wandb.log({f"eval_fit/state_{k}": v for k, v in eval_fit_state.items()}, step=self.global_step)
+            wandb.log({f"eval_fit/diff_{k}": v for k, v in eval_fit_diff.items()}, step=self.global_step)
+            wandb.log({f"eval_fit/state_diag_{k}": v for k, v in eval_fit_diag_state.items()}, step=self.global_step)
+            wandb.log({f"eval_fit/diff_diag_{k}": v for k, v in eval_fit_diag_diff.items()}, step=self.global_step)
+        else:
+            for k, v in eval_fit_state.items():
+                print(f"eval_fit/state_{k}: {v}")
+            for k, v in eval_fit_diff.items():
+                print(f"eval_fit/diff_{k}: {v}")
+            for k, v in eval_fit_diag_state.items():
+                print(f"eval_fit/state_diag_{k}: {v}")
+            for k, v in eval_fit_diag_diff.items():
+                print(f"eval_fit/diff_diag_{k}: {v}")
+
+        eval_diff = defaultdict(list)
+        eval_state = defaultdict(list)
+        for command_horizon in commands_horizons:
+            diff_horizon_results = defaultdict(list)
+            state_horizon_results = defaultdict(list)
+            for key, (traj, command_vec, traj_idx) in traj_data.items():
+                command_name = key
+                diff_video_path = os.path.join(rollout_parent, f"diff_{command_name}_{command_horizon}.mp4")
+                diff_rewards_json_path = os.path.join(rollout_parent, f"diff_{command_name}_{command_horizon}.json")
+                state_video_path = os.path.join(rollout_parent, f"state_{command_name}_{command_horizon}.mp4")
+                state_rewards_json_path = os.path.join(rollout_parent, f"state_{command_name}_{command_horizon}.json")
+
+                len_trajectory = traj.shape[0]
+                resample_steps_list = np.array([i for i in range(command_horizon, len_trajectory, command_horizon)])
+
+                goals_list = [traj[i].reshape(1, -1) for i in resample_steps_list]
+                goals_list.append(traj[-1].reshape(1, -1))  
+
+                image_diff_parent = os.path.join(rollout_parent, f"{command_horizon}_diff_images")
+                image_state_parent = os.path.join(rollout_parent, f"{command_horizon}_state_images")
+                os.makedirs(image_diff_parent, exist_ok=True)
+                os.makedirs(image_state_parent, exist_ok=True)
                 rollout_results = self._env_rollout(
                     command_name=command_name, 
-                    goal_type="fit_diff",
+                    goal_type="diff_horizon",
                     command_vec=command_vec, 
-                    video_path=fit_video_path_diff,
-                    rewards_json_path=fit_rewards_json_path_diff, 
+                    video_path=diff_video_path,
+                    rewards_json_path=diff_rewards_json_path, 
                     eval_steps=eval_steps,
-                    z_actor=z_actor_diff,
+                    command_horizon=command_horizon,
+                    goals_list=goals_list,
                     image_parent=image_diff_parent,
                 )
                 for k, v in rollout_results.items():
-                    eval_fit_diff[k].append(v)
-                for k, v in diag_diff.items():
-                    eval_fit_diag_diff[k].append(v)
-                if self.cfg.use_wandb:
-                    wandb.log({f"eval_fit_diag_diff_detail/{command_name}_{k}": v for k, v in diag_diff.items()}, step=self.global_step)
-                else:
-                    for k, v in diag_diff.items():
-                        print(f"eval_fit_diag_diff_detail/{command_name}_{k}: {v}")
-            eval_fit_state = {key: np.mean(eval_fit_state[key]) for key in eval_fit_state.keys()}
-            eval_fit_diff = {key: np.mean(eval_fit_diff[key]) for key in eval_fit_diff.keys()}
-            eval_fit_diag_state = {key: np.mean(eval_fit_diag_state[key]) for key in eval_fit_diag_state.keys()}
-            eval_fit_diag_diff = {key: np.mean(eval_fit_diag_diff[key]) for key in eval_fit_diag_diff.keys()}
+                    diff_horizon_results[k].append(v)
+                rollout_results = self._env_rollout(
+                    command_name=command_name, 
+                    goal_type="state_horizon",
+                    command_vec=command_vec, 
+                    video_path=state_video_path,
+                    rewards_json_path=state_rewards_json_path, 
+                    eval_steps=eval_steps,
+                    command_horizon=command_horizon,
+                    goals_list=goals_list,
+                    image_parent=image_state_parent,
+                )
+                for k, v in rollout_results.items():
+                    state_horizon_results[k].append(v)
+            diff_horizon_metrics = {}
+            state_horizon_metrics = {}
+            for k, v in diff_horizon_results.items():
+                diff_horizon_metrics[f"{command_horizon}_{k}"] = np.mean(v)
+                eval_diff[k].append(np.mean(v))
+            for k, v in state_horizon_results.items():
+                state_horizon_metrics[f"{command_horizon}_{k}"] = np.mean(v)
+                eval_state[k].append(np.mean(v))
             if self.cfg.use_wandb:
-                wandb.log({f"eval_fit/state_{k}": v for k, v in eval_fit_state.items()}, step=self.global_step)
-                wandb.log({f"eval_fit/diff_{k}": v for k, v in eval_fit_diff.items()}, step=self.global_step)
-                wandb.log({f"eval_fit/state_diag_{k}": v for k, v in eval_fit_diag_state.items()}, step=self.global_step)
-                wandb.log({f"eval_fit/diff_diag_{k}": v for k, v in eval_fit_diag_diff.items()}, step=self.global_step)
+                wandb.log({f"eval_diff_horizon/{k}": v for k, v in diff_horizon_metrics.items()}, step=self.global_step)
+                wandb.log({f"eval_state_horizon/{k}": v for k, v in state_horizon_metrics.items()}, step=self.global_step)
             else:
-                for k, v in eval_fit_state.items():
-                    print(f"eval_fit/state_{k}: {v}")
-                for k, v in eval_fit_diff.items():
-                    print(f"eval_fit/diff_{k}: {v}")
-                for k, v in eval_fit_diag_state.items():
-                    print(f"eval_fit/state_diag_{k}: {v}")
-                for k, v in eval_fit_diag_diff.items():
-                    print(f"eval_fit/diff_diag_{k}: {v}")
-
-            eval_diff = defaultdict(list)
-            eval_state = defaultdict(list)
-            for command_horizon in commands_horizons:
-                diff_horizon_results = defaultdict(list)
-                state_horizon_results = defaultdict(list)
-                for key, (traj, command_vec, traj_idx) in traj_data.items():
-                    command_name = key
-                    diff_video_path = os.path.join(rollout_parent, f"diff_{command_name}_{command_horizon}.mp4")
-                    diff_rewards_json_path = os.path.join(rollout_parent, f"diff_{command_name}_{command_horizon}.json")
-                    state_video_path = os.path.join(rollout_parent, f"state_{command_name}_{command_horizon}.mp4")
-                    state_rewards_json_path = os.path.join(rollout_parent, f"state_{command_name}_{command_horizon}.json")
-
-                    len_trajectory = traj.shape[0]
-                    resample_steps_list = np.array([i for i in range(command_horizon, len_trajectory, command_horizon)])
-
-                    goals_list = [traj[i].reshape(1, -1) for i in resample_steps_list]
-                    goals_list.append(traj[-1].reshape(1, -1))  
-
-                    image_diff_parent = os.path.join(rollout_parent, f"{command_horizon}_diff_images")
-                    image_state_parent = os.path.join(rollout_parent, f"{command_horizon}_state_images")
-                    os.makedirs(image_diff_parent, exist_ok=True)
-                    os.makedirs(image_state_parent, exist_ok=True)
-                    rollout_results = self._env_rollout(
-                        command_name=command_name, 
-                        goal_type="diff_horizon",
-                        command_vec=command_vec, 
-                        video_path=diff_video_path,
-                        rewards_json_path=diff_rewards_json_path, 
-                        eval_steps=eval_steps,
-                        command_horizon=command_horizon,
-                        goals_list=goals_list,
-                        image_parent=image_diff_parent,
-                    )
-                    for k, v in rollout_results.items():
-                        diff_horizon_results[k].append(v)
-                    rollout_results = self._env_rollout(
-                        command_name=command_name, 
-                        goal_type="state_horizon",
-                        command_vec=command_vec, 
-                        video_path=state_video_path,
-                        rewards_json_path=state_rewards_json_path, 
-                        eval_steps=eval_steps,
-                        command_horizon=command_horizon,
-                        goals_list=goals_list,
-                        image_parent=image_state_parent,
-                    )
-                    for k, v in rollout_results.items():
-                        state_horizon_results[k].append(v)
-                diff_horizon_metrics = {}
-                state_horizon_metrics = {}
-                for k, v in diff_horizon_results.items():
-                    diff_horizon_metrics[f"{command_horizon}_{k}"] = np.mean(v)
-                    eval_diff[k].append(np.mean(v))
-                for k, v in state_horizon_results.items():
-                    state_horizon_metrics[f"{command_horizon}_{k}"] = np.mean(v)
-                    eval_state[k].append(np.mean(v))
-                if self.cfg.use_wandb:
-                    wandb.log({f"eval_diff_horizon/{k}": v for k, v in diff_horizon_metrics.items()}, step=self.global_step)
-                    wandb.log({f"eval_state_horizon/{k}": v for k, v in state_horizon_metrics.items()}, step=self.global_step)
-                else:
-                    for k, v in diff_horizon_metrics.items():
-                        print(f"eval_diff_horizon/{k}: {v}")
-                    for k, v in state_horizon_metrics.items():
-                        print(f"eval_state_horizon/{k}: {v}")
-            eval_diff = {key: np.mean(eval_diff[key]) for key in eval_diff.keys()}
-            eval_state = {key: np.mean(eval_state[key]) for key in eval_state.keys()}
-            if self.cfg.use_wandb:
-                wandb.log({f"eval_diff/{k}": v for k, v in eval_diff.items()}, step=self.global_step)
-                wandb.log({f"eval_state/{k}": v for k, v in eval_state.items()}, step=self.global_step)
-            else:
-                for k, v in eval_diff.items():
-                    print(f"eval_diff/{k}: {v}")
-                for k, v in eval_state.items():
-                    print(f"eval_state/{k}: {v}")
+                for k, v in diff_horizon_metrics.items():
+                    print(f"eval_diff_horizon/{k}: {v}")
+                for k, v in state_horizon_metrics.items():
+                    print(f"eval_state_horizon/{k}: {v}")
+        eval_diff = {key: np.mean(eval_diff[key]) for key in eval_diff.keys()}
+        eval_state = {key: np.mean(eval_state[key]) for key in eval_state.keys()}
+        if self.cfg.use_wandb:
+            wandb.log({f"eval_diff/{k}": v for k, v in eval_diff.items()}, step=self.global_step)
+            wandb.log({f"eval_state/{k}": v for k, v in eval_state.items()}, step=self.global_step)
+        else:
+            for k, v in eval_diff.items():
+                print(f"eval_diff/{k}: {v}")
+            for k, v in eval_state.items():
+                print(f"eval_state/{k}: {v}")
+    
         self.agent.feature_learner.train()
 
-    _CHECKPOINTED_KEYS = ('agent', 'global_step', 'global_episode')
+    _CHECKPOINTED_KEYS = ('agent', 'global_step', 'phi_step', 'policy_step')
 
     def save_checkpoint(self, fp: tp.Union[Path, str]) -> None:
         """保存关键状态用于断点重训。
@@ -1155,9 +1158,6 @@ class Workspace:
             else:
                 assert hasattr(self, name)
                 setattr(self, name, val)
-                if name == "global_episode":
-                    print(f"Reloaded agent at global episode {self.global_episode}")
-                    # logger.warning(f"Reloaded agent at global episode {self.global_episode}")
 
     def load_phi_from_checkpoint(self, fp: tp.Union[Path, str]) -> None:
         print(f"Loading phi from checkpoint from {fp}")

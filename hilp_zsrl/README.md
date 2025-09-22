@@ -50,13 +50,20 @@ PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda age
 
 HYDRA_FULL_ERROR=1 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000 agent.boltzmann=True
 
-PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000
+HYDRA_FULL_ERROR=1 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000
 
 CUDA_VISIBLE_DEVICES=1 HYDRA_FULL_ERROR=1 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf_v agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000 agent.feature_type=diff
 
 CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf_v2 agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000 agent.goal_type=delta goal_eval=True
 
 CUDA_VISIBLE_DEVICES=1 HYDRA_FULL_ERROR=1 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf_v2 agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000 agent.goal_type=state goal_eval=True
+
+0920
+CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf_v2 agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000 agent.goal_type=state goal_eval=True eval_only=True resume_from=/root/workspace/HILP/hilp_zsrl/exp_local/EXP/sfv2_state
+
+CUDA_VISIBLE_DEVICES=1 HYDRA_FULL_ERROR=1 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf_v2 agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000 agent.goal_type=delta goal_eval=True eval_only=True resume_from=/root/workspace/HILP/hilp_zsrl/exp_local/EXP/sfv2_delta
+
+CUDA_VISIBLE_DEVICES=2 HYDRA_FULL_ERROR=1 PYTHONPATH=. python url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000 eval_only=True resume_from=/root/workspace/HILP/hilp_zsrl/exp_local/EXP/sf_vanilla
 
 CUDA_VISIBLE_DEVICES=1 HYDRA_FULL_ERROR=1 PYTHONPATH=. python -m debugpy --listen 5678 --wait-for-client url_benchmark/train_offline.py run_group=EXP device=cuda agent=sf_v2 agent.feature_learner=hilp p_randomgoal=0.375 agent.hilp_expectile=0.5 agent.hilp_discount=0.96 agent.q_loss=False seed=0 task=walker_run expl_agent=rnd load_replay_buffer=/root/workspace/exorl/datasets/walker/rnd/replay.pt replay_buffer_episodes=5000 agent.goal_type=state goal_eval=True
 

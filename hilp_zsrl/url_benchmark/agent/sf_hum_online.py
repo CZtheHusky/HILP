@@ -12,15 +12,19 @@ from torch import nn
 import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 import omegaconf
-
+from url_benchmark.in_memory_hum_buffer import EpisodeBatch
 from url_benchmark import utils
+from url_benchmark.in_memory_replay_buffer import ReplayBuffer
 from .ddpg import MetaDict, make_aug_encoder
 from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, mlp, OnlineCov
 from url_benchmark.dmc import TimeStep
+from url_benchmark.hugwbc_policy_network import create_hugwbc_policy
+# from url_benchmark.hugwbc_policy_sac_network import create_sac_policy
 from url_benchmark.hugwbc_policy_online_network import create_sac_policy
 import time
-
 from typing import Dict, Any, Iterable, Tuple, Optional
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,29 +46,30 @@ class SFHumanoidOnlineAgentConfig:
     use_wandb: bool = omegaconf.II("use_wandb")  # ${use_wandb}
     num_inference_steps: int = 10000
     hidden_dim: int = 1024   # 128, 2048
-    phi_hidden_dim: int = 1024   # 128, 2048
-    feature_dim: int = 1024   # 128, 1024
-    z_dim: int = 128  # 30-200
+    phi_hidden_dim: int = 512   # 128, 2048
+    feature_dim: int = 512   # 128, 1024
+    z_dim: int = 50  # 30-200
+    stddev_schedule: str = "0.2"  # "linear(1,0.2,200000)"  # 0,  0.1, 0.2
+    stddev_clip: float = 0.3  # 1
     update_z_every_step: int = 300
     nstep: int = 1
     batch_size: int = 1024
     init_sf: bool = True
+    update_encoder: bool = omegaconf.II("update_encoder")  # ${update_encoder}
+    log_std_bounds: tp.Tuple[float, float] = (-5, 2)  # param for DiagGaussianActor
     temp: float = 1  # temperature for DiagGaussianActor
     debug: bool = False
     preprocess: bool = True
     num_sf_updates: int = 1
     feature_learner: str = "hilp"
-    mix_ratio: float = 0.5
-    q_loss: bool = False
+    update_cov_every_step: int = 1000
     add_trunk: bool = False
-    command_injection: bool = False # whether to generate command-conditioned z
-    use_raw_command: bool = False # whether to use raw command
 
     feature_type: str = 'state'  # 'state', 'diff', 'concat'
+    goal_type: str = "delta"  # 'delta', 'state'
     hilp_discount: float = 0.98
     hilp_expectile: float = 0.5
     obs_horizon: int = 5
-    random_sample_z: bool = True
 
 
 cs = ConfigStore.instance()
@@ -100,7 +105,7 @@ class HILP(FeatureLearner):
             assert z_dim % 2 == 0
             feature_dim = z_dim // 2
 
-        layers = [obs_dim, hidden_dim, "ntanh", hidden_dim, "ntanh", hidden_dim, "relu", feature_dim]
+        layers = [obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", hidden_dim, "relu", hidden_dim, "relu", feature_dim]
 
         self.phi1 = mlp(*layers)
         self.phi2 = mlp(*layers)
@@ -171,24 +176,23 @@ class HILP(FeatureLearner):
         value_loss1 = self.expectile_loss(adv, q1 - v1, self.cfg.hilp_expectile).mean()
         value_loss2 = self.expectile_loss(adv, q2 - v2, self.cfg.hilp_expectile).mean()
         value_loss = value_loss1 + value_loss2
-        if self.training:   # we shall not update parameters during evaluation
-            utils.soft_update_params(self.phi1, self.target_phi1, 0.005)
-            utils.soft_update_params(self.phi2, self.target_phi2, 0.005)
-            with torch.no_grad():
-                phi1 = self.phi1(obs)
-                self.running_mean = 0.995 * self.running_mean + 0.005 * phi1.mean(dim=0)
-                self.running_std = 0.995 * self.running_std + 0.005 * phi1.std(dim=0)
+        utils.soft_update_params(self.phi1, self.target_phi1, 0.005)
+        utils.soft_update_params(self.phi2, self.target_phi2, 0.005)
+        with torch.no_grad():
+            phi1 = self.phi1(obs)
+            self.running_mean = 0.995 * self.running_mean + 0.005 * phi1.mean(dim=0)
+            self.running_std = 0.995 * self.running_std + 0.005 * phi1.std(dim=0)
 
         return value_loss, {
-            'hilp/value_loss': value_loss,
-            'hilp/v_mean': v.mean(),
-            'hilp/v_max': v.max(),
-            'hilp/v_min': v.min(),
-            'hilp/abs_adv_mean': torch.abs(adv).mean(),
-            'hilp/adv_mean': adv.mean(),
-            'hilp/adv_max': adv.max(),
-            'hilp/adv_min': adv.min(),
-            'hilp/accept_prob': (adv >= 0).float().mean(),
+            'hilp/value_loss': value_loss.item(),
+            'hilp/v_mean': v.mean().item(),
+            'hilp/v_max': v.max().item(),
+            'hilp/v_min': v.min().item(),
+            'hilp/abs_adv_mean': torch.abs(adv).mean().item(),
+            'hilp/adv_mean': adv.mean().item(),
+            'hilp/adv_max': adv.max().item(),
+            'hilp/adv_min': adv.min().item(),
+            'hilp/accept_prob': (adv >= 0).float().mean().item(),
         }
 
 
@@ -435,9 +439,6 @@ class SFHumanoidOnlineAgent:
         self.action_dim = cfg.action_shape[0]
         self.solved_meta: tp.Any = None
 
-        self.command_injection = cfg.command_injection
-        self.use_raw_command = cfg.use_raw_command
-
         # models
         if cfg.obs_type == 'pixels':
             self.aug, self.encoder = make_aug_encoder(cfg)
@@ -450,15 +451,23 @@ class SFHumanoidOnlineAgent:
         if cfg.feature_learner == "identity":
             cfg.z_dim = self.obs_dim
             self.cfg.z_dim = self.obs_dim
+        # create the network
+        # if self.cfg.boltzmann:
+        #     self.actor: nn.Module = DiagGaussianActor(cfg.obs_type, self.obs_dim, cfg.z_dim, self.action_dim,
+        #                                               cfg.hidden_dim, cfg.log_std_bounds).to(cfg.device)
+        # else:
+        #     self.actor = Actor(self.obs_dim, cfg.z_dim, self.action_dim,
+        #                        cfg.feature_dim, cfg.hidden_dim,
+        #                        preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
         self.actor = create_sac_policy(z_dim=cfg.z_dim, horizon=cfg.obs_horizon, proprio_dim=self.obs_dim // cfg.obs_horizon, clock_dim=0).to(cfg.device)
         self.successor_net = ForwardMap(self.obs_dim, cfg.z_dim, self.action_dim,
                                         cfg.feature_dim, cfg.hidden_dim,
-                                        preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
+                                        preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk, output_dim=1).to(cfg.device)
         # build up the target network
         self.successor_target_net = ForwardMap(self.obs_dim, cfg.z_dim, self.action_dim,
                                                cfg.feature_dim, cfg.hidden_dim,
-                                               preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
-        self.log_alpha = torch.nn.Parameter(torch.tensor(0.0))  # α≈1.0，可改为 -1.0(≈0.37)
+                                               preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk, output_dim=1).to(cfg.device)
+        self.log_alpha = torch.nn.Parameter(torch.tensor(-1.0))  # α≈1.0，可改为 -1.0(≈0.37)
         self.target_entropy = -float(self.action_dim)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=3e-4)
         learner = dict(icm=ICM, transition=TransitionModel, latent=TransitionLatentModel,
@@ -483,18 +492,12 @@ class SFHumanoidOnlineAgent:
         if cfg.obs_type == 'pixels':
             self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=cfg.lr)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr)
-        if self.command_injection:
-            self.command_injection_net = mlp(11, cfg.hidden_dim, "ntanh", cfg.hidden_dim, "relu", cfg.z_dim).to(cfg.device)
-            self.command_injection_opt = torch.optim.Adam(self.command_injection_net.parameters(), lr=cfg.lr)
-            self.command_injection_net.train()
         self.sf_opt = torch.optim.Adam(self.successor_net.parameters(), lr=cfg.lr)
         self.phi_opt: tp.Optional[torch.optim.Adam] = None
         if cfg.feature_learner not in ["random", "identity"]:
             self.phi_opt = torch.optim.Adam(self.feature_learner.parameters(), lr=cfg.lr_coef * cfg.lr)
         self.train()
         self.successor_target_net.train()
-
-        self.inv_cov = torch.eye(self.cfg.z_dim, dtype=torch.float32, device=self.cfg.device)
 
     def train(self, training: bool = True) -> None:
         self.training = training
@@ -515,6 +518,7 @@ class SFHumanoidOnlineAgent:
     #             val.load_state_dict(copy.deepcopy(getattr(other, key).state_dict()))
 
     def init_from(self, other) -> None:
+        # 1) 只复制权重/缓冲，不替换模块对象
         device = torch.device(self.cfg.device)
         print("Agent Device:", device)
 
@@ -733,46 +737,41 @@ class SFHumanoidOnlineAgent:
         meta['z'] = z.squeeze().cpu().numpy()
         return meta, diag
 
-    def sample_z(self, size, env_command=None, obs=None, next_obs=None, rollout=False):
-        if rollout or self.cfg.random_sample_z:
-            z_hilbert = torch.randn((size, self.cfg.z_dim), dtype=torch.float32).to(self.cfg.device)
-            z_hilbert = math.sqrt(self.cfg.z_dim) * F.normalize(z_hilbert, dim=1)
+    @torch.no_grad()
+    def sample_z(self, obs=None, future_obs=None, size=None, random_sample=False):
+        if random_sample:
+            z = torch.randn((size, self.cfg.z_dim), dtype=torch.float32)
         else:
-            z_hilbert = torch.as_tensor(self.get_goal_meta(next_obs, obs if self.cfg.feature_type == 'diff' else None)['z']).to(self.cfg.device)
-        if self.command_injection:
-            assert not self.use_raw_command
-            z_actor = self.command_injection_net(env_command)
-            z_actor = math.sqrt(self.cfg.z_dim) * F.normalize(z_actor, dim=1)
-        elif self.use_raw_command:
-            assert not self.command_injection
-            z_actor = env_command
-        else:
-            z_actor = z_hilbert
-        return z_hilbert, z_actor
+            if self.cfg.goal_type == 'delta':
+                z = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(obs)
+            elif self.cfg.goal_type == 'state':
+                z = self.feature_learner.feature_net(future_obs)
+        z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
+        return z.detach()
 
-    def init_meta(self) -> MetaDict:
-        if self.solved_meta is not None:
-            print('solved_meta')
-            return self.solved_meta
-        else:
-            z = self.sample_z(1)
-            z = z.squeeze().numpy()
-            meta = OrderedDict()
-            meta['z'] = z
-        return meta
+    # def init_meta(self) -> MetaDict:
+    #     if self.solved_meta is not None:
+    #         print('solved_meta')
+    #         return self.solved_meta
+    #     else:
+    #         z = self.sample_z(1)
+    #         z = z.squeeze().numpy()
+    #         meta = OrderedDict()
+    #         meta['z'] = z
+    #     return meta
 
     # pylint: disable=unused-argument
-    def update_meta(
-            self,
-            meta: MetaDict,
-            global_step: int,
-            time_step: TimeStep,
-            finetune: bool = False,
-            replay_loader = None
-    ) -> MetaDict:
-        if global_step % self.cfg.update_z_every_step == 0:
-            return self.init_meta()
-        return meta
+    # def update_meta(
+    #         self,
+    #         meta: MetaDict,
+    #         global_step: int,
+    #         time_step: TimeStep,
+    #         finetune: bool = False,
+    #         replay_loader: tp.Optional[ReplayBuffer] = None
+    # ) -> MetaDict:
+    #     if global_step % self.cfg.update_z_every_step == 0:
+    #         return self.init_meta()
+    #     return meta
 
     @torch.no_grad()
     def act_inference(self, observations, z_vector) -> tp.Any:
@@ -782,100 +781,38 @@ class SFHumanoidOnlineAgent:
         action = self.actor.act_inference(h, z)
         return action
 
-
-    def update_feature(
-        self,
-        obs: torch.Tensor,
-        action: torch.Tensor,
-        next_obs: torch.Tensor,
-        future_obs: tp.Optional[torch.Tensor],
-        is_train: bool = True
-    ) -> tp.Dict[str, float]:
-        metrics: tp.Dict[str, float] = {}
-        # compute feature loss
-        if self.cfg.feature_learner == 'hilp':
-            phi_loss, info = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
-        else:
-            phi_loss = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
-            info = None
-        if self.cfg.use_tb or self.cfg.use_wandb:
-            if phi_loss is not None:
-                metrics['phi_loss'] = phi_loss.item()
-            if info is not None:
-                for key, val in info.items():
-                    metrics[key] = val.item()
-        if is_train:
-            self.phi_opt.zero_grad()
-            phi_loss.backward()
-            phi_grad = grad_norm_stats(self.feature_learner, prefix='phi')
-            metrics.update(phi_grad)
-            self.phi_opt.step()
-        return metrics
-
-    def update_sf_actor(
+    def update_policy(
         self,
         obs: torch.Tensor,
         action: torch.Tensor,
         discount: torch.Tensor,
         next_obs: torch.Tensor,
-        z_hilbert: torch.Tensor,
+        future_obs: tp.Optional[torch.Tensor],
         z_actor: torch.Tensor,
     ) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
         # compute target successor measure
         with torch.no_grad():
-            next_action, logp = self.actor.sample_and_logprob(next_obs, z_hilbert)
-            next_F1, next_F2 = self.successor_target_net(next_obs, z_hilbert, next_action)  # batch x z_dim
-            if self.cfg.feature_type == 'state':
-                target_phi = self.feature_learner.feature_net(next_obs).detach()  # batch x z_dim
-            elif self.cfg.feature_type == 'diff':
-                target_phi = self.feature_learner.feature_net(next_obs).detach() - self.feature_learner.feature_net(obs).detach()
-            else:
-                target_phi = torch.cat([self.feature_learner.feature_net(obs).detach(), self.feature_learner.feature_net(next_obs).detach()], dim=-1)
-            next_Q1, next_Q2 = [torch.einsum('sd, sd -> s', next_Fi, z_hilbert) for next_Fi in [next_F1, next_F2]]
-            next_F = torch.where((next_Q1 < next_Q2).reshape(-1, 1), next_F1, next_F2)
-            target_F = target_phi + discount * next_F
+            if torch.isnan(z_actor).any() or torch.isnan(next_obs).any() or torch.isnan(obs).any():
+                print("NaN in update_policy")
+                print(f"z_actor: {z_actor}")
+                print(f"next_obs: {next_obs}")
+                print(f"obs: {obs}")
+                raise ValueError("NaN in update_policy")
+            next_action, logp = self.actor.sample_and_logprob(next_obs, z_actor)
+            next_Q1, next_Q2 = self.successor_target_net(next_obs, z_actor, next_action)  # batch x z_dim
+            d_s = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(obs)
+            d_next_s = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(next_obs)
+            d_s = torch.norm(d_s, dim=-1)
+            d_next_s = torch.norm(d_next_s, dim=-1)
+            r = d_s - d_next_s
+            next_Q = torch.min(next_Q1, next_Q2)
+            target_Q = r.unsqueeze(-1) + discount * next_Q
+            target_Q = target_Q.detach()
 
-        F1, F2 = self.successor_net(obs, z_hilbert, action)
-        if self.cfg.q_loss:
-            Q1, Q2 = [torch.einsum('sd, sd -> s', Fi, z_hilbert) for Fi in [F1, F2]]
-            target_Q = torch.einsum('sd, sd -> s', target_F, z_hilbert)
-            sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
-        else:
-            sf_loss = F.mse_loss(F1, target_F) + F.mse_loss(F2, target_F)
-
-        action, log_prob = self.actor.sample_and_logprob(obs, z_actor)
-        F1, F2 = self.successor_net(obs, z_hilbert, action)
-        Q1 = torch.einsum('sd, sd -> s', F1, z_hilbert)
-        Q2 = torch.einsum('sd, sd -> s', F2, z_hilbert)
-        Q = torch.min(Q1, Q2)
-        alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
-        alpha = self.log_alpha.detach().exp()
-        actor_loss = (alpha * log_prob - Q.detach()).mean()
-        if self.cfg.use_tb or self.cfg.use_wandb:
-            metrics['alpha_loss'] = alpha_loss.item()
-            metrics['alpha'] = self.log_alpha.detach().item()
-            metrics['actor_loss'] = actor_loss.item()
-            metrics['actor_logprob'] = log_prob.mean().item()
-            metrics['Q1'] = Q1.mean().item()
-            metrics['Q2'] = Q2.mean().item()
-            metrics['Q'] = Q.mean().item()
-            metrics['target_F'] = target_F.mean().item()
-            metrics['F1'] = F1.mean().item()
-            metrics['phi'] = target_phi.mean().item()
-            metrics['phi_norm'] = torch.norm(target_phi, dim=-1).mean().item()
-            metrics['z_norm'] = torch.norm(z_hilbert, dim=-1).mean().item()
-            metrics['sf_loss'] = sf_loss.item()
-            # 在update_sf方法中添加
-            metrics['F1_norm'] = torch.norm(F1, dim=-1).mean().item()
-            metrics['F2_norm'] = torch.norm(F2, dim=-1).mean().item()  
-            metrics['target_F_norm'] = torch.norm(target_F, dim=-1).mean().item()
-            metrics['next_F_norm'] = torch.norm(next_F, dim=-1).mean().item()
-            metrics['target_F_std'] = target_F.std().item()  # 目标的方差
-            metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
-            if isinstance(self.sf_opt, torch.optim.Adam):
-                metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]
-
+        Q1, Q2 = self.successor_net(obs, z_actor, action)
+        sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
+        # optimize SF
         if self.encoder_opt is not None:
             self.encoder_opt.zero_grad(set_to_none=True)
         self.sf_opt.zero_grad(set_to_none=True)
@@ -884,162 +821,46 @@ class SFHumanoidOnlineAgent:
         metrics.update(sf_grad)
         self.sf_opt.step()
         if self.encoder_opt is not None:
+            self.encoder_opt.step()
             encoder_grad = grad_norm_stats(self.encoder, prefix='encoder')
             metrics.update(encoder_grad)
-            self.encoder_opt.step()
-        self.alpha_opt.zero_grad(set_to_none=True)
-        alpha_grad = grad_norm_stats(self.log_alpha, prefix='alpha')
-        metrics.update(alpha_grad)
-        alpha_loss.backward()
-        self.alpha_opt.step()
-        # optimize actor
-        self.actor_opt.zero_grad(set_to_none=True)
-        actor_grad = grad_norm_stats(self.actor, prefix='actor')
-        metrics.update(actor_grad)
-        actor_loss.backward()
-        self.actor_opt.step()
-        if self.command_injection:
-            self.command_injection_opt.step()
-            self.command_injection_opt.zero_grad(set_to_none=True)
-        return metrics
 
-    def update_sf_phi(
-        self,
-        obs: torch.Tensor,
-        action: torch.Tensor,
-        discount: torch.Tensor,
-        next_obs: torch.Tensor,
-        future_obs: tp.Optional[torch.Tensor],
-        z: torch.Tensor,
-        is_train: bool = True
-    ) -> tp.Dict[str, float]:
-        metrics: tp.Dict[str, float] = {}
-        # compute target successor measure
-        if len(discount.shape) == 1:
-            discount = discount.unsqueeze(-1)
-        with torch.no_grad():
-            next_action, logp = self.actor.sample_and_logprob(next_obs, z)
-            next_F1, next_F2 = self.successor_target_net(next_obs, z, next_action)  # batch x z_dim
-            if self.cfg.feature_type == 'state':
-                target_phi = self.feature_learner.feature_net(next_obs).detach()  # batch x z_dim
-            elif self.cfg.feature_type == 'diff':
-                target_phi = self.feature_learner.feature_net(next_obs).detach() - self.feature_learner.feature_net(obs).detach()
-            else:
-                target_phi = torch.cat([self.feature_learner.feature_net(obs).detach(), self.feature_learner.feature_net(next_obs).detach()], dim=-1)
-            next_Q1, next_Q2 = [torch.einsum('sd, sd -> s', next_Fi, z) for next_Fi in [next_F1, next_F2]]
-            next_F = torch.where((next_Q1 < next_Q2).reshape(-1, 1), next_F1, next_F2)
-            target_F = target_phi + discount * next_F
-
-        F1, F2 = self.successor_net(obs, z, action)
-        if self.cfg.q_loss:
-            Q1, Q2 = [torch.einsum('sd, sd -> s', Fi, z) for Fi in [F1, F2]]
-            target_Q = torch.einsum('sd, sd -> s', target_F, z)
-            sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
-        else:
-            sf_loss = F.mse_loss(F1, target_F) + F.mse_loss(F2, target_F)
-
-        # compute feature loss
-        if self.cfg.feature_learner == 'hilp':
-            phi_loss, info = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
-        else:
-            phi_loss = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
-            info = None
-
-        if self.cfg.use_tb or self.cfg.use_wandb:
-            metrics['target_F'] = target_F.mean().item()
-            metrics['F1'] = F1.mean().item()
-            metrics['phi'] = target_phi.mean().item()
-            metrics['phi_norm'] = torch.norm(target_phi, dim=-1).mean().item()
-            metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
-            metrics['sf_loss'] = sf_loss.item()
-            # 在update_sf方法中添加
-            metrics['F1_norm'] = torch.norm(F1, dim=-1).mean().item()
-            metrics['F2_norm'] = torch.norm(F2, dim=-1).mean().item()  
-            metrics['target_F_norm'] = torch.norm(target_F, dim=-1).mean().item()
-            metrics['next_F_norm'] = torch.norm(next_F, dim=-1).mean().item()
-            metrics['target_F_std'] = target_F.std().item()  # 目标的方差
-            metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
-            if phi_loss is not None:
-                metrics['phi_loss'] = phi_loss.item()
-
-            if isinstance(self.sf_opt, torch.optim.Adam):
-                metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]
-
-            if info is not None:
-                for key, val in info.items():
-                    metrics[key] = val.item()
-        if is_train:
-            # optimize SF
-            if self.encoder_opt is not None:
-                self.encoder_opt.zero_grad(set_to_none=True)
-            self.sf_opt.zero_grad(set_to_none=True)
-            sf_loss.backward()
-            sf_grad = grad_norm_stats(self.successor_net, prefix='sf')
-            metrics.update(sf_grad)
-            self.sf_opt.step()
-            if self.encoder_opt is not None:
-                self.encoder_opt.step()
-                encoder_grad = grad_norm_stats(self.encoder, prefix='encoder')
-                metrics.update(encoder_grad)
-            if self.phi_opt is not None:
-                self.phi_opt.zero_grad(set_to_none=True)
-                phi_loss.backward(retain_graph=True)
-                phi_grad = grad_norm_stats(self.feature_learner, prefix='phi')
-                metrics.update(phi_grad)
-            if self.phi_opt is not None:
-                self.phi_opt.step()
-        return metrics
-
-    def update_actor(self, obs: torch.Tensor, z_hilbert: torch.Tensor, z_actor: torch.Tensor, privileged_obs: torch.Tensor=None, is_train: bool = True) -> tp.Dict[str, float]:
-        metrics: tp.Dict[str, float] = {}
-        action, log_prob = self.actor.sample_and_logprob(obs, z_actor)
-        F1, F2 = self.successor_net(obs, z_hilbert, action)
-        Q1 = torch.einsum('sd, sd -> s', F1, z_hilbert)
-        Q2 = torch.einsum('sd, sd -> s', F2, z_hilbert)
-        Q = torch.min(Q1, Q2)
+        new_action, log_prob = self.actor.sample_and_logprob(obs, z_actor)
+        Q1_policy, Q2_policy = self.successor_net(obs, z_actor, new_action)
+        Q = torch.min(Q1_policy, Q2_policy)
         alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
-        if is_train:
-            self.alpha_opt.zero_grad(set_to_none=True)
-            alpha_grad = grad_norm_stats(self.log_alpha, prefix='alpha')
-            metrics.update(alpha_grad)
-            alpha_loss.backward()
-            self.alpha_opt.step()
         alpha = self.log_alpha.detach().exp()
         actor_loss = (alpha * log_prob - Q).mean()
-        if is_train:
-            # optimize actor
-            self.actor_opt.zero_grad(set_to_none=True)
-            actor_grad = grad_norm_stats(self.actor, prefix='actor')
-            metrics.update(actor_grad)
-            actor_loss.backward()
-            self.actor_opt.step()
-            if self.command_injection:
-                # 使用torch.norm计算梯度范数
-                grad_norms = []
-                for p in self.command_injection_net.parameters():
-                    if p.grad is not None:
-                        grad_norms.append(p.grad.norm(2).item())
-                
-                if grad_norms:
-                    total_grad_norm = sum(grad_norms)
-                    max_grad_norm = max(grad_norms)
-                    avg_grad_norm = total_grad_norm / len(grad_norms)
-                    
-                    metrics['command_net_total_grad_norm'] = total_grad_norm
-                    metrics['command_net_max_grad_norm'] = max_grad_norm
-                    metrics['command_net_avg_grad_norm'] = avg_grad_norm
-                    
-                self.command_injection_opt.step()
-                self.command_injection_opt.zero_grad(set_to_none=True)
-
         if self.cfg.use_tb or self.cfg.use_wandb:
-            metrics['alpha_loss'] = alpha_loss.item()
-            metrics['alpha'] = self.log_alpha.detach().item()
             metrics['actor_loss'] = actor_loss.item()
             metrics['actor_logprob'] = log_prob.mean().item()
-            metrics['Q1'] = Q1.mean().item()
-            metrics['Q2'] = Q2.mean().item()
-            metrics['Q'] = Q.mean().item()
+            metrics['Q1_policy'] = Q1.mean().item()
+            metrics['Q2_policy'] = Q2.mean().item()
+            metrics['Q_policy'] = Q.mean().item()
+            metrics['z_norm'] = torch.norm(z_actor, dim=-1).mean().item()
+            metrics['sf_loss'] = sf_loss.item()
+            metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
+            metrics['r'] = r.mean().item()
+            metrics['r_max'] = r.max().item()
+            metrics['r_min'] = r.min().item()
+            metrics['r_std'] = r.std().item()
+            metrics['Q1_critic'] = Q1.mean().item()
+            metrics['Q2_critic'] = Q2.mean().item()
+            metrics['Q_target'] = target_Q.mean().item()
+            if isinstance(self.sf_opt, torch.optim.Adam):
+                metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]
+        # optimize actor
+        self.actor_opt.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        actor_grad = grad_norm_stats(self.actor, prefix='actor')
+        metrics.update(actor_grad)
+        self.actor_opt.step()
+        # optimize alpha
+        self.alpha_opt.zero_grad(set_to_none=True)
+        alpha_loss.backward()
+        # alpha_grad = grad_norm_stats(self.log_alpha, prefix='alpha')
+        # metrics.update(alpha_grad)
+        self.alpha_opt.step()
 
         return metrics
 
@@ -1047,73 +868,49 @@ class SFHumanoidOnlineAgent:
         obs = self.aug(obs)
         return self.encoder(obs)
 
-    def mix_z(self, obs: torch.Tensor, next_obs: torch.Tensor, z_hilbert: torch.Tensor, z_actor: torch.Tensor) -> tp.Tuple[torch.Tensor, torch.Tensor]:
-        if self.cfg.mix_ratio > 0 and self.cfg.random_sample_z:
-            perm = torch.randperm(self.cfg.batch_size)
-            with torch.no_grad():
-                if self.cfg.feature_type == 'state':
-                    desired_obs = next_obs[perm]
-                    phi = self.feature_learner.feature_net(desired_obs)
-                elif self.cfg.feature_type == 'diff':
-                    desired_obs = obs[perm]
-                    desired_next_obs = next_obs[perm]
-                    phi = self.feature_learner.feature_net(desired_next_obs) - self.feature_learner.feature_net(desired_obs)
-                else:
-                    desired_obs = obs[perm]
-                    desired_next_obs = next_obs[perm]
-                    phi = torch.cat([self.feature_learner.feature_net(desired_obs), self.feature_learner.feature_net(desired_next_obs)], dim=-1)
-            # compute inverse of cov of phi
-            cov = torch.matmul(phi.T, phi) / phi.shape[0]
-            inv_cov = torch.linalg.pinv(cov)
+    def update_phi(self, batch: EpisodeBatch) -> tp.Dict[str, float]:
+        metrics: tp.Dict[str, float] = {}
+        
+        obs = batch["obs"].to(self.cfg.device)
+        # action = batch['actions'].to(self.cfg.device)
+        next_obs = batch['next_obs'].to(self.cfg.device)
+        future_obs = batch['future_obs'].to(self.cfg.device)
 
-            mix_idxs: tp.Any = np.where(np.random.uniform(size=self.cfg.batch_size) < self.cfg.mix_ratio)[0]
-            with torch.no_grad():
-                new_z = phi[mix_idxs]
+        obs = self.aug_and_encode(obs)
+        next_obs = self.aug_and_encode(next_obs)
+        future_obs = self.aug_and_encode(future_obs)
+        next_obs = next_obs.detach()
 
-            new_z = torch.matmul(new_z, inv_cov)  # batch_size x z_dim
-            new_z = math.sqrt(self.cfg.z_dim) * F.normalize(new_z, dim=1)
-            z_hilbert[mix_idxs] = new_z
-            z_actor[mix_idxs] = new_z
-        return z_hilbert, z_actor
+        phi_loss, info = self.feature_learner(obs=obs, action=None, next_obs=next_obs, future_obs=future_obs)
+        self.phi_opt.zero_grad(set_to_none=True)
+        phi_loss.backward()
+        self.phi_opt.step()
+        metrics['phi_loss'] = phi_loss.item()
+        metrics.update(info)
+        return metrics
 
-    def prepare_batch(self, batch, is_phi: bool = False) -> tp.Dict[str, torch.Tensor]:
+
+    def update_batch(self, batch: EpisodeBatch) -> tp.Dict[str, float]:
+        metrics: tp.Dict[str, float] = {}
         batch = batch.to(self.cfg.device)
         obs = batch.obs
         action = batch.action
         discount = batch.discount
+        if len(discount.shape) == 1:
+            discount = discount.unsqueeze(1)
         next_obs = batch.next_obs
-        try:
-            future_obs = batch.future_obs
-            future_obs = self.aug_and_encode(future_obs)
-        except:
-            future_obs = None
+        future_obs = batch.future_obs
 
         obs = self.aug_and_encode(obs)
         next_obs = self.aug_and_encode(next_obs)
-        next_obs = next_obs.detach()        
-        try:
-            commands_obs = batch.commands
-        except:
-            commands_obs = None
-        if is_phi:
-            return obs, action, next_obs, future_obs
-        z_hilbert, z_actor = self.sample_z(self.cfg.batch_size, commands_obs, obs, next_obs)
-        z_hilbert, z_actor = self.mix_z(obs, next_obs, z_hilbert, z_actor)
-        z_hilbert = z_hilbert.to(self.cfg.device)
+        future_obs = self.aug_and_encode(future_obs)
+        next_obs = next_obs.detach()
+
+        z_actor = self.sample_z(obs, future_obs, obs.shape[0])
         z_actor = z_actor.to(self.cfg.device)
-        if not z_hilbert.shape[-1] == self.cfg.z_dim:
-            raise RuntimeError("There's something wrong with the logic here")
-        return obs, action, discount, next_obs, future_obs, z_hilbert, z_actor
 
-
-    def update_policy(self, batch) -> tp.Dict[str, float]:
-        obs, action, discount, next_obs, future_obs, z_hilbert, z_actor = self.prepare_batch(batch)
-        metrics = self.update_sf_actor(obs=obs, action=action, discount=discount, next_obs=next_obs, z_hilbert=z_hilbert.detach(), z_actor=z_actor)
-        return metrics
-    
-    def update_phi(self, batch) -> tp.Dict[str, float]:
-        obs, action, next_obs, future_obs = self.prepare_batch(batch, is_phi=True)
-        metrics = self.update_feature(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
+        metrics.update(self.update_policy(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z_actor=z_actor))
+        utils.soft_update_params(self.successor_net, self.successor_target_net, self.cfg.sf_target_tau)
         return metrics
 
 
@@ -1144,8 +941,8 @@ def grad_norm_stats(
     if isinstance(norm_type, float) and math.isinf(norm_type):
         norm_type = float('inf')
 
-    max_per_param = 0.0
-    max_abs_grad = 0.0
+    # max_per_param = 0.0
+    # max_abs_grad = 0.0
 
     # 按 p-范数聚合得到 global_norm
     # p == inf 时：global = max(abs(grad))
@@ -1164,22 +961,22 @@ def grad_norm_stats(
 
         # 每参数的 p-范数
         if norm_type == float('inf'):
-            param_norm = g.detach().abs().max().item()
+            # param_norm = g.detach().abs().max().item()
             # 更新 global_accum
             cur_max = g.detach().abs().max()
             global_accum = cur_max if global_accum is None else torch.maximum(global_accum, cur_max)
         else:
             # torch.linalg.vector_norm 在新版本更好；兼容性用 torch.norm
-            param_norm = torch.norm(g.detach(), p=norm_type).item()
+            # param_norm = torch.norm(g.detach(), p=norm_type).item()
             # 累加 |g|^p
             global_accum = global_accum + torch.sum(g.detach().abs().pow(norm_type))
 
-        # 追踪最大 per-param 范数
-        if param_norm > max_per_param:
-            max_per_param = float(param_norm)
+        # # 追踪最大 per-param 范数
+        # if param_norm > max_per_param:
+        #     max_per_param = float(param_norm)
 
         # 追踪最大绝对梯度条目（无关 p）
-        max_abs_grad = max(max_abs_grad, g.detach().abs().max().item())
+        # max_abs_grad = max(max_abs_grad, g.detach().abs().max().item())
 
     # 汇总 global norm
     if norm_type == float('inf'):
@@ -1189,7 +986,8 @@ def grad_norm_stats(
 
     out = {
         f"{prefix}_global_norm": global_norm,
-        f"{prefix}_max_per_param_norm": max_per_param,
-        f"{prefix}_max_abs_grad": max_abs_grad,
+        # f"{prefix}_max_per_param_norm": max_per_param,
+        # f"{prefix}_max_abs_grad": max_abs_grad,
     }
     return out
+
