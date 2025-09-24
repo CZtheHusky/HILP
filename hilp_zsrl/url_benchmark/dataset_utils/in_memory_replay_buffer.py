@@ -58,7 +58,6 @@ class EpisodeBatch(tp.Generic[T]):
     meta: tp.Dict[str, T] = dataclasses.field(default_factory=dict)
     _physics: tp.Optional[T] = None
     future_obs: tp.Optional[T] = None
-    valid_future_obs: tp.Optional[T] = None
     privileged_obs: tp.Optional[T] = None
     commands: tp.Optional[T] = None
 
@@ -128,7 +127,7 @@ class ReplayBuffer:
             self, max_episodes: int, discount: float, future: float,
             max_episode_length: tp.Optional[int] = None,
             p_currgoal: float = 0., p_randomgoal: float = 0.,
-            frame_stack: int = None,
+            frame_stack: int = None, dummy_steps: int = 1, is_mismatched: bool = True,
     ) -> None:
         self._max_episodes = max_episodes
         self._discount = discount
@@ -148,6 +147,8 @@ class ReplayBuffer:
         self._is_fixed_episode_length = True
         self._max_episode_length = max_episode_length
         self._frame_stack = frame_stack
+        self._dummy_steps = dummy_steps
+        self._is_mismatched = is_mismatched
 
     def __len__(self) -> int:
         return self._max_episodes if self._full else self._idx
@@ -196,6 +197,28 @@ class ReplayBuffer:
             self._full = self._full or self._idx == 0
             self._episodes_selection_probability = None
 
+    def add_episodes(self, episodes: tp.Dict[str, np.ndarray], num_episodes: int) -> None:
+        assert not self._is_mismatched and self._dummy_steps == 0, "add_episodes is only supported for mismatched episodes with dummy_steps=0"
+        current_idx = np.arange(num_episodes) + self._idx
+        self._idx = self._idx + num_episodes
+        if self._idx >= self._max_episodes:
+            self._full = True
+            self._idx %= self._max_episodes
+        current_idx %= self._max_episodes
+        for name, values in episodes.items():
+            if name not in self._storage:
+                self._storage[name] = np.empty((self._max_episodes,) + values.shape[1:], dtype=values.dtype)
+            self._storage[name][current_idx] = values
+        self._episodes_length[current_idx] = values.shape[1] - 1
+        self._collected_episodes += num_episodes
+
+    def step_idx_mod(self, step_idx: int) -> int:
+        if self._is_mismatched:
+            return step_idx - self._dummy_steps
+        else:
+            return step_idx
+
+
     @property
     def avg_episode_length(self) -> int:
         return round(self._episodes_length[:len(self)].mean())
@@ -243,36 +266,40 @@ class ReplayBuffer:
         eps_lengths = self._episodes_length[ep_idx]
         random_eps_lengths = self._episodes_length[random_ep_idx]
         # add +1 for the first dummy transition
-        step_idx = np.random.randint(0, eps_lengths) + 1
-        random_step_idx = np.random.randint(0, random_eps_lengths) + 1
+        step_idx = np.random.randint(0, eps_lengths) + self._dummy_steps
+        random_step_idx = np.random.randint(0, random_eps_lengths) + self._dummy_steps
         assert (step_idx <= eps_lengths).all() and (random_step_idx <= random_eps_lengths).all()
         if self._future < 1:
             future_idx = step_idx + np.random.geometric(p=(1 - self._future), size=batch_size)
             future_idx = np.clip(future_idx, 0, eps_lengths)
             assert (future_idx <= eps_lengths).all()
-        meta = {name: data[ep_idx, step_idx - 1] for name, data in self._storage.items() if name not in self._batch_names}
-        obs = self.get_obs("observation", ep_idx, step_idx - 1)
+        meta = {name: data[ep_idx, self.step_idx_mod(step_idx)] for name, data in self._storage.items() if name not in self._batch_names}
+        obs = self.get_obs("observation", ep_idx, self.step_idx_mod(step_idx))
         action = self._storage['action'][ep_idx, step_idx]
-        next_obs = self.get_obs("observation", ep_idx, step_idx)
+        next_obs = self.get_obs("observation", ep_idx, self.step_idx_mod(step_idx + 1))
         phy = self._storage['physics'][ep_idx, step_idx]
         if custom_reward is not None:
             reward = np.array([[custom_reward.from_physics(p)] for p in phy], dtype=np.float32)
         else:
             reward = self._storage['reward'][ep_idx, step_idx]
-        discount = self._discount * self._storage['discount'][ep_idx, step_idx]
+        if "discount" in self._storage:
+            discount = self._discount * self._storage['discount'][ep_idx, step_idx]
+        else:
+            discount = self._discount * np.ones_like(reward, dtype=np.float32)
         future_obs: tp.Optional[np.ndarray] = None
         if self._future < 1:
-            future_obs = self.get_obs('observation', ep_idx, future_idx - 1)
-            curr_obs = self.get_obs('observation', ep_idx, step_idx - 1)
-            future_obs = np.where((np.random.rand(batch_size) < self._p_currgoal / (1. - self._p_randomgoal)).reshape(future_obs.shape[0], *[1] * (len(future_obs.shape) - 1)), curr_obs, future_obs)
-            valid_future_obs = future_obs.copy()
-            random_obs = self.get_obs('observation', random_ep_idx, random_step_idx - 1)
-            future_obs = np.where((np.random.rand(batch_size) < self._p_randomgoal).reshape(future_obs.shape[0], *[1] * (len(future_obs.shape) - 1)), random_obs, future_obs)
+            future_obs = self.get_obs('observation', ep_idx, self.step_idx_mod(future_idx))
+            if self._p_currgoal > 0:
+                curr_obs = self.get_obs('observation', ep_idx, self.step_idx_mod(step_idx))
+                future_obs = np.where((np.random.rand(batch_size) < self._p_currgoal / (1. - self._p_randomgoal)).reshape(future_obs.shape[0], *[1] * (len(future_obs.shape) - 1)), curr_obs, future_obs)
+            if self._p_randomgoal > 0:
+                random_obs = self.get_obs('observation', random_ep_idx, self.step_idx_mod(random_step_idx))
+                future_obs = np.where((np.random.rand(batch_size) < self._p_randomgoal).reshape(future_obs.shape[0], *[1] * (len(future_obs.shape) - 1)), random_obs, future_obs)
         additional = {}
         if with_physics:
             additional["_physics"] = phy
         return EpisodeBatch(obs=obs, action=action, reward=reward, discount=discount,
-                            next_obs=next_obs, future_obs=future_obs, valid_future_obs=valid_future_obs, meta=meta, **additional)
+                            next_obs=next_obs, future_obs=future_obs, meta=meta, **additional)
 
     def sample_transitions_with_indices(self, batch_size: int, custom_reward: tp.Optional[tp.Any] = None) -> tp.Dict[str, np.ndarray]:
         """Sample a batch of transitions and also return (ep_idx, step_idx) for each sampled transition.
@@ -290,16 +317,18 @@ class ReplayBuffer:
                 self._episodes_selection_probability = self._episodes_length / self._episodes_length.sum()
             ep_idx = np.random.choice(np.arange(len(self._episodes_length)), size=batch_size, p=self._episodes_selection_probability)
         eps_lengths = self._episodes_length[ep_idx]
-        step_idx = np.random.randint(0, eps_lengths) + 1  # 1..len
+        step_idx = np.random.randint(0, eps_lengths) + self._dummy_steps  # 1..len
         assert (step_idx <= eps_lengths).all()
+        obs = self.get_obs("observation", ep_idx, self.step_idx_mod(step_idx))
         # Fetch data exactly like sample()
-        next_obs = self.get_obs("observation", ep_idx, step_idx)
+        next_obs = self.get_obs("observation", ep_idx, self.step_idx_mod(step_idx + 1))
         phy = self._storage['physics'][ep_idx, step_idx]
         if custom_reward is not None:
             reward = np.array([[custom_reward.from_physics(p)] for p in phy], dtype=np.float32)
         else:
             reward = self._storage['reward'][ep_idx, step_idx]
         return {
+            'obs': obs,
             'next_obs': next_obs,
             'reward': reward,
             'ep_idx': ep_idx.astype(np.int64),

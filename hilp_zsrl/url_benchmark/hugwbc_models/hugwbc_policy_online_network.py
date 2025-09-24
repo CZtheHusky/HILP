@@ -546,8 +546,8 @@ class HugWBCConfig:
     MAX_LENGTH = 5
     
     # Hidden layer dimensions
-    ACTOR_HIDDEN_DIMS = [1024, 1024, 1024]
-    MLP_HIDDEN_DIMS = [1024, 1024]
+    ACTOR_HIDDEN_DIMS = [1024, 1024, 1024, 1024]
+    MLP_HIDDEN_DIMS = [1024, 1024, 1024]
     
     # Activation functions
     ACTIVATION = 'elu'

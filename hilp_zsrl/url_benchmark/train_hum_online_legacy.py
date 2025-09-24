@@ -57,14 +57,14 @@ import omegaconf as omgcf
 
 import torch
 from dm_env import specs
-from url_benchmark import utils
+from url_benchmark.utils import utils
 from url_benchmark import agent as agents
 from gym import spaces
 from isaacgym import gymapi
-from url_benchmark.legged_gym_env_utils import build_isaac_namespace, _to_rgb_frame
+from url_benchmark.utils.legged_gym_env_utils import build_isaac_namespace, _to_rgb_frame
 from collections import defaultdict
-from url_benchmark.replay_buffer import DataBuffer
-from url_benchmark.hilbert_dataset import HilbertRepresentationDataset
+from url_benchmark.dataset_utils.replay_buffer import DataBuffer
+from url_benchmark.dataset_utils.hilbert_dataset import HilbertRepresentationDataset
 from torch.utils.data import DataLoader
 # pbar import
 import datetime

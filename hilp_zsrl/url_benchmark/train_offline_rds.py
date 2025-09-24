@@ -15,7 +15,8 @@ for fp in [base, base / "url_benchmark"]:
     assert fp.exists()
     if str(fp) not in sys.path:
         sys.path.append(str(fp))
-
+import shutil
+import time
 import logging
 import torch
 import warnings
@@ -26,6 +27,7 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 from collections import defaultdict
 import json
 import dataclasses
+from collections import deque
 import tempfile
 import typing as tp
 from pathlib import Path
@@ -37,17 +39,20 @@ import numpy as np
 import torch
 import wandb
 import omegaconf as omgcf
-import shutil
+from url_benchmark.dataset_utils.phi_pretrain_dataset import PhiWalkerDataset
+from url_benchmark.dataset_utils.utils import InfiniteDataLoaderWrapper
 from url_benchmark.dmc_utils import dmc
 from dm_env import specs
 from url_benchmark.utils import utils
 from url_benchmark import agent as agents
 from url_benchmark.utils.logger import Logger
-from url_benchmark.dataset_utils.in_memory_replay_buffer import ReplayBuffer
+# from url_benchmark.dataset_utils.in_memory_replay_buffer import ReplayBuffer
 from url_benchmark.utils.video import VideoRecorder
 from url_benchmark.utils.my_utils import record_video
+from tqdm import trange
 import traceback
 from url_benchmark.utils.humanoid_utils import _safe_set_viewer_cam, get_cosine_sim, collect_nonzero_losses, calc_phi_loss_upper, calc_z_vector_matrixes, plot_matrix_heatmaps, compute_global_color_limits, plot_tripanel_heatmaps_with_line, plot_per_step_z
+from url_benchmark.dmc_utils.gym_vector_env import make_gym_async_vectorized
 
 def rescale_to_unit_range(data_list):
     """Rescale each episode's data to [0, 1] range for comparison"""
@@ -73,21 +78,9 @@ def log_plotly_lines(prefix, ep, xs, series, global_frame):
         fig.add_trace(go.Scatter(x=xs[:L], y=ys[:L], mode="lines", name=name))
     fig.update_layout(title=f"{prefix} Episode {ep}: Rescaled Latent vs Reward",
                       xaxis_title="step", yaxis_title="value")
-    wandb.log({f"{prefix}/combined_rescaled_ep{ep}": fig}, step=global_frame)
+    wandb.log({f"{prefix}/combined_rew_scaled_ep{ep}": fig}, step=global_frame)
 
 def plot_wandb_lines(data_lists, prefix, global_frame, key_name="raw_dist_ep", x_name="step", y_name="raw_dist"):
-    xs = [list(range(len(data))) for data in data_lists]
-    ys = data_lists
-    plot_keys = [f'{prefix}/{key_name}{ep}' for ep in range(len(data_lists))]
-    wandb_tables = [
-        wandb.Table(data=list(zip(xs[ep], ys[ep])), columns=[x_name, y_name]) for ep in range(len(data_lists))
-    ]
-    charts_dict = {f"{prefix}/{key_name}{ep}": wandb.plot.line(
-        wandb_tables[ep], x_name, y_name, title=plot_keys[ep]) for ep in range(len(data_lists)
-        )}
-    wandb.log(charts_dict, step=global_frame)
-
-def plot_wandb_line_series(data_lists, prefix, global_frame, key_name="raw_dist_ep", x_name="step", y_name="raw_dist"):
     xs = [list(range(len(data))) for data in data_lists]
     ys = data_lists
     plot_keys = [f'{prefix}/{key_name}{ep}' for ep in range(len(data_lists))]
@@ -121,6 +114,7 @@ class Config:
     future: float = 0.99  # discount of future sampling, future=1 means no future sampling
     p_currgoal: float = 0  # current goal ratio
     p_randomgoal: float = 0  # random goal ratio
+    num_episode_steps: int = 1000
     # eval
     num_eval_episodes: int = 10
     eval_every_steps: int = 10000
@@ -132,11 +126,20 @@ class Config:
     snapshot_at: tp.Tuple[int, ...] = ()
     checkpoint_every: int = 100000
     load_model: tp.Optional[str] = None
+    local_replay_buffer_path: tp.Optional[str] = None
     # training
-    num_grad_steps: int = 1000000
+    sac_optim_steps: int = 50
+    phi_net_pretrain_steps: int = 80000
+    num_workers: int = 2
+    rollout_every_steps: int = 20000
+    save_every_steps: int = 20000
+    phi_total_episodes: int = 100000
+    phi_rollout_num: int = 100
+    num_train_envs: int = 100
+    num_grad_steps: int = 100000000
     log_every_steps: int = 1000
     num_seed_frames: int = 0
-    replay_buffer_episodes: int = 5000
+    replay_buffer_init_size: int = 1000
     update_encoder: bool = True
     batch_size: int = omgcf.II("agent.batch_size")
     goal_eval: bool = False
@@ -188,7 +191,7 @@ class DmcReward(BaseReward):
 
 def make_agent(
         obs_type: str, image_wh, obs_spec, action_spec, num_expl_steps: int, cfg: omgcf.DictConfig
-) -> tp.Union[agents.SFV2Agent, agents.SFAgent]:
+) -> tp.Union[agents.SFV2OnlineAgent]:
     cfg.obs_type = obs_type
     cfg.image_wh = image_wh
     cfg.obs_shape = obs_spec.shape
@@ -203,14 +206,10 @@ def _init_eval_meta(workspace, custom_reward: BaseReward = None, feature_type: s
     obs_list, reward_list, next_obs_list = [], [], []
     batch_size = 0
     while batch_size < num_steps:
-        batch = workspace.replay_loader.sample(workspace.cfg.batch_size, custom_reward=custom_reward)
+        batch = workspace.phi_dataset.sample(workspace.cfg.batch_size, custom_reward=custom_reward)
         batch = batch.to(workspace.cfg.device)
-        if isinstance(workspace.agent, agents.FBDDPGAgent) or (isinstance(workspace.agent, agents.SFAgent) and workspace.agent.cfg.feature_type == 'state'):
-            obs_list.append(batch.next_obs)
-            next_obs_list.append(batch.next_obs)
-        else:
-            obs_list.append(batch.obs)
-            next_obs_list.append(batch.next_obs)
+        obs_list.append(batch.obs)
+        next_obs_list.append(batch.next_obs)
         reward_list.append(batch.reward)
         batch_size += batch.next_obs.size(0)
     obs, reward, next_obs = torch.cat(obs_list, 0), torch.cat(reward_list, 0), torch.cat(next_obs_list, 0)
@@ -241,21 +240,25 @@ class Workspace:
         task = cfg.task
         self.domain = task.split('_', maxsplit=1)[0]
 
-        self.train_env = self._make_env()
+        self.train_env = make_gym_async_vectorized(
+            name=self.cfg.task,
+            num_envs=self.cfg.num_train_envs,
+            obs_type=self.cfg.obs_type,
+            frame_stack=self.cfg.frame_stack,
+            action_repeat=self.cfg.action_repeat,
+            seed=self.cfg.seed,
+            image_wh=self.cfg.image_wh,
+        )
+
         self.eval_env = self._make_env()
         # create agent
-        self.train_env.reset()
+        # self.train_env.reset()
         self.agent = make_agent(cfg.obs_type,
                                 cfg.image_wh,
-                                self.train_env.observation_spec(),
-                                self.train_env.action_spec(),
+                                self.train_env.observation_space,
+                                self.train_env.action_space,
                                 cfg.num_seed_frames // cfg.action_repeat,
                                 cfg.agent)
-
-        # create logger
-        self.logger = Logger(self.work_dir,
-                             use_tb=cfg.use_tb,
-                             use_wandb=cfg.use_wandb)
 
         if cfg.use_wandb:
             exp_name = ''
@@ -272,35 +275,21 @@ class Workspace:
                        config=omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
                        dir=wandb_output_dir)
 
-        self.replay_loader = ReplayBuffer(max_episodes=cfg.replay_buffer_episodes, discount=cfg.discount, future=cfg.future)
-
         cam_id = 0 if 'quadruped' not in self.domain else 2
 
         self.video_recorder = VideoRecorder(self.work_dir if cfg.save_video else None, task=self.cfg.task,
                                             camera_id=cam_id, use_wandb=self.cfg.use_wandb)
 
         self.timer = utils.Timer()
+        self.phi_step = 0
+        self.policy_step = 0
         self.global_step = 0
-        self.global_episode = 0
         self.eval_rewards_history: tp.List[float] = []
         self._checkpoint_filepath = self.work_dir / "models" / "latest.pt"
         if self._checkpoint_filepath.exists():
             self.load_checkpoint(self._checkpoint_filepath)
         elif cfg.load_model is not None:
-            self.load_checkpoint(cfg.load_model, exclude=["replay_loader"])
-
-        datasets_dir = self.work_dir / cfg.replay_buffer_dir
-        replay_dir = datasets_dir.resolve() / self.domain / cfg.expl_agent / 'buffer'
-        print(f'replay dir: {replay_dir}')
-        print("loading Replay from %s", self.cfg.load_replay_buffer)
-        self.load_checkpoint(self.cfg.load_replay_buffer, only=["replay_loader"], num_episodes=cfg.replay_buffer_episodes, use_pixels=(cfg.obs_type == 'pixels'))
-
-        self.replay_loader._future = cfg.future
-        self.replay_loader._discount = cfg.discount
-        self.replay_loader._p_currgoal = cfg.p_currgoal
-        self.replay_loader._p_randomgoal = cfg.p_randomgoal
-        self.replay_loader._frame_stack = cfg.frame_stack if cfg.obs_type == 'pixels' else None
-        self.replay_loader._max_episodes = len(self.replay_loader._storage["discount"])
+            self.load_checkpoint(cfg.load_model, exclude=["phi_dataset"])
 
     def _make_env(self) -> dmc.EnvWrapper:
         cfg = self.cfg
@@ -320,32 +309,22 @@ class Workspace:
         If return_indices is True, also return (ep_idx, step_idx) of that transition in the buffer.
         """
         num_steps = self.agent.cfg.num_inference_steps
-        all_rewards = []
-        all_next_obs = []
-        all_ep_idx = []
-        all_step_idx = []
-        collected = 0
-        while collected < num_steps:
-            batch = self.replay_loader.sample_transitions_with_indices(self.cfg.batch_size, custom_reward=custom_reward)
-            next_obs = batch['next_obs']
-            reward = batch['reward']
-            ep_idx = batch['ep_idx']
-            step_idx = batch['step_idx']
-            all_next_obs.append(next_obs)
-            all_rewards.append(reward)
-            all_ep_idx.append(ep_idx)
-            all_step_idx.append(step_idx)
-            collected += next_obs.shape[0]
-        next_obs_arr = np.concatenate(all_next_obs, axis=0)[:num_steps]
-        reward_arr = np.concatenate(all_rewards, axis=0)[:num_steps]
-        ep_idx_arr = np.concatenate(all_ep_idx, axis=0)[:num_steps]
-        step_idx_arr = np.concatenate(all_step_idx, axis=0)[:num_steps]
+        batch = self.phi_dataset.sample_transitions_with_indices(num_steps, custom_reward=custom_reward)
+        next_obs = batch['next_obs']
+        reward = batch['reward']
+        ep_idx = batch['ep_idx']
+        step_idx = batch['step_idx']
+        next_obs_arr = next_obs
+        reward_arr = reward
+        ep_idx_arr = ep_idx
+        step_idx_arr = step_idx
         # rewards are (N,1) -> (N,)
         reward_flat = reward_arr.reshape(-1)
         best = int(np.argmax(reward_flat))
         goal = next_obs_arr[best]
+        best_reward = reward_flat[best]
         if return_indices:
-            return goal, int(ep_idx_arr[best]), int(step_idx_arr[best])
+            return goal, int(ep_idx_arr[best]), int(step_idx_arr[best]), best_reward
         return goal
     
     def get_argmax_goal(self, custom_reward):
@@ -353,7 +332,7 @@ class Workspace:
         reward_list, next_obs_list = [], []
         batch_size = 0
         while batch_size < num_steps:
-            batch = self.replay_loader.sample(self.cfg.batch_size, custom_reward=custom_reward)
+            batch = self.phi_dataset.sample(self.cfg.batch_size, custom_reward=custom_reward)
             batch = batch.to(self.cfg.device)
             next_obs_list.append(batch.next_obs)
             reward_list.append(batch.reward)
@@ -362,66 +341,37 @@ class Workspace:
         reward_t, next_obs_t = reward[:num_steps], next_obs[:num_steps]
         return next_obs_t[torch.argmax(reward_t)].detach().cpu().numpy()
 
-    def train(self):
-        if self.cfg.eval_only:
-            try:
-                self.potential_eval('argmax')
-            except Exception as e:
-                print("Potential eval failed: task")
-                print(traceback.format_exc())
-            try:
-                self.potential_eval('random')
-            except Exception as e:
-                print("Potential eval failed: random")
-                print(traceback.format_exc())
+
+    def eval_sum(self):
             try:
                 self.potential_eval('fit')
             except Exception as e:
                 print("Potential eval failed: fit")
                 print(traceback.format_exc())
             try:
-                self.eval(prefix=self.cfg.agent.feature_type, goal_select_type='fit')
+                self.potential_eval('argmax')
             except Exception as e:
-                print("Goal eval (fit) failed")
+                print("Potential eval failed: argmax")
                 print(traceback.format_exc())
             try:
-                self.eval(prefix=self.cfg.agent.feature_type, goal_select_type='argmax')
+                self.potential_eval('random')
             except Exception as e:
-                print("Goal eval (argmax) failed")
+                print("Potential eval failed: random")
                 print(traceback.format_exc())
-            # self.finalize()
+    
+    def train(self):
+        if self.cfg.eval_only:
+            self.eval_sum()
             return
-        
-        train_until_step = utils.Until(self.cfg.num_grad_steps)
-        eval_every_step = utils.Every(self.cfg.eval_every_steps)
-        log_every_step = utils.Every(self.cfg.log_every_steps)
-
-        while train_until_step(self.global_step):
-            # try to evaluate
-            if eval_every_step(self.global_step):
-                self.logger.log('eval_total_time', self.timer.total_time(), self.global_step)
-                self.eval()
-
-            metrics = self.agent.update(self.replay_loader, self.global_step)
-            self.logger.log_metrics(metrics, self.global_step, ty='train')
-            if log_every_step(self.global_step):
-                elapsed_time, total_time = self.timer.reset()
-                with self.logger.log_and_dump_ctx(self.global_step, ty='train') as log:
-                    log('fps', self.cfg.log_every_steps / elapsed_time)
-                    log('total_time', total_time)
-                    log('step', self.global_step)
-            self.global_step += 1
-            # try to save snapshot
-            if self.global_frame in self.cfg.snapshot_at:
-                self.save_checkpoint(self._checkpoint_filepath.with_name(f'snapshot_{self.global_frame}.pt'),
-                                     exclude=["replay_loader"])
-            # save checkpoint to reload
-            if self.cfg.checkpoint_every != 0 and self.global_frame % self.cfg.checkpoint_every == 0:
-                self.save_checkpoint(self._checkpoint_filepath, exclude=["replay_loader"])
-        if self.cfg.checkpoint_every != 0:
-            self.save_checkpoint(self._checkpoint_filepath, exclude=["replay_loader"])  # make sure we save the final checkpoint
-        self.finalize()
-
+        self.global_progress_bar = trange(self.cfg.num_grad_steps, position=0, initial=self.global_step, leave=True, desc="Training Global")
+        if not hasattr(self, 'phi_dataloader'):
+            self.prepare_phi_dataset(is_init=True)
+        while True:
+            self.eval_sum()
+            self.train_policy()
+            if self.global_step >= self.cfg.num_grad_steps:
+                print("Training completed.")
+                break
 
     @torch.no_grad()
     def potential_eval(self, eval_type='argmax'):
@@ -465,12 +415,12 @@ class Workspace:
                 goal, ep_idx, step_idx = self.get_argmax_goal_potential(custom_reward, return_indices=True)
             elif eval_type == 'random':
                 # randomly pick an episode and use its final state as goal
-                ep_idx_arr = self.replay_loader.get_episode()
+                ep_idx_arr = self.phi_dataset.get_episode()
                 ep_idx = int(ep_idx_arr[0])
-                step_idx = int(self.replay_loader._episodes_length[ep_idx]) - 1
-                goal = self.replay_loader.get_obs('observation', ep_idx, step_idx)
+                step_idx = self.phi_dataset.ep_lengths - 1
+                goal = self.phi_dataset.get_obs(ep_idx, step_idx)
             if eval_type != 'fit':
-                ds_trajectory = torch.as_tensor(self.replay_loader._storage["observation"][ep_idx, :step_idx + 1], device=self.cfg.device)
+                ds_trajectory = torch.as_tensor(self.phi_dataset.data_storage["observation"][ep_idx, :step_idx + 1], device=self.cfg.device)
                 ds_trajectory_phi = self.agent.feature_learner.feature_net(self.agent.encoder(ds_trajectory)).detach()
                 ds_delta_phi = ds_trajectory_phi - ds_trajectory_phi[-1]
                 ds_delta_phi = torch.norm(ds_delta_phi, dim=-1).cpu().numpy()
@@ -481,11 +431,11 @@ class Workspace:
                 # dataset partial return up to goal step (inclusive)
                 ds_partial_return = 0.0
                 if custom_reward is not None:
-                    phy = self.replay_loader._storage["physics"][ep_idx, :step_idx+1]
+                    phy = self.phi_dataset.data_storage["physics"][ep_idx, :step_idx+1]
                     ds_rewards = [custom_reward.from_physics(p) for p in phy]
                     ds_partial_return = float(np.sum(ds_rewards))
                 else:
-                    ds_rewards = self.replay_loader._storage["reward"][ep_idx, :step_idx+1]
+                    ds_rewards = self.phi_dataset.data_storage["reward"][ep_idx, :step_idx+1]
                     ds_partial_return = float(np.sum(ds_rewards))
                 ds_raw_reward.append(ds_rewards.reshape(-1).tolist())
                 if eval_type == 'argmax':
@@ -507,7 +457,7 @@ class Workspace:
             t = 0
             while not time_step.last():
                 # recompute z as in normal goal_eval for hilp
-                meta = self.agent.get_goal_meta(goal_array=goal, obs_array=time_step.observation)
+                meta = self.agent.get_goal_meta(goal_array=goal, obs_array=time_step.observation, phi_goal=phi_goal)
                 with torch.no_grad(), utils.eval_mode(self.agent):
                     action, phi = self.agent.act(time_step.observation, meta, self.global_step, eval_mode=True)
                     current_phi.append(phi)
@@ -650,170 +600,7 @@ class Workspace:
             video = record_video(f'{prefix}_TrajVideo_{self.global_frame}', videos, skip_frames=2)
             wandb.log({f'{prefix}/TrajVideo': video}, step=self.global_frame)
 
-
-    def eval(self, final_eval=False, prefix=None, goal_select_type=None):
-        assert prefix is None or prefix == 'state' or prefix == 'diff', "prefix must be None, state, or diff"
-        step, episode = 0, 0
-        eval_until_episode = utils.Until(self.cfg.num_eval_episodes)
-        physics_agg = dmc.PhysicsAggregator()
-        rewards: tp.List[float] = []
-        custom_reward = self._make_custom_reward()  # not None only if final_eval
-        if goal_select_type == 'fit':
-            meta, diag = _init_eval_meta(self, custom_reward, feature_type=prefix)
-            phi_goal = torch.as_tensor(meta['z']).to(self.cfg.device)
-            goal = None
-            print("Fit goal evaluating")
-        elif goal_select_type == 'argmax':
-            print("Argmax goal evaluating")
-        else:
-            raise ValueError("goal_select_type must be 'fit' or 'argmax'")
-        videos = []
-        if prefix is None:
-            # cos_sim_save_parent = self.work_dir / self.cfg.task / 'state_cosine_sim'
-            current_goal_path = self.work_dir / self.cfg.task / 'state_current_goal'
-        else:
-            # cos_sim_save_parent = self.work_dir / self.cfg.task / f'_cosine_sim'
-            current_goal_path = self.work_dir / self.cfg.task / f'{prefix}_current_goal'
-        import shutil
-        # shutil.rmtree(cos_sim_save_parent, ignore_errors=True)
-        shutil.rmtree(current_goal_path, ignore_errors=True)
-        # cos_sim_save_parent.mkdir(exist_ok=True, parents=True)
-        current_goal_path.mkdir(exist_ok=True, parents=True)
-        zstate_records = defaultdict(list)
-        episode_distances = [[] for _ in range(self.cfg.num_eval_episodes)]
-        latent_episode_distances = [[] for _ in range(self.cfg.num_eval_episodes)]
-        raw_reward = [[] for _ in range(self.cfg.num_eval_episodes)]
-        while eval_until_episode(episode):
-            time_step = self.eval_env.reset()
-            if goal_select_type == 'fit':
-                pass
-            elif goal_select_type == 'argmax':
-                goal = self.get_argmax_goal(custom_reward)
-                meta = self.agent.get_goal_meta(goal_array=goal, obs_array=time_step.observation)
-                phi_goal = self.agent.feature_learner.feature_net(self.agent.encoder(torch.as_tensor(goal, device=self.cfg.device).unsqueeze(0))).detach()
-            current_z = torch.as_tensor(meta['z']).to(self.cfg.device).unsqueeze(0)
-            total_reward = 0.0
-            video_enabled = (episode < 2) and (self.global_frame % self.cfg.video_every_steps == 0)
-            self.video_recorder.init(self.eval_env, enabled=video_enabled)
-            current_phi = []
-            while not time_step.last():
-                if goal_select_type == 'argmax' and self.cfg.agent.feature_learner == 'hilp':
-                    # Recompute z every step
-                    meta = self.agent.get_goal_meta(goal_array=goal, obs_array=time_step.observation)
-                    # phi_goal = self.agent.feature_learner.feature_net(self.agent.encoder(torch.as_tensor(goal, device=self.cfg.device).unsqueeze(0))).detach()
-                with torch.no_grad(), utils.eval_mode(self.agent):
-                    action, phi = self.agent.act(time_step.observation, meta, self.global_step, eval_mode=True)
-                    current_phi.append(phi)
-                # latent-space distance to goal
-                if phi_goal is not None:
-                    latent_dist = torch.norm(phi.view(-1) - phi_goal.view(-1)).item()
-                    latent_episode_distances[episode].append(latent_dist)
-                if goal is not None:
-                    raw_dist = float(np.linalg.norm(time_step.observation - goal))
-                    episode_distances[episode].append(raw_dist)
-
-                time_step = self.eval_env.step(action)
-
-                physics_agg.add(self.eval_env)
-                if step % self.cfg.num_skip_frames == 0:
-                    self.video_recorder.record(self.eval_env)
-                if custom_reward is not None:
-                    time_step.reward = custom_reward.from_env(self.eval_env)
-                total_reward += time_step.reward
-                raw_reward[episode].append(time_step.reward)
-                step += 1
-            hilbert_traj = torch.cat(current_phi, axis=0)
-            last_z = hilbert_traj[-1]
-            z_diff = torch.diff(hilbert_traj, dim=0)
-            z_diff_normed = math.sqrt(self.cfg.agent.z_dim) * F.normalize(z_diff, dim=1)
-            z_diff_normed = z_diff_normed.cpu().numpy()
-            goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj.cpu().numpy(), goal_vector=last_z.cpu().numpy())
-            # plot_per_step_z(
-            #     latent=z_diff_normed,
-            #     eid=episode,
-            #     out_dir=cos_sim_save_parent,   
-            # )
-            plot_tripanel_heatmaps_with_line(
-                goal_z_cosine_sim_list,
-                goal_distance_list,
-                goal_absdist_list,
-                [f"{goal_select_type}_goal={goal_z_cosine_sim_list[g_idx].shape[-1]}_{episode}_{np.round(total_reward, 2)}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
-                current_goal_path,
-                title_cos=f'{episode} Z Cosine Similarity',
-                title_dist=f'{episode} Latent Space Distance',
-            )
-            goal_z_cosine_sim_list, goal_distance_list, goal_absdist_list = calc_z_vector_matrixes(hilbert_traj.cpu().numpy(), goal_vector=current_z.cpu().numpy())
-            plot_tripanel_heatmaps_with_line(
-                goal_z_cosine_sim_list,
-                goal_distance_list,
-                goal_absdist_list,
-                [f"goal=z_{goal_select_type}_{episode}_{np.round(total_reward, 2)}.png" for g_idx in range(len(goal_z_cosine_sim_list))],
-                current_goal_path,
-                title_cos=f'z_{goal_select_type} {episode} Z Cosine Similarity',
-                title_dist=f'z_{goal_select_type} {episode} Latent Space Distance',
-            )
-            diff_rewards = torch.einsum('sd, sd -> s', z_diff, current_z)
-            state_rewards = torch.einsum('sd, sd -> s', hilbert_traj[1:], current_z)
-            diff_sum = torch.sum(diff_rewards).item()
-            state_sum = torch.sum(state_rewards).item()
-            diff_mean = torch.mean(diff_rewards).item()
-            state_mean = torch.mean(state_rewards).item()
-            zstate_records['diff_rew_sum'].append(diff_sum)
-            zstate_records['state_rew_sum'].append(state_sum)
-            zstate_records['diff_rew_mean'].append(diff_mean)
-            zstate_records['state_rew_mean'].append(state_mean)
-            zstate_records['diff_rew_mean'].append(diff_mean)
-            zstate_records['state_rew_mean'].append(state_mean)
-            if video_enabled:
-                videos.append(self.video_recorder.frames)
-            rewards.append(total_reward)
-            episode += 1
-            self.video_recorder.save(f'{goal_select_type}_{self.global_frame}.mp4')
-
-        self.eval_rewards_history.append(float(np.mean(rewards)))
-        if final_eval:
-            return {
-                f'{goal_select_type}_episode_reward': self.eval_rewards_history[-1],
-            }, videos
-
-        if len(videos) > 0:
-            video = record_video(f'{goal_select_type}_TrajVideo_{self.global_frame}', videos, skip_frames=2)
-            wandb.log({f'{goal_select_type}_TrajVideo': video}, step=self.global_frame)
-        if self.cfg.use_wandb:
-            if goal is not None:
-                plot_wandb_lines(episode_distances, f'{prefix}_{goal_select_type}', self.global_frame, key_name="raw_dist_ep", x_name="step", y_name="raw_dist")
-            if phi_goal is not None:
-                plot_wandb_lines(latent_episode_distances, f'{prefix}_{goal_select_type}', self.global_frame, key_name="latent_dist_ep", x_name="step", y_name="latent_dist")
-            plot_wandb_lines(raw_reward, f'{prefix}_{goal_select_type}', self.global_frame, key_name="raw_reward_ep", x_name="step", y_name="raw_reward")
-            # Create combined rescaled plots using wandb.plot.line_series
-            rescaled_latent = rescale_to_unit_range(latent_episode_distances)
-            rescaled_rewards = rescale_to_unit_range(raw_reward)
-            for ep in range(len(latent_episode_distances)):
-                if len(rescaled_latent[ep]) > 0 and len(rescaled_rewards[ep]) > 0:
-                    assert len(rescaled_latent[ep]) == len(rescaled_rewards[ep])
-                    xs = list(range(len(rescaled_latent[ep])))
-                    ys = [
-                        rescaled_latent[ep],
-                        rescaled_rewards[ep],
-                    ]
-                    keys = ["latent_distance", "raw_reward"]
-                    series = {keys[i]: ys[i] for i in range(len(keys))}
-                    log_plotly_lines(f'{prefix}_{goal_select_type}', ep, xs, series, self.global_frame)
-
-        with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
-            log(f'{prefix}_{goal_select_type}_episode_reward', self.eval_rewards_history[-1])
-            if len(rewards) > 1:
-                log(f'{prefix}_{goal_select_type}_episode_reward#std', float(np.std(rewards)))
-            log(f'{prefix}_{goal_select_type}_episode_length', step * self.cfg.action_repeat / episode)
-            log(f'{prefix}_{goal_select_type}_episode', self.global_episode)
-            log('step', self.global_step)
-            if goal_select_type == 'fit':
-                for k, v in diag.items():
-                    log(f'{prefix}_{goal_select_type}_diag_{k}', v)
-            for k, v in zstate_records.items():
-                log(f'{prefix}_{goal_select_type}_z_{k}', np.mean(v))
-
-    _CHECKPOINTED_KEYS = ('agent', 'global_step', 'global_episode', "replay_loader")
+    _CHECKPOINTED_KEYS = ('agent', 'global_step', 'phi_step', "policy_step")
 
     def save_checkpoint(self, fp: tp.Union[Path, str], exclude: tp.Sequence[str] = ()) -> None:
         logger.info(f"Saving checkpoint to {fp}")
@@ -821,7 +608,6 @@ class Workspace:
         assert all(x in self._CHECKPOINTED_KEYS for x in exclude)
         fp = Path(fp)
         fp.parent.mkdir(exist_ok=True, parents=True)
-        assert isinstance(self.replay_loader, ReplayBuffer), "Is this buffer designed for checkpointing?"
         # this is just a dumb security check to not forget about it
         payload = {k: self.__dict__[k] for k in self._CHECKPOINTED_KEYS if k not in exclude}
         with fp.open('wb') as f:
@@ -843,8 +629,8 @@ class Workspace:
             del payload._storage['pixel']
             payload._batch_names.remove('pixel')
 
-        if isinstance(payload, ReplayBuffer):  # compatibility with pure buffers pickles
-            payload = {"replay_loader": payload}
+        # if isinstance(payload, ReplayBuffer):  # compatibility with pure buffers pickles
+        #     payload = {"phi_dataset": payload}
         if only is not None:
             only = list(only)
             assert all(x in self._CHECKPOINTED_KEYS for x in only)
@@ -857,20 +643,9 @@ class Workspace:
             logger.info("Reloading %s from %s", name, fp)
             if name == "agent":
                 self.agent.init_from(val)
-            elif name == "replay_loader":
-                assert isinstance(val, ReplayBuffer)
-                # pylint: disable=protected-access
-                # drop unecessary meta which could make a mess
-                val._current_episode.clear()  # make sure we can start over
-                val._future = self.cfg.future
-                val._discount = self.cfg.discount
-                val._max_episodes = len(val._storage["discount"])
-                self.replay_loader = val
             else:
                 assert hasattr(self, name)
                 setattr(self, name, val)
-                if name == "global_episode":
-                    logger.warning(f"Reloaded agent at global episode {self.global_episode}")
 
     def finalize(self) -> None:
         print("Running final test", flush=True)
@@ -906,20 +681,124 @@ class Workspace:
             #     rewards[name + '_diff'] = self.eval_rewards_history.copy()
             # except Exception as e:
             #     print(f"Error evaluating {name} diff: {e}")
-        with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
-            for name in domain_tasks[self.domain]:
-                video = record_video(f'Final_{name}', videos[name], skip_frames=2)
-                # diff_video = record_video(f'Final_{name}_diff', videos[name + '_diff'], skip_frames=2)
-                wandb.log({f'Final_{name}': video}, step=self.global_frame)
-                # wandb.log({f'Final_{name}_diff': diff_video}, step=self.global_frame)
-                for k, v in infos[name].items():
-                    log(f'final/{name}/{k}', v)
-                # for k, v in diff_info.items():
-                #     log(f'final/{name}_diff/{k}', v)
+        # with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
+        #     for name in domain_tasks[self.domain]:
+        #         video = record_video(f'Final_{name}', videos[name], skip_frames=2)
+        #         # diff_video = record_video(f'Final_{name}_diff', videos[name + '_diff'], skip_frames=2)
+        #         wandb.log({f'Final_{name}': video}, step=self.global_frame)
+        #         # wandb.log({f'Final_{name}_diff': diff_video}, step=self.global_frame)
+        #         for k, v in infos[name].items():
+        #             log(f'final/{name}/{k}', v)
+        #         # for k, v in diff_info.items():
+        #         #     log(f'final/{name}_diff/{k}', v)
         self.eval_rewards_history = eval_hist  # restore
         with (self.work_dir / "test_rewards.json").open("w") as f:
             json.dump(rewards, f)
+    
+    def init_phi_dataset(self):
+        if not hasattr(self, 'phi_dataset'):       
+            self.phi_dataset = PhiWalkerDataset(
+                data_dir=os.path.join(self.work_dir, "phi_dataset"),
+                obs_horizon=self.cfg.agent.obs_horizon,
+                total_episodes=self.cfg.phi_total_episodes,
+                discount=self.cfg.discount,
+                goal_future=self.cfg.future,
+                p_randomgoal=self.cfg.p_randomgoal,
+            )
 
+
+    def prepare_phi_dataset(self, is_init=False):
+        self.init_phi_dataset()
+        start_time = time.time()
+        if self.cfg.local_replay_buffer_path is not None:
+            rp_cls = torch.load(self.cfg.local_replay_buffer_path)
+            episode_data = {}
+            episode_data['observation'] = rp_cls._storage['observation'][:, :-1]
+            episode_data['action'] = rp_cls._storage['action'][:, 1:]
+            episode_data['reward'] = rp_cls._storage['reward'][:, 1:]
+            # episode_data['discount'] = rp_cls._storage['discount'][1:]
+            episode_data['physics'] = rp_cls._storage['physics'][:, 1:]
+            self.phi_dataset.add_episodes(episode_data, num_episodes=rp_cls._storage['observation'].shape[0])
+        else:
+            total_num = self.cfg.phi_rollout_num
+            pbar = trange(total_num, desc="Collecting data", leave=True)
+            for _ in range(total_num):
+                episodes = self._collect_episodes(random_sample=True, is_init=is_init)
+                pbar.update(1)
+                self.phi_dataset.add_episodes(episodes, num_episodes=self.cfg.num_train_envs)
+                pbar.set_description(f"Steps: {len(self.phi_dataset)}")
+        dataloader_cfg = {
+            "batch_size": self.cfg.batch_size,
+            "shuffle": True,
+            "num_workers": self.cfg.num_workers,
+        }
+        self.phi_dataloader = InfiniteDataLoaderWrapper(self.phi_dataset, dataloader_cfg)
+        end_time = time.time()
+        if self.cfg.use_wandb:
+            wandb.log({f"train/phi_dataset_time": end_time - start_time, 'phi_dataset_ep_num': self.phi_dataset.meta_info['current_size']}, step=self.global_step)
+        else:
+            print(f"train/phi_dataset_time: {end_time - start_time}")
+
+    def _collect_episodes(self, random_sample=True, phi_obs=None, phi_future_obs=None, is_init=False):
+        """Collect episodes using gymnasium AsyncVectorEnv.
+
+        Returns:
+            episodes: List[dict], one per env, with keys:
+                - data: { 'observation', 'actions', 'rewards', 'discount' }
+                - meta: {}
+            mean_len: float, average episode length over envs
+        """
+        obs, infos = self.train_env.reset()
+        physics = infos['physics']
+        action_shape = self.train_env.action_space.shape
+
+        data_buffer = {
+            "observation": np.empty((self.cfg.num_train_envs, self.cfg.num_episode_steps, *obs.shape[1:]), dtype=obs.dtype),
+            "action": np.empty((self.cfg.num_train_envs, self.cfg.num_episode_steps, *action_shape[1:]), dtype=np.float32),
+            "reward": np.empty((self.cfg.num_train_envs, self.cfg.num_episode_steps), dtype=np.float32),
+            'physics': np.empty((self.cfg.num_train_envs, self.cfg.num_episode_steps, *physics.shape[1:]), dtype=physics.dtype),
+        }
+        t = 0
+        z = self.agent.sample_z(obs=phi_obs, future_obs=phi_future_obs, size=self.cfg.num_train_envs, random_sample=random_sample)
+        while t < self.cfg.num_episode_steps:
+            # Random actions by default; integrate policy here if desired
+            # actions = np.random.uniform(low=act_low, high=act_high, size=(num_envs,) + act_shape).astype(np.float32)
+            data_buffer['observation'][:, t] = obs
+            data_buffer['physics'][:, t] = physics
+            if is_init:
+                actions = self.train_env.action_space.sample()
+            else:
+                actions = self.agent.act_inference(obs, z)
+            obs, rew, term, trunc, infos = self.train_env.step(actions)
+            # dones = np.logical_or(term, trunc)
+            data_buffer['action'][:, t] = actions
+            data_buffer['reward'][:, t] = rew
+            physics = infos['physics']
+            t += 1
+        return data_buffer
+
+    def update_train_metrics(self, metrics_summon: tp.Dict[str, float]) -> None:
+        for k, v in metrics_summon.items():
+            metrics_summon[k] = np.mean(v)
+        if self.cfg.use_wandb:
+            wandb.log({f"train/{'_'.join(k.split('/'))}" if "/" in k else f"train/{k}": v for k, v in metrics_summon.items()}, step=self.global_step)
+        else:
+            for k, v in metrics_summon.items():
+                print(f"train/{'_'.join(k.split('/'))}" if "/" in k else f"train/{k}: {v}")
+
+    def train_policy(self):
+        for batch in self.phi_dataloader:
+            metrics = self.agent.update_batch(batch, update_all=True)
+            self.global_step += 1
+            self.global_progress_bar.update(1)
+            self.global_progress_bar.set_description(f"Training")
+            metrics['phi_dataset_steps'] = len(self.phi_dataset)
+            self.update_train_metrics(metrics)
+            if self.global_step % self.cfg.save_every_steps == 0:
+                _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
+                self.save_checkpoint(_checkpoint_filepath)
+            if self.global_step % self.cfg.rollout_every_steps == 0:
+                return
 
 @hydra.main(config_path='.', config_name='base_config')
 def main(cfg: omgcf.DictConfig) -> None:

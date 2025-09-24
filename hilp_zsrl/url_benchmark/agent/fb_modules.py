@@ -4,7 +4,7 @@ import typing as tp
 import torch
 from torch import nn
 import torch.nn.functional as F
-from url_benchmark import utils
+from url_benchmark.utils import utils
 
 
 class OnlineCov(nn.Module):

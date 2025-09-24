@@ -10,9 +10,9 @@ import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 import omegaconf
 
-from url_benchmark.dmc import TimeStep
-from url_benchmark.in_memory_replay_buffer import ReplayBuffer
-from url_benchmark import utils
+from url_benchmark.dmc_utils.dmc import TimeStep
+from url_benchmark.dataset_utils.in_memory_replay_buffer import ReplayBuffer
+from url_benchmark.utils import utils
 from .fb_modules import mlp, Actor
 
 

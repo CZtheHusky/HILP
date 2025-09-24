@@ -17,3 +17,5 @@ from .sf_v0 import SFV0Agent as SFV0Agent
 from .sf_v0 import SFV0AgentConfig as SFV0AgentConfig
 from .sf_v1 import SFV1Agent as SFV1Agent
 from .sf_v1 import SFV1AgentConfig as SFV1AgentConfig
+from .sf_v2_online import SFV2OnlineAgent as SFV2OnlineAgent
+from .sf_v2_online import SFV2OnlineAgentConfig as SFV2OnlineAgentConfig

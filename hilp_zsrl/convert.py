@@ -16,7 +16,7 @@ from pickle import HIGHEST_PROTOCOL
 import torch
 from tqdm import tqdm
 from url_benchmark import dmc
-from url_benchmark.in_memory_replay_buffer import ReplayBuffer
+from url_benchmark.dataset_utils.in_memory_replay_buffer import ReplayBuffer
 
 
 FLAGS = flags.FLAGS

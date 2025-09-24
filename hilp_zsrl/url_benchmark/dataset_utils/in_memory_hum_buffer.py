@@ -4,7 +4,7 @@ import dataclasses
 import collections
 import numpy as np
 import torch
-from url_benchmark.replay_buffer import DataBuffer
+from url_benchmark.dataset_utils.replay_buffer import DataBuffer
 from collections import defaultdict
 from tqdm import tqdm
 import traceback
@@ -112,7 +112,6 @@ class EpisodeBatch(tp.Generic[T]):
     meta: tp.Dict[str, T] = dataclasses.field(default_factory=dict)
     _physics: tp.Optional[T] = None
     future_obs: tp.Optional[T] = None
-    valid_future_obs: tp.Optional[T] = None
     privileged_obs: tp.Optional[T] = None
     commands: tp.Optional[T] = None
 
@@ -341,7 +340,6 @@ class StepReplayBuffer:
                 print("Traceback:")
                 traceback.print_exc()
                 raise e
-            # valid_future_obs = future_obs.copy()
 
             # 随机目标（跨 episode）
             if self._p_randomgoal > 0.0:

@@ -13,14 +13,14 @@ import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 import omegaconf
 
-from url_benchmark import utils
-from url_benchmark.in_memory_replay_buffer import ReplayBuffer
+from url_benchmark.utils import utils
+from url_benchmark.dataset_utils.in_memory_replay_buffer import ReplayBuffer
 from .ddpg import MetaDict, make_aug_encoder
 from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, mlp, OnlineCov
-from url_benchmark.dmc import TimeStep
-from url_benchmark.hugwbc_policy_network import create_hugwbc_policy
-# from url_benchmark.hugwbc_policy_sac_network import create_sac_policy
-from url_benchmark.hugwbc_policy_online_network import create_sac_policy
+from url_benchmark.dmc_utils.dmc import TimeStep
+from url_benchmark.hugwbc_models.hugwbc_policy_network import create_hugwbc_policy
+# from url_benchmark.hugwbc_models.hugwbc_policy_sac_network import create_sac_policy
+from url_benchmark.hugwbc_models.hugwbc_policy_online_network import create_sac_policy
 import time
 from typing import Dict, Any, Iterable, Tuple, Optional
 
@@ -861,8 +861,6 @@ class SFHumanoidAgent:
                 metrics['next_F_norm'] = torch.norm(next_F, dim=-1).mean().item()
                 metrics['target_F_std'] = target_F.std().item()  # 目标的方差
                 metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
-            if phi_loss is not None:
-                metrics['phi_loss'] = phi_loss.item()
 
             if isinstance(self.sf_opt, torch.optim.Adam):
                 metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]

@@ -14,12 +14,12 @@ import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 import omegaconf
 
-from url_benchmark import utils
-from url_benchmark.in_memory_replay_buffer import ReplayBuffer
+from url_benchmark.utils import utils
+from url_benchmark.dataset_utils.in_memory_replay_buffer import ReplayBuffer
 from .ddpg import MetaDict, make_aug_encoder
 from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, mlp, OnlineCov
-from url_benchmark.dmc import TimeStep
-from url_benchmark.potential_goal_fit import fit_goal_latent
+from url_benchmark.dmc_utils.dmc import TimeStep
+from url_benchmark.utils.potential_goal_fit import fit_goal_latent
 
 logger = logging.getLogger(__name__)
 
@@ -514,19 +514,24 @@ class SFV2Agent:
             if isinstance(val, torch.optim.Optimizer):
                 val.load_state_dict(copy.deepcopy(getattr(other, key).state_dict()))
 
-    def get_goal_meta(self, goal_array: np.ndarray, obs_array: np.ndarray = None) -> MetaDict:
+    def get_goal_meta(self, goal_array: np.ndarray=None, obs_array: np.ndarray = None, phi_goal: torch.Tensor = None) -> MetaDict:
         assert self.cfg.feature_learner == 'hilp'
 
         obs = torch.tensor(obs_array).unsqueeze(0).to(self.cfg.device)
-        desired_goal = torch.tensor(goal_array).unsqueeze(0).to(self.cfg.device)
+        if goal_array is not None:
+            desired_goal = torch.tensor(goal_array).unsqueeze(0).to(self.cfg.device)
+            with torch.no_grad():
+                obs = self.encoder(obs)
+                desired_goal = self.encoder(desired_goal)
 
-        with torch.no_grad():
-            obs = self.encoder(obs)
-            desired_goal = self.encoder(desired_goal)
-
-        with torch.no_grad():
-            z_g = self.feature_learner.feature_net(desired_goal)
-            z_s = self.feature_learner.feature_net(obs)
+            with torch.no_grad():
+                z_g = self.feature_learner.feature_net(desired_goal)
+                z_s = self.feature_learner.feature_net(obs)
+        else:
+            with torch.no_grad():
+                obs = self.encoder(obs)
+                z_s = self.feature_learner.feature_net(obs)
+            z_g = phi_goal.view(z_s.shape[0], self.cfg.z_dim)
         if self.cfg.goal_type == 'delta':
             z = (z_g - z_s)
         elif self.cfg.goal_type == 'state':
@@ -556,14 +561,14 @@ class SFV2Agent:
             r = reward.view(-1)
         z, diag = fit_goal_latent(
             x, xp, r,
-            optimizer="lbfgs",          # 中小数据更快更稳
+            optimizer="lbfgs",       
             lbfgs_max_iter=200,
-            restarts=8,                 # 多重重启更稳（含闭式解初始化）
+            restarts=8,               
             use_lstsq_init=True,
-            standardize=True,           # 强烈建议
+            standardize=True,
             device=self.cfg.device
         )
-        z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=0)
+        # z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=0)
         meta = OrderedDict()
         meta['z'] = z.squeeze().cpu().numpy()
         return meta, diag
@@ -675,8 +680,6 @@ class SFV2Agent:
             metrics['r_min'] = r.min().item()
             metrics['r_std'] = r.std().item()
             metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
-            if phi_loss is not None:
-                metrics['phi_loss'] = phi_loss.item()
 
             if isinstance(self.sf_opt, torch.optim.Adam):
                 metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]
@@ -746,7 +749,6 @@ class SFV2Agent:
             next_obs = batch.next_obs
             future_obs = batch.future_obs
 
-            z = self.sample_z(obs, future_obs, self.cfg.batch_size).to(self.cfg.device)
             if not z.shape[-1] == self.cfg.z_dim:
                 raise RuntimeError("There's something wrong with the logic here")
 
@@ -754,6 +756,7 @@ class SFV2Agent:
             next_obs = self.aug_and_encode(next_obs)
             future_obs = self.aug_and_encode(future_obs)
             next_obs = next_obs.detach()
+            z = self.sample_z(obs, future_obs, self.cfg.batch_size).to(self.cfg.device)
 
             metrics.update(self.update_sf(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z=z, step=step))
 

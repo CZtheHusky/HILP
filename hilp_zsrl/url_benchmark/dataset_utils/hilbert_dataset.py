@@ -6,8 +6,8 @@ from torch.utils.data import Dataset
 from typing import List, Optional, Tuple
 import zarr
 from tqdm import tqdm
-from url_benchmark.replay_buffer import DataBuffer
-from url_benchmark.in_memory_replay_buffer import EpisodeBatch
+from url_benchmark.dataset_utils.replay_buffer import DataBuffer
+from url_benchmark.dataset_utils.in_memory_replay_buffer import EpisodeBatch
 
 
 

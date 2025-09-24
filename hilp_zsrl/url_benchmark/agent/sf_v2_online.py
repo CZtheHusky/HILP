@@ -3,6 +3,7 @@ import math
 import logging
 import dataclasses
 from collections import OrderedDict
+from re import X
 import typing as tp
 from pathlib import Path
 
@@ -12,30 +13,25 @@ from torch import nn
 import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 import omegaconf
-from url_benchmark.dataset_utils.in_memory_hum_buffer import EpisodeBatch
+
 from url_benchmark.utils import utils
-from url_benchmark.dataset_utils.in_memory_replay_buffer import ReplayBuffer
+from url_benchmark.dataset_utils.in_memory_replay_buffer import ReplayBuffer, EpisodeBatch
 from .ddpg import MetaDict, make_aug_encoder
 from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, mlp, OnlineCov
 from url_benchmark.dmc_utils.dmc import TimeStep
-from url_benchmark.hugwbc_models.hugwbc_policy_network import create_hugwbc_policy
-# from url_benchmark.hugwbc_models.hugwbc_policy_sac_network import create_sac_policy
-from url_benchmark.hugwbc_models.hugwbc_policy_online_network import create_sac_policy
-import time
-from typing import Dict, Any, Iterable, Tuple, Optional
-
+from url_benchmark.utils.potential_goal_fit import fit_goal_latent
 
 logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class SFHumanoidOnlineAgentConfig:
+class SFV2OnlineAgentConfig:
     # @package agent
-    _target_: str = "url_benchmark.agent.sf_hum_online.SFHumanoidOnlineAgent"
+    _target_: str = "url_benchmark.agent.sf_v2_online.SFV2OnlineAgent"
     name: str = "sf"
     obs_type: str = omegaconf.MISSING  # to be specified later
+    image_wh: int = omegaconf.MISSING  # to be specified later
     obs_shape: tp.Tuple[int, ...] = omegaconf.MISSING  # to be specified later
-    critic_obs_shape: tp.Tuple[int, ...] = omegaconf.MISSING
     action_shape: tp.Tuple[int, ...] = omegaconf.MISSING  # to be specified later
     device: str = omegaconf.II("device")  # ${device}
     lr: float = 1e-4
@@ -44,10 +40,12 @@ class SFHumanoidOnlineAgentConfig:
     update_every_steps: int = 1
     use_tb: bool = omegaconf.II("use_tb")  # ${use_tb}
     use_wandb: bool = omegaconf.II("use_wandb")  # ${use_wandb}
+    num_expl_steps: int = omegaconf.MISSING  # ???  # to be specified later
     num_inference_steps: int = 10000
     hidden_dim: int = 1024   # 128, 2048
     phi_hidden_dim: int = 512   # 128, 2048
     feature_dim: int = 512   # 128, 1024
+    obs_horizon: int = 1
     z_dim: int = 50  # 30-200
     stddev_schedule: str = "0.2"  # "linear(1,0.2,200000)"  # 0,  0.1, 0.2
     stddev_clip: float = 0.3  # 1
@@ -58,10 +56,13 @@ class SFHumanoidOnlineAgentConfig:
     update_encoder: bool = omegaconf.II("update_encoder")  # ${update_encoder}
     log_std_bounds: tp.Tuple[float, float] = (-5, 2)  # param for DiagGaussianActor
     temp: float = 1  # temperature for DiagGaussianActor
+    boltzmann: bool = False  # set to true for DiagGaussianActor
     debug: bool = False
     preprocess: bool = True
     num_sf_updates: int = 1
     feature_learner: str = "hilp"
+    mix_ratio: float = 0.5
+    q_loss: bool = True
     update_cov_every_step: int = 1000
     add_trunk: bool = False
 
@@ -69,11 +70,10 @@ class SFHumanoidOnlineAgentConfig:
     goal_type: str = "delta"  # 'delta', 'state'
     hilp_discount: float = 0.98
     hilp_expectile: float = 0.5
-    obs_horizon: int = 5
 
 
 cs = ConfigStore.instance()
-cs.store(group="agent", name="sf_hum_online", node=SFHumanoidOnlineAgentConfig)
+cs.store(group="agent", name="sf_v2_online", node=SFV2OnlineAgentConfig)
 
 
 class FeatureLearner(nn.Module):
@@ -105,7 +105,7 @@ class HILP(FeatureLearner):
             assert z_dim % 2 == 0
             feature_dim = z_dim // 2
 
-        layers = [obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", hidden_dim, "relu", hidden_dim, "relu", feature_dim]
+        layers = [obs_dim, hidden_dim, "ntanh", hidden_dim, "relu", feature_dim]
 
         self.phi1 = mlp(*layers)
         self.phi2 = mlp(*layers)
@@ -176,8 +176,10 @@ class HILP(FeatureLearner):
         value_loss1 = self.expectile_loss(adv, q1 - v1, self.cfg.hilp_expectile).mean()
         value_loss2 = self.expectile_loss(adv, q2 - v2, self.cfg.hilp_expectile).mean()
         value_loss = value_loss1 + value_loss2
+
         utils.soft_update_params(self.phi1, self.target_phi1, 0.005)
         utils.soft_update_params(self.phi2, self.target_phi2, 0.005)
+
         with torch.no_grad():
             phi1 = self.phi1(obs)
             self.running_mean = 0.995 * self.running_mean + 0.005 * phi1.mean(dim=0)
@@ -430,13 +432,14 @@ class SVDP(FeatureLearner):
         return loss
 
 
-class SFHumanoidOnlineAgent:
+class SFV2OnlineAgent:
 
     def __init__(self, **kwargs: tp.Any):
-        cfg = SFHumanoidOnlineAgentConfig(**kwargs)
+        cfg = SFV2OnlineAgentConfig(**kwargs)
         self.cfg = cfg
-        assert len(cfg.action_shape) == 1
-        self.action_dim = cfg.action_shape[0]
+        cfg.feature_type == 'diff'
+        # assert len(cfg.action_shape) == 1
+        self.action_dim = cfg.action_shape[-1]
         self.solved_meta: tp.Any = None
 
         # models
@@ -446,20 +449,18 @@ class SFHumanoidOnlineAgent:
         else:
             self.aug = nn.Identity()
             self.encoder = nn.Identity()
-            self.obs_dim = cfg.obs_shape[0]
-        self.critic_obs_dim = cfg.critic_obs_shape[0]
+            self.obs_dim = cfg.obs_shape[-1]
         if cfg.feature_learner == "identity":
             cfg.z_dim = self.obs_dim
             self.cfg.z_dim = self.obs_dim
         # create the network
-        # if self.cfg.boltzmann:
-        #     self.actor: nn.Module = DiagGaussianActor(cfg.obs_type, self.obs_dim, cfg.z_dim, self.action_dim,
-        #                                               cfg.hidden_dim, cfg.log_std_bounds).to(cfg.device)
-        # else:
-        #     self.actor = Actor(self.obs_dim, cfg.z_dim, self.action_dim,
-        #                        cfg.feature_dim, cfg.hidden_dim,
-        #                        preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
-        self.actor = create_sac_policy(z_dim=cfg.z_dim, horizon=cfg.obs_horizon, proprio_dim=self.obs_dim // cfg.obs_horizon, clock_dim=0).to(cfg.device)
+        if self.cfg.boltzmann:
+            self.actor: nn.Module = DiagGaussianActor(self.obs_dim, cfg.z_dim, self.action_dim,
+                                                      cfg.hidden_dim, cfg.log_std_bounds).to(cfg.device)
+        else:
+            self.actor = Actor(self.obs_dim, cfg.z_dim, self.action_dim,
+                               cfg.feature_dim, cfg.hidden_dim,
+                               preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk).to(cfg.device)
         self.successor_net = ForwardMap(self.obs_dim, cfg.z_dim, self.action_dim,
                                         cfg.feature_dim, cfg.hidden_dim,
                                         preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk, output_dim=1).to(cfg.device)
@@ -467,9 +468,7 @@ class SFHumanoidOnlineAgent:
         self.successor_target_net = ForwardMap(self.obs_dim, cfg.z_dim, self.action_dim,
                                                cfg.feature_dim, cfg.hidden_dim,
                                                preprocess=cfg.preprocess, add_trunk=self.cfg.add_trunk, output_dim=1).to(cfg.device)
-        # self.log_alpha = torch.nn.Parameter(torch.tensor(-1.0))  # α≈1.0，可改为 -1.0(≈0.37)
-        # self.target_entropy = -float(self.action_dim)
-        # self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=3e-4)
+
         learner = dict(icm=ICM, transition=TransitionModel, latent=TransitionLatentModel,
                        contrastive=ContrastiveFeature, autoencoder=AutoEncoder, lap=Laplacian,
                        random=FeatureLearner, svd_sr=SVDSR, svd_p=SVDP,
@@ -481,9 +480,6 @@ class SFHumanoidOnlineAgent:
                 cfg=self.cfg,
             )
         self.feature_learner = learner(self.obs_dim, self.action_dim, cfg.z_dim, cfg.phi_hidden_dim, **extra_kwargs).to(cfg.device)
-
-        print("Successor net: ", self.successor_net)
-        print("feature learner: ", self.feature_learner)
 
         # load the weights into the target networks
         self.successor_target_net.load_state_dict(self.successor_net.state_dict())
@@ -499,6 +495,8 @@ class SFHumanoidOnlineAgent:
         self.train()
         self.successor_target_net.train()
 
+        self.inv_cov = torch.eye(self.cfg.z_dim, dtype=torch.float32, device=self.cfg.device)
+
     def train(self, training: bool = True) -> None:
         self.training = training
         for net in [self.encoder, self.actor, self.successor_net]:
@@ -506,233 +504,66 @@ class SFHumanoidOnlineAgent:
         if self.phi_opt is not None:
             self.feature_learner.train()
 
-    # def init_from(self, other) -> None:
-    #     # copy parameters over
-    #     names = ["encoder", "actor"]
-    #     if self.cfg.init_sf:
-    #         names += ["successor_net", "feature_learner", "successor_target_net"]
-    #     for name in names:
-    #         utils.hard_update_params(getattr(other, name), getattr(self, name))
-    #     for key, val in self.__dict__.items():
-    #         if isinstance(val, torch.optim.Optimizer):
-    #             val.load_state_dict(copy.deepcopy(getattr(other, key).state_dict()))
-
     def init_from(self, other) -> None:
-        # 1) 只复制权重/缓冲，不替换模块对象
-        device = torch.device(self.cfg.device)
-        print("Agent Device:", device)
+        # copy parameters over
+        names = ["encoder", "actor"]
+        if self.cfg.init_sf:
+            names += ["successor_net", "feature_learner", "successor_target_net"]
+        for name in names:
+            utils.hard_update_params(getattr(other, name), getattr(self, name))
+        for key, val in self.__dict__.items():
+            if isinstance(val, torch.optim.Optimizer):
+                val.load_state_dict(copy.deepcopy(getattr(other, key).state_dict()))
 
-        # -------- helpers: 自动收集 --------
-        def _collect_modules(obj):
-            for k, v in obj.__dict__.items():
-                if isinstance(v, nn.Module):
-                    yield k, v
-
-        def _collect_free_params(obj):
-            for k, v in obj.__dict__.items():
-                if isinstance(v, torch.nn.Parameter):
-                    yield k, v
-
-        def _collect_optimizers(obj):
-            for k, v in obj.__dict__.items():
-                if isinstance(v, torch.optim.Optimizer):
-                    yield k, v
-
-        # -------- 1) 复制所有子模块权重/缓冲（自动发现） --------
-        for name, dst_mod in _collect_modules(self):
-            src_mod = getattr(other, name, None)
-            if isinstance(src_mod, nn.Module):
-                try:
-                    # strict=False 更健壮，允许 shape/键有少量出入
-                    dst_mod.load_state_dict(src_mod.state_dict(), strict=True)
-                    # 也可打印一下 missed/unused keys 方便调试：
-                    # print(f"[{name}] loaded.")
-                except Exception as e:
-                    print(f"Error loading module '{name}': {e}")
-
-        # -------- 1.1) 复制“游离”的 nn.Parameter --------
-        for name, dst_p in _collect_free_params(self):
-            src_p = getattr(other, name, None)
-            if isinstance(src_p, torch.nn.Parameter):
-                try:
-                    with torch.no_grad():
-                        dst_p.copy_(src_p.data)
-                    # print(f"[param {name}] copied.")
-                except Exception as e:
-                    print(f"Error copying param '{name}': {e}")
-
-        # -------- 2) 统一迁移所有子模块到 device --------
-        for _, m in _collect_modules(self):
-            m.to(device)
-        # 游离参数也迁移（通常你不会有很多，但以防万一）
-        for name, p in _collect_free_params(self):
-            if p.device != device:
-                with torch.no_grad():
-                    p.data = p.data.to(device)
-
-        # -------- 3) 复制优化器状态并把其 state 迁移到 device（自动发现） --------
-        for key, opt in _collect_optimizers(self):
-            src_opt = getattr(other, key, None)
-            if isinstance(src_opt, torch.optim.Optimizer):
-                try:
-                    opt.load_state_dict(copy.deepcopy(src_opt.state_dict()))
-                    # 把优化器 state 张量搬到目标设备
-                    for state in opt.state.values():
-                        for sk, sv in state.items():
-                            if isinstance(sv, torch.Tensor):
-                                state[sk] = sv.to(device, non_blocking=True)
-                    # print(f"[optimizer {key}] loaded & moved.")
-                except Exception as e:
-                    print(f"Error loading optimizer '{key}': {e}")
-
-        # -------- 4) 记录设备（若你需要） --------
-        self.device = str(device)
-
-        # -------- 5) 可选：一致性自检（调试期很有用） --------
-        def _check_opt(opt, name):
-            for group in opt.param_groups:
-                for p in group["params"]:
-                    if p.requires_grad:
-                        assert p.device == device, f"{name}: param on {p.device}, expected {device}"
-                        if p.grad is not None:
-                            assert p.grad.device == device, f"{name}: grad on {p.grad.device}, expected {device}"
-            for s in opt.state.values():
-                for k, v in s.items():
-                    if isinstance(v, torch.Tensor):
-                        assert v.device == device, f"{name}: state[{k}] on {v.device}, expected {device}"
-
-        for key, opt in _collect_optimizers(self):
-            _check_opt(opt, key)
-
-    def get_goal_meta(self, goal_array: np.ndarray, obs_array: np.ndarray = None) -> MetaDict:
+    def get_goal_meta(self, goal_array: np.ndarray=None, obs_array: np.ndarray = None, phi_goal: torch.Tensor = None) -> MetaDict:
         assert self.cfg.feature_learner == 'hilp'
 
-        desired_goal = torch.as_tensor(goal_array).to(self.cfg.device)
-        if len(desired_goal.shape) == 1:
-            desired_goal = desired_goal.unsqueeze(0)
-        if obs_array is not None:
-            obs = torch.as_tensor(obs_array).to(self.cfg.device)
-            if len(obs.shape) == 1:
-                obs = obs.unsqueeze(0)
+        obs = torch.tensor(obs_array).unsqueeze(0).to(self.cfg.device)
+        if goal_array is not None:
+            desired_goal = torch.tensor(goal_array).unsqueeze(0).to(self.cfg.device)
             with torch.no_grad():
                 obs = self.encoder(obs)
                 desired_goal = self.encoder(desired_goal)
+
+            with torch.no_grad():
                 z_g = self.feature_learner.feature_net(desired_goal)
                 z_s = self.feature_learner.feature_net(obs)
-
-            z = (z_g - z_s)
         else:
             with torch.no_grad():
-                desired_goal = self.encoder(desired_goal)
-                z_g = self.feature_learner.feature_net(desired_goal)
-                z = z_g
+                obs = self.encoder(obs)
+                z_s = self.feature_learner.feature_net(obs)
+            z_g = phi_goal.view(z_s.shape[0], self.cfg.z_dim)
+        if self.cfg.goal_type == 'delta':
+            z = (z_g - z_s)
+        elif self.cfg.goal_type == 'state':
+            z = z_g
+        else:
+            raise ValueError(f"Invalid goal type: {self.cfg.goal_type}")
         z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
-        # check if there is nan
-        if torch.isnan(z).any():
-            # find the nan
-            nan_idx = torch.isnan(z).any()
-            print(f"z is nan at index {nan_idx}")
-            # nan z_g, z_s
-            nan_z_g = z_g[nan_idx]
-            print(f"nan z_g: {nan_z_g}")
-            print(f"nan goal: {desired_goal[nan_idx]}")
-            try:
-                nan_z_s = z_s[nan_idx]
-                print(f"nan z_s: {nan_z_s}")
-                print(f"nan obs: {obs[nan_idx]}")
-            except:
-                pass
-            raise ValueError("z is nan")
-        z = z.cpu().numpy()
+        z = z.squeeze(0).cpu().numpy()
         meta = OrderedDict()
         meta['z'] = z
         return meta
 
-    def get_traj_meta(self, traj: np.ndarray) -> MetaDict:
-        # traj: (traj_len, obs_dim)
-        assert len(traj.shape) == 2
-        obs = torch.as_tensor(traj).to(self.cfg.device)
-        with torch.no_grad():
-            obs = self.encoder(obs)
-            z = self.feature_learner.feature_net(obs)
-        # calcualte the z_diff by sliding window
-        z_diff = torch.diff(z, dim=0)
-        z_diff = math.sqrt(self.cfg.z_dim) * F.normalize(z_diff, dim=1)
-        return z_diff.cpu().numpy(), z.cpu().numpy()
-
-    def get_z_rewards(self, obs: np.ndarray, next_obs: np.ndarray, z_hilbert: np.ndarray, normalize: bool = True) -> np.ndarray:
-        obs = torch.as_tensor(obs).to(self.cfg.device)
-        next_obs = torch.as_tensor(next_obs).to(self.cfg.device)
-        z_hilbert = torch.as_tensor(z_hilbert).to(self.cfg.device)
-        with torch.no_grad():
-            next_obs = self.encoder(next_obs)
-            z_next_obs = self.feature_learner.feature_net(next_obs)
-            obs = self.encoder(obs)
-            z_obs = self.feature_learner.feature_net(obs)
-            z_diff = z_next_obs - z_obs
-            diff_rewards = torch.einsum('sd, sd -> s', z_diff, z_hilbert)
-            state_rewards = torch.einsum('sd, sd -> s', z_next_obs, z_hilbert)
-        if normalize:
-            diff_rewards = diff_rewards / math.sqrt(self.cfg.z_dim)
-            state_rewards = state_rewards / math.sqrt(self.cfg.z_dim)
-        return diff_rewards.squeeze(0).cpu().numpy(), state_rewards.squeeze(0).cpu().numpy()
-
-    def infer_meta_from_obs_and_rewards(self, obs: torch.Tensor, reward: torch.Tensor, next_obs: torch.Tensor, feat_type: str = 'state'):
+    def infer_meta_from_obs_and_rewards(self, obs: torch.Tensor, reward: torch.Tensor, next_obs: torch.Tensor, feature_type: str = None):
         with torch.no_grad():
             obs = self.encoder(obs)
             next_obs = self.encoder(next_obs)
 
         with torch.no_grad():
-            if feat_type == 'state':
-                phi = self.feature_learner.feature_net(obs)
-            elif feat_type == 'diff':
-                phi = self.feature_learner.feature_net(next_obs) - self.feature_learner.feature_net(obs)
-        z = torch.linalg.lstsq(phi, reward).solution
-        with torch.no_grad():
-            r_vec = reward.view(-1)  # (N,)
-            y_hat = phi @ z  # (N,)
-            resid = r_vec - y_hat
-
-            N, D = phi.shape
-            sse = (resid ** 2).sum()
-            rmse = torch.sqrt((resid ** 2).mean())
-            # 避免除零
-            denom = torch.clamp((r_vec - r_vec.mean()).pow(2).sum(), min=1e-12)
-            r2 = 1.0 - sse / denom
-
-            # 数值稳定性
-            svals = torch.linalg.svdvals(phi)  # (min(N,D),)
-            s_min = torch.clamp_min(svals.min(), 1e-12)
-            cond = (svals.max() / s_min)
-            # 有效秩（基于阈值）
-            rank = int((svals > 1e-6).sum().item())
-
-            # 置信区间（可选；N > D 时有意义）
-            ci_low = None; ci_high = None
-            if N > D:
-                sigma2 = (sse / (N - D)).item()
-                # (ΦᵀΦ)^{-1}
-                xtx = phi.T @ phi
-                cov = sigma2 * torch.linalg.pinv(xtx)
-                se = torch.sqrt(torch.clamp(torch.diag(cov), min=0.0))
-                ci_low = (z - 1.96 * se)
-                ci_high = (z + 1.96 * se)
-
-            diag = {
-                "N": N, "D": D,
-                "SSE": float(sse.item()),
-                "RMSE": float(rmse.item()),
-                "R2": float(r2.item()),
-                "cond": float(cond.item()),
-                "rank": rank,
-            }
-            # 如果你愿意，也可以把 ci 的范数或最大/最小值记录一下：
-            if ci_low is not None:
-                diag.update({
-                    "z_se_max": float(se.max().item()),
-                    "z_se_mean": float(se.mean().item()),
-                })
-        z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=0)
+            x = self.feature_learner.feature_net(obs)
+            xp = self.feature_learner.feature_net(next_obs)
+            r = reward.view(-1)
+        z, diag = fit_goal_latent(
+            x, xp, r,
+            optimizer="lbfgs",       
+            lbfgs_max_iter=200,
+            restarts=8,               
+            use_lstsq_init=True,
+            standardize=True,
+            device=self.cfg.device
+        )
+        # z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=0)
         meta = OrderedDict()
         meta['z'] = z.squeeze().cpu().numpy()
         return meta, diag
@@ -749,37 +580,200 @@ class SFHumanoidOnlineAgent:
         z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
         return z.detach()
 
-    # def init_meta(self) -> MetaDict:
-    #     if self.solved_meta is not None:
-    #         print('solved_meta')
-    #         return self.solved_meta
-    #     else:
-    #         z = self.sample_z(1)
-    #         z = z.squeeze().numpy()
-    #         meta = OrderedDict()
-    #         meta['z'] = z
-    #     return meta
+    def init_meta(self) -> MetaDict:
+        raise NotImplementedError
+        if self.solved_meta is not None:
+            print('solved_meta')
+            return self.solved_meta
+        else:
+            z = self.sample_z(1)
+            z = z.squeeze().numpy()
+            meta = OrderedDict()
+            meta['z'] = z
+        return meta
 
     # pylint: disable=unused-argument
-    # def update_meta(
-    #         self,
-    #         meta: MetaDict,
-    #         global_step: int,
-    #         time_step: TimeStep,
-    #         finetune: bool = False,
-    #         replay_loader: tp.Optional[ReplayBuffer] = None
-    # ) -> MetaDict:
-    #     if global_step % self.cfg.update_z_every_step == 0:
-    #         return self.init_meta()
-    #     return meta
+    def update_meta(
+            self,
+            meta: MetaDict,
+            global_step: int,
+            time_step: TimeStep,
+            finetune: bool = False,
+            replay_loader: tp.Optional[ReplayBuffer] = None
+    ) -> MetaDict:
+        if global_step % self.cfg.update_z_every_step == 0:
+            return self.init_meta()
+        return meta
 
     @torch.no_grad()
-    def act_inference(self, observations, z_vector) -> tp.Any:
-        obs = torch.as_tensor(observations, device=self.cfg.device, dtype=torch.float32)
+    def act(self, obs, meta, step, eval_mode) -> tp.Any:
+        obs = torch.as_tensor(obs, device=self.cfg.device, dtype=torch.float32).unsqueeze(0)  # type: ignore
         h = self.encoder(obs)
-        z = torch.as_tensor(z_vector, device=self.cfg.device)
-        action = self.actor.act_inference(h, z)
-        return action
+        z = torch.as_tensor(meta['z'], device=self.cfg.device).unsqueeze(0)  # type: ignore
+        phi = self.feature_learner.feature_net(h)
+        if self.cfg.boltzmann:
+            dist = self.actor(h, z)
+        else:
+            stddev = utils.schedule(self.cfg.stddev_schedule, step)
+            dist = self.actor(h, z, stddev)
+        if eval_mode:
+            action = dist.mean
+        else:
+            action = dist.sample()
+            if step < self.cfg.num_expl_steps:
+                action.uniform_(-1.0, 1.0)
+        return action.cpu().numpy()[0], phi.detach()
+
+    @torch.no_grad()
+    def act_inference(self, obs, z_actor) -> tp.Any:
+        obs = torch.as_tensor(obs, device=self.cfg.device, dtype=torch.float32)
+        h = self.encoder(obs)
+        z = torch.as_tensor(z_actor, device=self.cfg.device)
+        if self.cfg.boltzmann:
+            dist = self.actor(h, z)
+        else:
+            stddev = utils.schedule(self.cfg.stddev_schedule, step=None)
+            dist = self.actor(h, z, stddev)
+        action = dist.mean
+        return action.cpu().numpy()
+
+    def update_sf(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        discount: torch.Tensor,
+        next_obs: torch.Tensor,
+        future_obs: tp.Optional[torch.Tensor],
+        z: torch.Tensor,
+    ) -> tp.Dict[str, float]:
+        metrics: tp.Dict[str, float] = {}
+        # compute target successor measure
+        with torch.no_grad():
+            if self.cfg.boltzmann:
+                dist = self.actor(next_obs, z)
+                next_action = dist.sample()
+            else:
+                stddev = utils.schedule(self.cfg.stddev_schedule)
+                dist = self.actor(next_obs, z, stddev)
+                next_action = dist.sample(clip=self.cfg.stddev_clip)
+            next_Q1, next_Q2 = self.successor_target_net(next_obs, z, next_action)  # batch x z_dim
+            # target_phi = self.feature_learner.feature_net(next_obs).detach() - self.feature_learner.feature_net(obs).detach()
+            d_s = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(obs)
+            d_next_s = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(next_obs)
+            d_s = torch.norm(d_s, dim=-1)
+            d_next_s = torch.norm(d_next_s, dim=-1)
+            r = d_s - d_next_s
+            next_Q = torch.min(next_Q1, next_Q2)
+            target_Q = r.unsqueeze(-1) + discount * next_Q
+            target_Q = target_Q.detach()
+
+        Q1, Q2 = self.successor_net(obs, z, action)
+        sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
+
+        # compute feature loss
+        if self.cfg.feature_learner == 'hilp':
+            phi_loss, info = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
+        else:
+            phi_loss = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
+            info = {}
+
+        if self.cfg.use_tb or self.cfg.use_wandb:
+            metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
+            metrics['sf_loss'] = sf_loss.item()
+            # metrics["Q_1"] = Q1.mean().item()
+            # metrics["Q_2"] = Q2.mean().item()
+            metrics["next_Q"] = next_Q.mean().item()
+            metrics['r'] = r.mean().item()
+            metrics['r_max'] = r.max().item()
+            metrics['r_min'] = r.min().item()
+            metrics['r_std'] = r.std().item()
+            metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
+            if isinstance(self.sf_opt, torch.optim.Adam):
+                metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]
+            metrics.update(info)
+
+        # optimize SF
+        if self.encoder_opt is not None:
+            self.encoder_opt.zero_grad(set_to_none=True)
+        self.sf_opt.zero_grad(set_to_none=True)
+        if self.phi_opt is not None:
+            self.phi_opt.zero_grad(set_to_none=True)
+            phi_loss.backward(retain_graph=True)
+            self.phi_opt.step()
+
+        sf_loss.backward()
+        self.sf_opt.step()
+        if self.encoder_opt is not None:
+            self.encoder_opt.step()
+
+        return metrics
+
+    def update_actor(self, obs: torch.Tensor, z: torch.Tensor) -> tp.Dict[str, float]:
+        metrics: tp.Dict[str, float] = {}
+        if self.cfg.boltzmann:
+            dist = self.actor(obs, z)
+            action = dist.rsample()
+        else:
+            stddev = utils.schedule(self.cfg.stddev_schedule)
+            dist = self.actor(obs, z, stddev)
+            action = dist.sample(clip=self.cfg.stddev_clip)
+
+        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
+        Q1, Q2 = self.successor_net(obs, z, action)
+        Q = torch.min(Q1, Q2)
+        actor_loss = (self.cfg.temp * log_prob - Q).mean() if self.cfg.boltzmann else -Q.mean()
+
+        # optimize actor
+        self.actor_opt.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        self.actor_opt.step()
+
+        if self.cfg.use_tb or self.cfg.use_wandb:
+            metrics['actor_loss'] = actor_loss.item()
+            metrics['actor_logprob'] = log_prob.mean().item()
+            metrics['Q1'] = Q1.mean().item()
+            metrics['Q2'] = Q2.mean().item()
+            metrics['Q'] = Q.mean().item()
+        return metrics
+
+    def aug_and_encode(self, obs: torch.Tensor) -> torch.Tensor:
+        obs = self.aug(obs)
+        return self.encoder(obs)
+
+    def update(self, replay_loader: ReplayBuffer, step: int) -> tp.Dict[str, float]:
+        metrics: tp.Dict[str, float] = {}
+
+        if step % self.cfg.update_every_steps != 0:
+            return metrics
+
+        for _ in range(self.cfg.num_sf_updates):
+            batch = replay_loader.sample(self.cfg.batch_size)
+            batch = batch.to(self.cfg.device)
+            obs = batch.obs
+            action = batch.action
+            discount = batch.discount
+            next_obs = batch.next_obs
+            future_obs = batch.future_obs
+
+            if not z.shape[-1] == self.cfg.z_dim:
+                raise RuntimeError("There's something wrong with the logic here")
+
+            obs = self.aug_and_encode(obs)
+            next_obs = self.aug_and_encode(next_obs)
+            future_obs = self.aug_and_encode(future_obs)
+            next_obs = next_obs.detach()
+            z = self.sample_z(obs, future_obs, self.cfg.batch_size).to(self.cfg.device)
+
+            metrics.update(self.update_sf(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z=z, step=step))
+
+            # update actor
+            metrics.update(self.update_actor(obs.detach(), z, step))
+
+            # update critic target
+            utils.soft_update_params(self.successor_net, self.successor_target_net, self.cfg.sf_target_tau)
+
+        return metrics
+
 
     def update_policy(
         self,
@@ -789,6 +783,7 @@ class SFHumanoidOnlineAgent:
         next_obs: torch.Tensor,
         future_obs: tp.Optional[torch.Tensor],
         z_actor: torch.Tensor,
+        update_all=False,
     ) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
         # compute target successor measure
@@ -799,7 +794,13 @@ class SFHumanoidOnlineAgent:
                 print(f"next_obs: {next_obs}")
                 print(f"obs: {obs}")
                 raise ValueError("NaN in update_policy")
-            next_action, logp = self.actor.sample_and_logprob(next_obs, z_actor)
+            if self.cfg.boltzmann:
+                dist = self.actor(next_obs, z_actor)
+                next_action = dist.sample()
+            else:
+                stddev = utils.schedule(self.cfg.stddev_schedule)
+                dist = self.actor(next_obs, z_actor, stddev)
+                next_action = dist.sample(clip=self.cfg.stddev_clip)
             next_Q1, next_Q2 = self.successor_target_net(next_obs, z_actor, next_action)  # batch x z_dim
             d_s = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(obs)
             d_next_s = self.feature_learner.feature_net(future_obs) - self.feature_learner.feature_net(next_obs)
@@ -812,33 +813,43 @@ class SFHumanoidOnlineAgent:
 
         Q1, Q2 = self.successor_net(obs, z_actor, action)
         sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
+        if update_all:
+            phi_loss, info = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
+            self.phi_opt.zero_grad(set_to_none=True)
+            phi_loss.backward(retain_graph=True)
+            self.phi_opt.step()
+            metrics.update(info)
         # optimize SF
         if self.encoder_opt is not None:
             self.encoder_opt.zero_grad(set_to_none=True)
         self.sf_opt.zero_grad(set_to_none=True)
         sf_loss.backward()
-        max_norm = torch.nn.utils.clip_grad_norm_(self.successor_net.parameters(), max_norm=1.0)
-        # sf_grad = grad_norm_stats(self.successor_net, prefix='sf')
-        metrics['sf_max_norm'] = max_norm.item()
+        # max_norm = torch.nn.utils.clip_grad_norm_(self.successor_net.parameters(), max_norm=1.0)
+        # metrics['sf_max_norm'] = max_norm.item()
         self.sf_opt.step()
         if self.encoder_opt is not None:
             self.encoder_opt.step()
-            encoder_grad = grad_norm_stats(self.encoder, prefix='encoder')
-            metrics.update(encoder_grad)
 
-        new_action, log_prob = self.actor.sample_and_logprob(obs, z_actor)
+        if self.cfg.boltzmann:
+            dist = self.actor(obs, z_actor)
+            new_action = dist.rsample()
+        else:
+            stddev = utils.schedule(self.cfg.stddev_schedule)
+            dist = self.actor(obs, z_actor, stddev)
+            new_action = dist.sample(clip=self.cfg.stddev_clip)
+        log_prob = dist.log_prob(new_action).sum(-1, keepdim=True)
         Q1_policy, Q2_policy = self.successor_net(obs, z_actor, new_action)
         Q = torch.min(Q1_policy, Q2_policy)
         # alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
         # alpha = self.log_alpha.detach().exp()
-        actor_loss = (log_prob - Q).mean()
+        actor_loss = (self.cfg.temp * log_prob - Q).mean() if self.cfg.boltzmann else -Q.mean()
         if self.cfg.use_tb or self.cfg.use_wandb:
             metrics['actor_loss'] = actor_loss.item()
             metrics['actor_logprob'] = log_prob.mean().item()
             # metrics['alpha_loss'] = alpha_loss.item()
             # metrics['alpha'] = alpha.item()
-            metrics['Q1_policy'] = Q1.mean().item()
-            metrics['Q2_policy'] = Q2.mean().item()
+            metrics['Q1_policy'] = Q1_policy.mean().item()
+            metrics['Q2_policy'] = Q2_policy.mean().item()
             metrics['Q_policy'] = Q.mean().item()
             metrics['z_norm'] = torch.norm(z_actor, dim=-1).mean().item()
             metrics['sf_loss'] = sf_loss.item()
@@ -855,23 +866,14 @@ class SFHumanoidOnlineAgent:
         # optimize actor
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
-        max_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-        metrics['actor_max_norm'] = max_norm.item()
-        # actor_grad = grad_norm_stats(self.actor, prefix='actor')
-        # metrics.update(actor_grad)
+        # max_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+        # metrics['actor_max_norm'] = max_norm.item()
         self.actor_opt.step()
         # optimize alpha
         # self.alpha_opt.zero_grad(set_to_none=True)
         # alpha_loss.backward()
-        # alpha_grad = grad_norm_stats(self.log_alpha, prefix='alpha')
-        # metrics.update(alpha_grad)
         # self.alpha_opt.step()
-
         return metrics
-
-    def aug_and_encode(self, obs: torch.Tensor) -> torch.Tensor:
-        obs = self.aug(obs)
-        return self.encoder(obs)
 
     def update_phi(self, batch: EpisodeBatch) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
@@ -893,17 +895,25 @@ class SFHumanoidOnlineAgent:
         metrics.update(info)
         return metrics
 
-
-    def update_batch(self, batch: EpisodeBatch) -> tp.Dict[str, float]:
+    def update_batch(self, batch: EpisodeBatch, update_all=False) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
-        batch = batch.to(self.cfg.device)
-        obs = batch.obs
-        action = batch.action
-        discount = batch.discount
-        if len(discount.shape) == 1:
-            discount = discount.unsqueeze(1)
-        next_obs = batch.next_obs
-        future_obs = batch.future_obs
+        if isinstance(batch, EpisodeBatch):
+            batch = batch.to(self.cfg.device)
+            obs = batch.obs
+            action = batch.action
+            discount = batch.discount
+            if len(discount.shape) == 1:
+                discount = discount.unsqueeze(1)
+            next_obs = batch.next_obs
+            future_obs = batch.future_obs
+        else:
+            obs = batch['obs'].to(self.cfg.device, dtype=torch.float32)
+            action = batch['action'].to(self.cfg.device, dtype=torch.float32)
+            discount = batch['discount'].to(self.cfg.device, dtype=torch.float32)
+            if len(discount.shape) == 1:
+                discount = discount.unsqueeze(1)
+            next_obs = batch['next_obs'].to(self.cfg.device, dtype=torch.float32)
+            future_obs = batch['future_obs'].to(self.cfg.device, dtype=torch.float32)
 
         obs = self.aug_and_encode(obs)
         next_obs = self.aug_and_encode(next_obs)
@@ -913,85 +923,8 @@ class SFHumanoidOnlineAgent:
         z_actor = self.sample_z(obs, future_obs, obs.shape[0])
         z_actor = z_actor.to(self.cfg.device)
 
-        metrics.update(self.update_policy(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z_actor=z_actor))
+        metrics.update(self.update_policy(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z_actor=z_actor, update_all=update_all))
         utils.soft_update_params(self.successor_net, self.successor_target_net, self.cfg.sf_target_tau)
         return metrics
 
-
-@torch.no_grad()
-def grad_norm_stats(
-    model: torch.nn.Module,
-    prefix: str,
-    norm_type: float = 2.0,
-    only_requires_grad: bool = True,
-) -> Dict[str, Any]:
-    """
-    统计当前已计算的梯度的范数信息。
-    - global_norm: 所有参数梯度拼接后的整体 p-范数（p=norm_type）
-    - max_per_param_norm: 每个参数张量梯度的 p-范数中的最大值
-    - max_abs_grad: 所有梯度条目中的最大绝对值（∞-范数层面）
-    注意：若使用混合精度且用了 GradScaler，请在调用前先对优化器 unscale：
-        scaler.unscale_(optimizer)
-    Args:
-        model: 含有 .named_parameters() 的模块
-        norm_type: 范数类型，常用 2.0 或 np.inf
-        include_per_param: 是否返回每个参数的范数字典（可能略慢）
-        only_requires_grad: 只考虑 requires_grad=True 的参数
-
-    Returns:
-        dict，键包括：
-            global_norm, max_per_param_norm, max_abs_grad
-    """
-    if isinstance(norm_type, float) and math.isinf(norm_type):
-        norm_type = float('inf')
-
-    # max_per_param = 0.0
-    # max_abs_grad = 0.0
-
-    # 按 p-范数聚合得到 global_norm
-    # p == inf 时：global = max(abs(grad))
-    # 否则：global = (sum(|g|^p))^(1/p)
-    if norm_type == float('inf'):
-        global_accum: Optional[torch.Tensor] = None  # 标量张量：当前最大值
-    else:
-        global_accum = torch.zeros((), device=next(model.parameters()).device)
-
-    for name, p in model.named_parameters():
-        if only_requires_grad and not p.requires_grad:
-            continue
-        g = p.grad
-        if g is None:
-            continue
-
-        # 每参数的 p-范数
-        if norm_type == float('inf'):
-            # param_norm = g.detach().abs().max().item()
-            # 更新 global_accum
-            cur_max = g.detach().abs().max()
-            global_accum = cur_max if global_accum is None else torch.maximum(global_accum, cur_max)
-        else:
-            # torch.linalg.vector_norm 在新版本更好；兼容性用 torch.norm
-            # param_norm = torch.norm(g.detach(), p=norm_type).item()
-            # 累加 |g|^p
-            global_accum = global_accum + torch.sum(g.detach().abs().pow(norm_type))
-
-        # # 追踪最大 per-param 范数
-        # if param_norm > max_per_param:
-        #     max_per_param = float(param_norm)
-
-        # 追踪最大绝对梯度条目（无关 p）
-        # max_abs_grad = max(max_abs_grad, g.detach().abs().max().item())
-
-    # 汇总 global norm
-    if norm_type == float('inf'):
-        global_norm = float(global_accum.item() if global_accum is not None else 0.0)
-    else:
-        global_norm = float(global_accum.pow(1.0 / norm_type).item())
-
-    out = {
-        f"{prefix}_global_norm": global_norm,
-        # f"{prefix}_max_per_param_norm": max_per_param,
-        # f"{prefix}_max_abs_grad": max_abs_grad,
-    }
-    return out
-
+        

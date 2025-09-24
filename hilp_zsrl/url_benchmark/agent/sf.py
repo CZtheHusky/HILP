@@ -13,11 +13,11 @@ import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 import omegaconf
 
-from url_benchmark import utils
-from url_benchmark.in_memory_replay_buffer import ReplayBuffer
+from url_benchmark.utils import utils
+from url_benchmark.dataset_utils.in_memory_replay_buffer import ReplayBuffer, EpisodeBatch
 from .ddpg import MetaDict, make_aug_encoder
 from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, mlp, OnlineCov
-from url_benchmark.dmc import TimeStep
+from url_benchmark.dmc_utils.dmc import TimeStep
 
 
 logger = logging.getLogger(__name__)
@@ -701,8 +701,6 @@ class SFAgent:
             metrics['next_F_norm'] = torch.norm(next_F, dim=-1).mean().item()
             metrics['target_F_std'] = target_F.std().item()  # 目标的方差
             metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
-            if phi_loss is not None:
-                metrics['phi_loss'] = phi_loss.item()
 
             if isinstance(self.sf_opt, torch.optim.Adam):
                 metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]
@@ -819,4 +817,166 @@ class SFAgent:
             # update critic target
             utils.soft_update_params(self.successor_net, self.successor_target_net, self.cfg.sf_target_tau)
 
+        return metrics
+
+    def update_policy(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        discount: torch.Tensor,
+        next_obs: torch.Tensor,
+        future_obs: tp.Optional[torch.Tensor],
+        z_actor: torch.Tensor,
+        update_all=False,
+    ) -> tp.Dict[str, float]:
+        metrics: tp.Dict[str, float] = {}
+        # compute target successor measure
+        with torch.no_grad():
+            if torch.isnan(z_actor).any() or torch.isnan(next_obs).any() or torch.isnan(obs).any():
+                print("NaN in update_policy")
+                print(f"z_actor: {z_actor}")
+                print(f"next_obs: {next_obs}")
+                print(f"obs: {obs}")
+                raise ValueError("NaN in update_policy")
+            if self.cfg.boltzmann:
+                dist = self.actor(next_obs, z_actor)
+                next_action = dist.sample()
+            else:
+                stddev = utils.schedule(self.cfg.stddev_schedule)
+                dist = self.actor(next_obs, z_actor, stddev)
+                next_action = dist.sample(clip=self.cfg.stddev_clip)
+            next_F1, next_F2 = self.successor_target_net(next_obs, z_actor, next_action)  # batch x z_dim
+            if self.cfg.feature_type == 'state':
+                target_phi = self.feature_learner.feature_net(next_obs).detach()  # batch x z_dim
+            elif self.cfg.feature_type == 'diff':
+                target_phi = self.feature_learner.feature_net(next_obs).detach() - self.feature_learner.feature_net(obs).detach()
+            else:
+                target_phi = torch.cat([self.feature_learner.feature_net(obs).detach(), self.feature_learner.feature_net(next_obs).detach()], dim=-1)
+            next_Q1, next_Q2 = [torch.einsum('sd, sd -> s', next_Fi, z_actor) for next_Fi in [next_F1, next_F2]]
+            next_F = torch.where((next_Q1 < next_Q2).reshape(-1, 1), next_F1, next_F2)
+            target_F = target_phi + discount * next_F
+
+        F1, F2 = self.successor_net(obs, z_actor, action)
+        if self.cfg.q_loss:
+            Q1, Q2 = [torch.einsum('sd, sd -> s', Fi, z_actor) for Fi in [F1, F2]]
+            target_Q = torch.einsum('sd, sd -> s', target_F, z_actor)
+            sf_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
+        else:
+            sf_loss = F.mse_loss(F1, target_F) + F.mse_loss(F2, target_F)
+        if update_all:
+            phi_loss, info = self.feature_learner(obs=obs, action=action, next_obs=next_obs, future_obs=future_obs)
+            self.phi_opt.zero_grad(set_to_none=True)
+            phi_loss.backward(retain_graph=True)
+            self.phi_opt.step()
+            metrics.update(info)
+        # optimize SF
+        if self.encoder_opt is not None:
+            self.encoder_opt.zero_grad(set_to_none=True)
+        self.sf_opt.zero_grad(set_to_none=True)
+        sf_loss.backward()
+        # max_norm = torch.nn.utils.clip_grad_norm_(self.successor_net.parameters(), max_norm=1.0)
+        # metrics['sf_max_norm'] = max_norm.item()
+        self.sf_opt.step()
+        if self.encoder_opt is not None:
+            self.encoder_opt.step()
+
+        if self.cfg.boltzmann:
+            dist = self.actor(obs, z_actor)
+            new_action = dist.rsample()
+        else:
+            stddev = utils.schedule(self.cfg.stddev_schedule)
+            dist = self.actor(obs, z_actor, stddev)
+            new_action = dist.sample(clip=self.cfg.stddev_clip)
+        log_prob = dist.log_prob(new_action).sum(-1, keepdim=True)
+        F1_actor, F2_actor = self.successor_net(obs, z_actor, new_action)
+        Q1_actor = torch.einsum('sd, sd -> s', F1_actor, z_actor)
+        Q2_actor = torch.einsum('sd, sd -> s', F2_actor, z_actor)
+        Q_actor = torch.min(Q1_actor, Q2_actor)
+        # alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
+        # alpha = self.log_alpha.detach().exp()
+        actor_loss = (self.cfg.temp * log_prob - Q_actor).mean() if self.cfg.boltzmann else -Q_actor.mean()
+        if self.cfg.use_tb or self.cfg.use_wandb:
+            metrics['target_F'] = target_F.mean().item()
+            metrics['F1'] = F1.mean().item()
+            metrics['F2'] = F2.mean().item()
+            metrics['phi'] = target_phi.mean().item()
+            metrics['phi_norm'] = torch.norm(target_phi, dim=-1).mean().item()
+            metrics['z_norm'] = torch.norm(z_actor, dim=-1).mean().item()
+            metrics['actor_loss'] = actor_loss.item()
+            metrics['actor_logprob'] = log_prob.mean().item()
+            # metrics['alpha_loss'] = alpha_loss.item()
+            # metrics['alpha'] = alpha.item()
+            metrics['Q1_actor'] = Q1_actor.mean().item()
+            metrics['Q2_actor'] = Q2_actor.mean().item()
+            metrics['Q_actor'] = Q_actor.mean().item()
+            metrics['z_norm'] = torch.norm(z_actor, dim=-1).mean().item()
+            metrics['sf_loss'] = sf_loss.item()
+            metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
+            metrics['Q1_critic'] = Q1.mean().item()
+            metrics['Q2_critic'] = Q2.mean().item()
+            metrics['Q_target'] = target_Q.mean().item()
+            if isinstance(self.sf_opt, torch.optim.Adam):
+                metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]
+        # optimize actor
+        self.actor_opt.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        # max_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+        # metrics['actor_max_norm'] = max_norm.item()
+        self.actor_opt.step()
+        # optimize alpha
+        # self.alpha_opt.zero_grad(set_to_none=True)
+        # alpha_loss.backward()
+        # self.alpha_opt.step()
+        return metrics
+
+    def update_phi(self, batch: EpisodeBatch) -> tp.Dict[str, float]:
+        metrics: tp.Dict[str, float] = {}
+        
+        obs = batch["obs"].to(self.cfg.device)
+        # action = batch['actions'].to(self.cfg.device)
+        next_obs = batch['next_obs'].to(self.cfg.device)
+        future_obs = batch['future_obs'].to(self.cfg.device)
+
+        obs = self.aug_and_encode(obs)
+        next_obs = self.aug_and_encode(next_obs)
+        future_obs = self.aug_and_encode(future_obs)
+        next_obs = next_obs.detach()
+
+        phi_loss, info = self.feature_learner(obs=obs, action=None, next_obs=next_obs, future_obs=future_obs)
+        self.phi_opt.zero_grad(set_to_none=True)
+        phi_loss.backward()
+        self.phi_opt.step()
+        metrics.update(info)
+        return metrics
+
+    def update_batch(self, batch: EpisodeBatch, update_all=False) -> tp.Dict[str, float]:
+        metrics: tp.Dict[str, float] = {}
+        if isinstance(batch, EpisodeBatch):
+            batch = batch.to(self.cfg.device)
+            obs = batch.obs
+            action = batch.action
+            discount = batch.discount
+            if len(discount.shape) == 1:
+                discount = discount.unsqueeze(1)
+            next_obs = batch.next_obs
+            future_obs = batch.future_obs
+        else:
+            obs = batch['obs'].to(self.cfg.device, dtype=torch.float32)
+            action = batch['action'].to(self.cfg.device, dtype=torch.float32)
+            discount = batch['discount'].to(self.cfg.device, dtype=torch.float32)
+            if len(discount.shape) == 1:
+                discount = discount.unsqueeze(1)
+            next_obs = batch['next_obs'].to(self.cfg.device, dtype=torch.float32)
+            future_obs = batch['future_obs'].to(self.cfg.device, dtype=torch.float32)
+
+        obs = self.aug_and_encode(obs)
+        next_obs = self.aug_and_encode(next_obs)
+        future_obs = self.aug_and_encode(future_obs)
+        next_obs = next_obs.detach()
+
+        z_actor = self.sample_z(obs, future_obs, obs.shape[0])
+        z_actor = z_actor.to(self.cfg.device)
+
+        metrics.update(self.update_policy(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z_actor=z_actor, update_all=update_all))
+        utils.soft_update_params(self.successor_net, self.successor_target_net, self.cfg.sf_target_tau)
         return metrics

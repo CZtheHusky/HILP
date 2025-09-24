@@ -56,20 +56,20 @@ import omegaconf as omgcf
 
 import torch
 from dm_env import specs
-from url_benchmark import utils
+from url_benchmark.utils import utils
 from url_benchmark import agent as agents
 from gym import spaces
 from isaacgym import gymapi
-from url_benchmark.legged_gym_env_utils import build_isaac_namespace, _to_rgb_frame
+from url_benchmark.utils.legged_gym_env_utils import build_isaac_namespace, _to_rgb_frame
 from collections import defaultdict
-from url_benchmark.replay_buffer import DataBuffer
-from url_benchmark.phi_pretrain_dataset import PhiDataset
-from url_benchmark.dataset_utils import InfiniteDataLoaderWrapper
+from url_benchmark.dataset_utils.replay_buffer import DataBuffer
+from url_benchmark.dataset_utils.phi_pretrain_dataset import PhiDataset
+from url_benchmark.dataset_utils.utils import InfiniteDataLoaderWrapper
 from torch.utils.data import DataLoader
 # pbar import
 import datetime
-from url_benchmark.humanoid_utils import _safe_set_viewer_cam, get_cosine_sim, collect_nonzero_losses, calc_phi_loss_upper, calc_z_vector_matrixes, plot_matrix_heatmaps, compute_global_color_limits, plot_tripanel_heatmaps_with_line, plot_per_step_z
-from url_benchmark.in_memory_hum_buffer import StepReplayBuffer, EpisodeBatch, ReplaySchema
+from url_benchmark.utils.humanoid_utils import _safe_set_viewer_cam, get_cosine_sim, collect_nonzero_losses, calc_phi_loss_upper, calc_z_vector_matrixes, plot_matrix_heatmaps, compute_global_color_limits, plot_tripanel_heatmaps_with_line, plot_per_step_z
+from url_benchmark.dataset_utils.in_memory_hum_buffer import StepReplayBuffer, EpisodeBatch, ReplaySchema
 from tqdm import trange
 from collections import deque
 
@@ -147,7 +147,7 @@ ConfigStore.instance().store(name="workspace_config", node=Config)
 
 def make_agent(
         obs_type: str, obs_spec, action_spec: int, cfg: omgcf.DictConfig
-) -> tp.Union[agents.SFHumanoidOnlineAgent]:
+) -> tp.Union[agents.SFV2OnlineAgent]:
     """利用 Hydra 配置实例化 agent，并注入观测/动作规格与探索步数。"""
     cfg.obs_type = obs_type
     cfg.obs_shape = obs_spec.shape
@@ -437,21 +437,21 @@ class Workspace:
     def train_phi(self, is_init: bool = False):
         print("Training Phi")
         self.prepare_phi_dataset()
-        metrics_summon = defaultdict(list)
+        # metrics_summon = defaultdict(list)
         train_steps = self.cfg.phi_net_pretrain_steps
         pbar = trange(train_steps, desc="Training Phi", position=1, leave=True)
         self.agent.feature_learner.train()
         for batch in self.phi_dataloader:
             metrics = self.agent.update_phi(batch)
-            for k, v in metrics.items():
-                metrics_summon[k].append(v)
-            if (self.phi_step + 1) % self.cfg.log_every_steps == 0:
-                self.update_train_metrics(metrics_summon)
-                metrics_summon = defaultdict(list)
+            # for k, v in metrics.items():
+            #     metrics_summon[k].append(v)
+            # if (self.phi_step + 1) % self.cfg.log_every_steps == 0:
+            self.update_train_metrics(metrics)
+                # metrics_summon = defaultdict(list)
             self.phi_step += 1
             self.global_step += 1
             pbar.update(1)
-            pbar.set_description(f"Local, Phi Loss: {metrics['phi_loss']:.4f}")
+            pbar.set_description(f"Local, Phi Loss: {metrics['hilp/value_loss']:.4f}")
             self.global_progress_bar.update(1)
             self.global_progress_bar.set_description(f"Global,Training Phi")
             if self.phi_step % train_steps == 0:
@@ -483,7 +483,7 @@ class Workspace:
             for ep in episodes:
                 self.replay_buffer.add_episode(ep["data"], ep["meta"])
             if self.replay_buffer.num_steps >= self.cfg.minimal_train_buffer_size:
-                metrics_summon = defaultdict(list)
+                # metrics_summon = defaultdict(list)
                 self.replay_buffer._candidate_indices()
                 for _ in range(self.cfg.sac_optim_steps):
                     sac_batch = self.replay_buffer.sample(self.cfg.batch_size)
@@ -492,21 +492,18 @@ class Workspace:
                     self.global_step += 1
                     self.global_progress_bar.update(1)
                     self.global_progress_bar.set_description(f"Global, SAC Training")
-                    for k, v in metrics.items():
-                        metrics_summon[k].append(v)
+                    # for k, v in metrics.items():
+                    #     metrics_summon[k].append(v)
+                    metrics['collection_mean_len'] = collection_mean_len[-1]
+                    metrics['replay_buffer_steps'] = self.replay_buffer.num_steps
+                    self.update_train_metrics(metrics)
                     if self.policy_step % self.cfg.save_every_steps == 0:
                         _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
                         self.save_checkpoint(_checkpoint_filepath)
                     if self.policy_step % self.cfg.rollout_every_steps == 0:
                         policy_phi_dataloader.close_loader()
                         return
-                metrics_summon['collection_mean_len'] = np.mean(collection_mean_len)
-                metrics_summon['replay_buffer_steps'] = self.replay_buffer.num_steps
-                metrics_summon['phi_dataset_ep_num'] = self.phi_dataset.meta_info['valid_episodes_num']
-                self.update_train_metrics(metrics_summon)
         return 
-                
-                
 
     def train(self):
         if self.cfg.eval_only:
@@ -720,8 +717,8 @@ class Workspace:
             episodes, mean_len = self._collect_episode(random_sample=True)
             collection_mean_len.append(mean_len)
             pbar.update(1)
-            pbar.set_description(f"Steps: {len(self.replay_buffer)}, EP len: {mean_len}")
-            self.phi_dataset._collect_and_save(episodes)
+            pbar.set_description(f"Steps: {len(self.phi_dataset)}, EP len: {mean_len}")
+            self.phi_dataset.add_episodes(episodes)
         self.phi_dataset._in_memory_finalize()
         dataloader_cfg = {
             "batch_size": self.cfg.batch_size,
@@ -731,7 +728,12 @@ class Workspace:
         self.phi_dataloader = InfiniteDataLoaderWrapper(self.phi_dataset, dataloader_cfg)
         end_time = time.time()
         if self.cfg.use_wandb:
-            wandb.log({f"train/phi_dataset_time": end_time - start_time, 'train/phi_collection_mean_len': np.mean(collection_mean_len)}, step=self.global_step)
+            wandb.log(
+                {f"train/phi_dataset_time": end_time - start_time, 
+                'train/phi_collection_mean_len': np.mean(collection_mean_len), 
+                "phi_dataset_ep_num": self.phi_dataset.meta_info['current_size']}, 
+                step=self.global_step
+            )
         else:
             print(f"train/phi_dataset_time: {end_time - start_time}")
 

@@ -16,7 +16,7 @@ for fp in [base, base / "url_benchmark"]:
     assert fp.exists()
     if str(fp) not in sys.path:
         sys.path.append(str(fp))
-from url_benchmark.legged_gym_env_utils import _make_eval_env, _to_rgb_frame
+from url_benchmark.utils.legged_gym_env_utils import _make_eval_env, _to_rgb_frame
 import os
 import logging
 import dataclasses
@@ -34,9 +34,9 @@ from hydra.core.config_store import ConfigStore
 import wandb
 from tqdm import tqdm
 
-from url_benchmark import utils
-from url_benchmark.hilbert_dataset import HugWBCSLDataset
-from url_benchmark.hugwbc_policy_network import create_hugwbc_policy, create_hugwbc_critic
+from url_benchmark.utils import utils
+from url_benchmark.dataset_utils.hilbert_dataset import HugWBCSLDataset
+from url_benchmark.hugwbc_models.hugwbc_policy_network import create_hugwbc_policy, create_hugwbc_critic
 from isaacgym import gymapi
 import imageio.v2 as imageio
 from collections import defaultdict

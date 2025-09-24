@@ -227,7 +227,7 @@ class SquashedNormal(pyd.transformed_distribution.TransformedDistribution):
         return mu
 
 
-def schedule(schdl, step) -> float:
+def schedule(schdl, step=None) -> float:
     try:
         return float(schdl)
     except ValueError:
