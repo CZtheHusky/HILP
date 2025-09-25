@@ -373,6 +373,7 @@ class PhiWalkerDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         if self.random_sample:
+            # print("Random sampling, size: ", len(self))
             idx = np.random.randint(0, len(self))
         ep_idx = idx // self.valid_len
         assert ep_idx < self.num_episodes

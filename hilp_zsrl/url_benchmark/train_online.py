@@ -128,10 +128,10 @@ class Config:
     load_model: tp.Optional[str] = None
     # training
     sac_optim_steps: int = 50
-    phi_net_pretrain_steps: int = 40000
+    phi_net_pretrain_steps: int = 50000
     num_workers: int = 2
-    rollout_every_steps: int = 20000
-    save_every_steps: int = 20000
+    rollout_every_steps: int = 50000
+    save_every_steps: int = 50000
     phi_total_episodes: int = 100000
     phi_rollout_num: int = 100
     num_train_envs: int = 100
@@ -139,7 +139,7 @@ class Config:
     log_every_steps: int = 1000
     num_seed_frames: int = 0
     replay_buffer_episodes: int = 100000
-    replay_buffer_init_size: int = 5000
+    replay_buffer_init_size: int = 10000
     update_encoder: bool = True
     batch_size: int = omgcf.II("agent.batch_size")
     goal_eval: bool = False
@@ -258,7 +258,7 @@ class Workspace:
                                 self.train_env.action_space,
                                 cfg.num_seed_frames // cfg.action_repeat,
                                 cfg.agent)
-
+        self.cfg['work_dir'] = self.work_dir
         if cfg.use_wandb:
             exp_name = ''
             exp_name += f'sd{cfg.seed:03d}_'
@@ -370,7 +370,7 @@ class Workspace:
         elif not self.cfg.resume_from.endswith('phi_pretrained_tmp.pt'):
             self.train_phi(is_init=False)
         while True:
-            self.eval_sum()
+            self.eval_sum(self.replay_loader)
             self.train_policy()
             self.train_phi()
             if self.global_step >= self.cfg.num_grad_steps:
@@ -571,15 +571,22 @@ class Workspace:
         fp = Path(fp)
         fp.parent.mkdir(exist_ok=True, parents=True)
         # this is just a dumb security check to not forget about it
-        payload = {k: self.__dict__[k] for k in self._CHECKPOINTED_KEYS if k not in exclude}
+        payload = {}
+        for k in self._CHECKPOINTED_KEYS:
+            if k not in exclude:
+                if k in self.__dict__:
+                    payload[k] = self.__dict__[k]
+                else:
+                    print("Warning: %s not found in __dict__" % k)
         with fp.open('wb') as f:
             torch.save(payload, f, pickle_protocol=4)
         # remove older checkpoints that is older than 20 checkpoints
         models_dir = os.path.join(self.work_dir, "models")
-        models = os.listdir(models_dir)
-        models.sort(key=lambda x: int(x.split('.')[0]))
-        for model in models[:-20]:
-            os.remove(os.path.join(models_dir, model))
+        if os.path.exists(models_dir):
+            models = os.listdir(models_dir)
+            models.sort(key=lambda x: int(x.split('.')[0]))
+            for model in models[:-20]:
+                os.remove(os.path.join(models_dir, model))
 
     def load_checkpoint(self, fp: tp.Union[Path, str], only: tp.Optional[tp.Sequence[str]] = None, exclude: tp.Sequence[str] = (), num_episodes=None, use_pixels=False) -> None:
         print(f"loading checkpoint from {fp}")
@@ -748,6 +755,13 @@ class Workspace:
         }
         t = 0
         z = self.agent.sample_z(obs=phi_obs, future_obs=phi_future_obs, size=self.cfg.num_train_envs, random_sample=random_sample)
+        if z.shape[0] < self.cfg.num_train_envs:
+            delta_num = self.cfg.num_train_envs - z.shape[0]
+            d = z.shape[1]
+            z_r = torch.randn((delta_num, d), dtype=torch.float32, device=z.device)
+            z_r = math.sqrt(d) * F.normalize(z_r, dim=1)
+            z = torch.cat([z, z_r], axis=0)
+
         while t < self.cfg.num_episode_steps:
             # Random actions by default; integrate policy here if desired
             # actions = np.random.uniform(low=act_low, high=act_high, size=(num_envs,) + act_shape).astype(np.float32)

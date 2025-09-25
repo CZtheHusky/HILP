@@ -32,6 +32,7 @@ from hydra.core.config_store import ConfigStore
 import torch
 import wandb
 import omegaconf as omgcf
+from url_benchmark.dataset_utils.phi_pretrain_dataset import PhiWalkerDataset
 from url_benchmark.dataset_utils.utils import InfiniteDataLoaderWrapper
 from url_benchmark.utils import utils
 from url_benchmark.utils.video import VideoRecorder
@@ -73,8 +74,8 @@ class OnlineSyncConfig(Config):
     checkpoint_every: int = 100000
     load_model: tp.Optional[str] = None
     # training
-    phi_update_ration: int = 1
-    optim_steps: int = 50
+    phi_update_ratio: int = 1
+    optim_steps: int = 1000
     num_workers: int = 0
     eval_every_steps: int = 40000
     save_every_steps: int = 40000
@@ -164,6 +165,18 @@ class OnlineSyncWorkspace(Workspace):
             self.load_checkpoint(self._checkpoint_filepath)
         elif cfg.load_model is not None:
             self.load_checkpoint(cfg.load_model, exclude=["replay_loader"])
+
+    def init_phi_dataset(self):
+        if not hasattr(self, 'phi_dataset'):       
+            self.phi_dataset = PhiWalkerDataset(
+                data_dir=os.path.join(self.work_dir, "phi_dataset"),
+                obs_horizon=self.cfg.agent.obs_horizon,
+                total_episodes=self.cfg.phi_total_episodes,
+                discount=self.cfg.discount,
+                goal_future=self.cfg.future,
+                p_randomgoal=self.cfg.p_randomgoal,
+                random_sample=True,
+            )
     
     def train(self):
         if self.cfg.eval_only:
@@ -172,36 +185,38 @@ class OnlineSyncWorkspace(Workspace):
         self.global_progress_bar = trange(self.cfg.num_grad_steps, position=0, initial=self.global_step, leave=True, desc="Training Global")
         if not hasattr(self, 'phi_dataloader'):
             self.prepare_phi_dataset(is_init=True)
+            assert self.phi_dataset.random_sample, "Random sampling is required for phi dataset"
         while True:
-            self.eval_sum(self.phi_dataset)
+            # self.eval_sum(self.phi_dataset)
             self.train_policy()
             if self.global_step >= self.cfg.num_grad_steps:
                 print("Training completed.")
                 break
 
+    
+
     def train_policy(self):
-        for batch in self.phi_dataloader:
-            phi_obs = batch['obs'].to(self.cfg.device)
-            phi_future_obs = batch['future_obs'].to(self.cfg.device)
-            episodes = self._collect_episodes(random_sample=False, phi_obs=phi_obs[:self.cfg.num_train_envs], phi_future_obs=phi_future_obs[:self.cfg.num_train_envs])
-            self.phi_dataset.add_episodes(episodes, self.cfg.num_train_envs)
-            self.global_progress_bar.set_description(f"Training, Dataset Steps: {len(self.phi_dataset)}")
-            if self.phi_dataset.num_episodes > self.cfg.replay_buffer_init_size:
-                for optim_step in range(self.cfg.optim_steps):
-                    metrics = {}
-                    if optim_step % self.cfg.phi_update_ration == 0:
-                        metrics = self.agent.update_phi(batch)
-                    metrics.update(self.agent.update_batch(batch))
-                    self.global_progress_bar.update(1)
-                    self.global_progress_bar.set_description(f"Training, Dataset Steps: {len(self.phi_dataset)}")
-                    metrics['phi_dataset_steps'] = len(self.phi_dataset)
-                    self.update_train_metrics(metrics)
-                    self.global_step += 1
-                    if self.global_step % self.cfg.save_every_steps == 0:
-                        _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
-                        self.save_checkpoint(_checkpoint_filepath)
-                    if self.global_step % self.cfg.eval_every_steps == 0:
-                        return
+        for idx, batch in enumerate(self.phi_dataloader):
+            if self.phi_dataset.num_episodes <= self.cfg.replay_buffer_init_size or idx % self.cfg.optim_steps == 0:
+                phi_obs = batch['obs'].to(self.cfg.device)
+                phi_future_obs = batch['future_obs'].to(self.cfg.device)
+                episodes = self._collect_episodes(random_sample=False, phi_obs=phi_obs[:self.cfg.num_train_envs//2], phi_future_obs=phi_future_obs[:self.cfg.num_train_envs//2])
+                self.phi_dataset.add_episodes(episodes, self.cfg.num_train_envs)
+            else:
+                metrics = {}
+                if idx % self.cfg.phi_update_ratio == 0:
+                    metrics = self.agent.update_phi(batch)
+                metrics.update(self.agent.update_batch(batch))
+                self.global_progress_bar.update(1)
+                self.global_progress_bar.set_description(f"Training, Dataset Steps: {len(self.phi_dataset)}")
+                metrics['phi_dataset_steps'] = len(self.phi_dataset)
+                self.update_train_metrics(metrics)
+                self.global_step += 1
+                if self.global_step % self.cfg.save_every_steps == 0:
+                    _checkpoint_filepath = os.path.join(self.work_dir, "models", f"{self.global_step}.pt")
+                    self.save_checkpoint(_checkpoint_filepath)
+                if self.global_step % self.cfg.eval_every_steps == 0:
+                    return
 
 @hydra.main(config_path='.', config_name='base_config')
 def main(cfg: omgcf.DictConfig) -> None:
