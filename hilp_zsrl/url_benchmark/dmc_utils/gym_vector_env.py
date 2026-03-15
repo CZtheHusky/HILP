@@ -75,9 +75,20 @@ class DMCGymEnv(gymnasium.Env):  # type: ignore
 
     def render(self):  # type: ignore
         try:
-            return self._env.render(height=256, width=256, camera_id=0)
-        except Exception:
-            return None
+            if hasattr(self._env, 'physics'):
+                if self._env.physics is not None:
+                    frame = self._env.physics.render(height=96,
+                                                width=96,
+                                                camera_id=0)
+                else:
+                    frame = self._env.base_env.render()
+            else:
+                frame = self._env.render()
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc())
+            raise e
+        return np.asarray(frame)
 
     def close(self):  # type: ignore
         return None

@@ -38,6 +38,7 @@ from url_benchmark.utils.video import VideoRecorder
 from tqdm import trange
 from url_benchmark.dmc_utils.gym_vector_env import make_gym_async_vectorized
 from url_benchmark.train_online import Config, Workspace, make_agent
+from url_benchmark.dmc_utils.gym_vector_env import _spec_to_space
 
 @dataclasses.dataclass
 class RDSConfig(Config):
@@ -102,7 +103,10 @@ ConfigStore.instance().store(name="workspace_config", node=RDSConfig)
 class RDSWorkspace(Workspace):
     def __init__(self, cfg: RDSConfig) -> None:
         if cfg.resume_from is not None:
-            self.work_dir = Path(cfg.resume_from)
+            if cfg.resume_from.endswith('.pt'):
+                self.work_dir = Path(cfg.resume_from).parent.parent
+            else:
+                self.work_dir = Path(cfg.resume_from)
         else:
             self.work_dir = Path.cwd()
         print(f'Workspace: {self.work_dir}')
@@ -121,24 +125,23 @@ class RDSWorkspace(Workspace):
 
         task = cfg.task
         self.domain = task.split('_', maxsplit=1)[0]
-
-        self.train_env = make_gym_async_vectorized(
-            name=self.cfg.task,
-            num_envs=self.cfg.num_train_envs,
-            obs_type=self.cfg.obs_type,
-            frame_stack=self.cfg.frame_stack,
-            action_repeat=self.cfg.action_repeat,
-            seed=self.cfg.seed,
-            image_wh=self.cfg.image_wh,
-        )
+        if not self.cfg.eval_only:
+            self.train_env = make_gym_async_vectorized(
+                name=self.cfg.task,
+                num_envs=self.cfg.num_train_envs,
+                obs_type=self.cfg.obs_type,
+                frame_stack=self.cfg.frame_stack,
+                action_repeat=self.cfg.action_repeat,
+                seed=self.cfg.seed,
+                image_wh=self.cfg.image_wh,
+            )
 
         self.eval_env = self._make_env()
         # create agent
-        # self.train_env.reset()
         self.agent = make_agent(cfg.obs_type,
                                 cfg.image_wh,
-                                self.train_env.observation_space,
-                                self.train_env.action_space,
+                                _spec_to_space(self.eval_env.observation_spec()),
+                                _spec_to_space(self.eval_env.action_spec()),
                                 cfg.num_seed_frames // cfg.action_repeat,
                                 cfg.agent)
 
@@ -167,20 +170,33 @@ class RDSWorkspace(Workspace):
         self.policy_step = 0
         self.global_step = 0
         self.eval_rewards_history: tp.List[float] = []
-        self._checkpoint_filepath = self.work_dir / "models" / "latest.pt"
-        if self._checkpoint_filepath.exists():
-            self.load_checkpoint(self._checkpoint_filepath)
-        elif cfg.load_model is not None:
-            self.load_checkpoint(cfg.load_model, exclude=["phi_dataset"])
+        # self._checkpoint_filepath = self.work_dir / "models" / "latest.pt"
+        # if self._checkpoint_filepath.exists():
+        #     self.load_checkpoint(self._checkpoint_filepath)
+        # elif cfg.load_model is not None:
+        #     self.load_checkpoint(cfg.load_model)
+        if cfg.resume_from is not None:
+            if cfg.resume_from.endswith('.pt'):
+                self._checkpoint_filepath = cfg.resume_from
+            else:
+                ckpt_path = self.work_dir / "models"
+                models = [filen for filen in os.listdir(ckpt_path) if filen.endswith('.pt')]
+                if len(models) == 1 and "latest" in models[0]:
+                    self._checkpoint_filepath = os.path.join(self.work_dir, "models", "latest.pt")
+                else:
+                    models.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                    self._checkpoint_filepath = os.path.join(self.work_dir, "models", models[-1])
+            if os.path.exists(self._checkpoint_filepath):
+                self.load_checkpoint(self._checkpoint_filepath)
 
     
     def train(self):
+        if not hasattr(self, 'phi_dataloader'):
+            self.prepare_phi_dataset(is_init=True)
         if self.cfg.eval_only:
             self.eval_sum(self.phi_dataset)
             return
         self.global_progress_bar = trange(self.cfg.num_grad_steps, position=0, initial=self.global_step, leave=True, desc="Training Global")
-        if not hasattr(self, 'phi_dataloader'):
-            self.prepare_phi_dataset(is_init=True)
         while True:
             self.eval_sum(self.phi_dataset)
             self.train_policy()
@@ -213,6 +229,7 @@ class RDSWorkspace(Workspace):
             "batch_size": self.cfg.batch_size,
             "shuffle": True,
             "num_workers": self.cfg.num_workers,
+            "drop_last": True,
         }
         self.phi_dataloader = InfiniteDataLoaderWrapper(self.phi_dataset, dataloader_cfg)
         end_time = time.time()

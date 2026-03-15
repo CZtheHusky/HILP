@@ -469,6 +469,7 @@ class Workspace:
             "batch_size": self.cfg.num_train_envs,
             "shuffle": True,
             "num_workers": self.cfg.num_workers,
+            "drop_last": True,
         }
         if hasattr(self, "phi_dataset"):
             policy_phi_dataloader = InfiniteDataLoaderWrapper(self.phi_dataset, loader_cfg)
@@ -724,6 +725,7 @@ class Workspace:
             "batch_size": self.cfg.batch_size,
             "shuffle": True,
             "num_workers": self.cfg.num_workers,
+            "drop_last": True,
         }
         self.phi_dataloader = InfiniteDataLoaderWrapper(self.phi_dataset, dataloader_cfg)
         end_time = time.time()

@@ -53,11 +53,47 @@ def _pred_diff_norm(z: torch.Tensor, x: torch.Tensor, xp: torch.Tensor, eps: flo
     d2 = torch.sqrt(((z - xp) ** 2).sum(dim=1) + eps)
     return d1 - d2
 
+def _loss(
+    z: torch.Tensor,
+    x: torch.Tensor,
+    xp: torch.Tensor,
+    r: torch.Tensor,
+    lam_z: float,
+    eps: float,
+    idx: np.ndarray,
+    *,
+    calibrate: Literal["none", "scale", "affine"] = "none",
+    a_param: Optional[torch.Tensor] = None,
+    b_param: Optional[torch.Tensor] = None,
+    lam_a: float = 0.0,
+    lam_b: float = 0.0,
+):
+    core = _pred_diff_norm(z, x[idx], xp[idx], eps)
+    if calibrate == "none":
+        pred = core
+        a = None
+        b = None
+    elif calibrate == "scale":
+        assert a_param is not None
+        pred = a_param * core
+        a = a_param
+        b = None
+    elif calibrate == "affine":
+        assert a_param is not None and b_param is not None
+        pred = a_param * core + b_param
+        a = a_param
+        b = b_param
+    else:
+        raise ValueError(f"Unknown calibrate mode: {calibrate}")
 
-def _loss(z, x, xp, r, lam, eps, idx):
-    pred = _pred_diff_norm(z, x[idx], xp[idx], eps)
     mse = torch.mean((r[idx] - pred) ** 2)
-    reg = lam * torch.sum(z ** 2)
+    reg = lam_z * torch.sum(z ** 2)
+    if a is not None and lam_a > 0:
+        # Prior: a ~ 1.0
+        reg = reg + lam_a * (a - 1.0) ** 2
+    if b is not None and lam_b > 0:
+        # Prior: b ~ 0.0
+        reg = reg + lam_b * (b ** 2)
     return mse + reg, mse
 
 
@@ -93,6 +129,17 @@ def fit_goal_latent(
     use_lstsq_init: bool = True,
     seed: int = 0,
     device: Optional[str] = None,
+    calibrate: Literal["none", "scale", "affine"] = "none",
+    ensure_positive_scale: bool = True,
+    lam_a: float = 1e-4,
+    lam_b: float = 1e-4,
+    # sign-consistency control
+    enforce_sign_consistency: bool = True,
+    sign_ref: Optional[Literal["r", "core"]] = "r",
+    sign_penalty: float = 1,
+    # hard bound on bias (optional)
+    bound_bias: bool = False,
+    max_bias_abs: float = 1.0,
 ) -> FitReport:
     """
     拟合 latent goal z* 使得  r ≈ ||z-phi(s)|| - ||z-phi(s')||  的 MSE 最小。
@@ -103,6 +150,11 @@ def fit_goal_latent(
     r         : (N,)    target rewards
     optimizer : "lbfgs" 适合中小N；"adam" 支持大N（mini-batch）
     restarts  : 多重重启，取验证集最优
+    calibrate : 是否对模型进行尺度/偏置校准。
+                - "none": 使用原始模型 r ~ core
+                - "scale": 学习比例 a，使 r ~ a * core
+                - "affine": 学习比例 a 与偏置 b，使 r ~ a * core + b
+    ensure_positive_scale: 若为 True，则用 softplus 参数化 a>=0。
     """
     assert x.shape == x_next.shape
     N, d = x.shape
@@ -135,6 +187,8 @@ def fit_goal_latent(
         "method": "direct_norm",
         "optimizer": optimizer,
         "restart": -1,
+        "a": None,
+        "b": None,
     }
 
     # 生成初始化
@@ -147,16 +201,88 @@ def fit_goal_latent(
     for _ in range(max(0, restarts - len(z0_list))):
         z0_list.append(torch.randn(d, device=device) * 0.1)
 
+    def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
+        # inverse of softplus for y>0: x = log(exp(y) - 1)
+        return torch.log(torch.expm1(y.clamp_min(1e-8)))
+
     for k, z0 in enumerate(z0_list):
         z = torch.nn.Parameter(z0.clone())
+
+        # Optional calibration parameters
+        a_param: Optional[torch.nn.Parameter] = None
+        b_param: Optional[torch.nn.Parameter] = None
+        # Prepare initial core prediction on train to initialize a,b via OLS
+        with torch.no_grad():
+            core_train0 = _pred_diff_norm(z, x_use[train_idx], xp_use[train_idx], eps)
+            r_train = r_t[train_idx]
+            # Centering can stabilize OLS when using affine
+            if calibrate == "affine":
+                X0 = torch.stack([core_train0, torch.ones_like(core_train0)], dim=1)  # [N,2]
+                sol = torch.linalg.lstsq(X0, r_train.unsqueeze(1)).solution.squeeze(1)
+                a0 = sol[0].item()
+                b0 = sol[1].item()
+            elif calibrate == "scale":
+                denom = torch.dot(core_train0, core_train0).item()
+                num = torch.dot(core_train0, r_train).item()
+                a0 = num / (denom + 1e-12)
+                b0 = 0.0
+            else:
+                a0, b0 = 1.0, 0.0
+
+        params = [z]
+        if calibrate in ("scale", "affine"):
+            if ensure_positive_scale:
+                a_raw0 = float(_inv_softplus(torch.tensor(max(a0, 1e-8))).item())
+                a_param = torch.nn.Parameter(torch.tensor(a_raw0, dtype=torch.float32, device=device))
+                a_effective = torch.nn.functional.softplus(a_param)
+            else:
+                a_param = torch.nn.Parameter(torch.tensor(a0, dtype=torch.float32, device=device))
+                a_effective = a_param
+            params.append(a_param)
+        if calibrate == "affine":
+            if bound_bias:
+                # Parameterize b via tanh to enforce |b| <= max_bias_abs
+                b_raw0 = np.arctanh(np.clip(b0 / (max_bias_abs + 1e-12), -0.999999, 0.999999)) if max_bias_abs > 0 else 0.0
+                b_raw = torch.tensor(b_raw0, dtype=torch.float32, device=device)
+                b_param = torch.nn.Parameter(b_raw)
+            else:
+                b_param = torch.nn.Parameter(torch.tensor(b0, dtype=torch.float32, device=device))
+            params.append(b_param)
+
         if optimizer == "lbfgs":
-            opt = torch.optim.LBFGS([z], lr=lbfgs_lr, max_iter=lbfgs_max_iter, line_search_fn="strong_wolfe")
+            opt = torch.optim.LBFGS(params, lr=lbfgs_lr, max_iter=lbfgs_max_iter, line_search_fn="strong_wolfe")
 
             itercount = {"n": 0}
 
             def closure():
                 opt.zero_grad(set_to_none=True)
-                loss, _ = _loss(z, x_use, xp_use, r_t, lam, eps, train_idx)
+                # Map a_raw->a if needed
+                if calibrate in ("scale", "affine") and ensure_positive_scale:
+                    a_use = torch.nn.functional.softplus(a_param)
+                elif calibrate in ("scale", "affine"):
+                    a_use = a_param
+                else:
+                    a_use = None
+                # map b if bounded
+                b_use = b_param
+                if calibrate == "affine" and bound_bias and b_param is not None:
+                    b_use = max_bias_abs * torch.tanh(b_param)
+                loss, _ = _loss(
+                    z, x_use, xp_use, r_t, lam, eps, train_idx,
+                    calibrate=calibrate,
+                    a_param=a_use,
+                    b_param=b_use,
+                    lam_a=lam_a,
+                    lam_b=lam_b,
+                )
+                # sign consistency penalty
+                if enforce_sign_consistency and calibrate != "none":
+                    core_train = _pred_diff_norm(z, x_use[train_idx], xp_use[train_idx], eps)
+                    pred_train = core_train if calibrate == "none" else (a_use * core_train + (b_use if calibrate == "affine" else 0.0))
+                    ref = r_t[train_idx] if sign_ref == "r" else core_train
+                    # penalize sign mismatches
+                    sign_mismatch = torch.relu(-(pred_train * ref))  # >0 when signs opposite
+                    loss = loss + sign_penalty * torch.mean(sign_mismatch)
                 loss.backward()
                 itercount["n"] += 1
                 return loss
@@ -164,9 +290,28 @@ def fit_goal_latent(
             opt.step(closure)
 
             with torch.no_grad():
-                _, train_mse = _loss(z, x_use, xp_use, r_t, lam=0.0, eps=eps, idx=train_idx)
+                # Compute metrics with calibration
+                if calibrate in ("scale", "affine") and ensure_positive_scale:
+                    a_use = torch.nn.functional.softplus(a_param)
+                elif calibrate in ("scale", "affine"):
+                    a_use = a_param
+                else:
+                    a_use = None
+                b_use = b_param
+                if calibrate == "affine" and bound_bias and b_param is not None:
+                    b_use = max_bias_abs * torch.tanh(b_param)
+                _, train_mse = _loss(
+                    z, x_use, xp_use, r_t, lam_z=0.0, eps=eps, idx=train_idx,
+                    calibrate=calibrate, a_param=a_use, b_param=b_use,
+                )
                 if has_val:
-                    pred_val = _pred_diff_norm(z, x_use[val_idx], xp_use[val_idx], eps)
+                    core_val = _pred_diff_norm(z, x_use[val_idx], xp_use[val_idx], eps)
+                    if calibrate == "none":
+                        pred_val = core_val
+                    elif calibrate == "scale":
+                        pred_val = a_use * core_val
+                    else:
+                        pred_val = a_use * core_val + (b_use if b_use is not None else 0.0)
                     val_mse = torch.mean((r_t[val_idx] - pred_val) ** 2)
                 else:
                     val_mse = train_mse
@@ -175,11 +320,18 @@ def fit_goal_latent(
             val_mse_f = float(val_mse.detach().cpu())
 
             if val_mse_f < best["val_mse"]:
-                best.update({"val_mse": val_mse_f, "train_mse": train_mse_f, "z_std": z.detach().clone(),
-                             "iters": itercount["n"], "restart": k})
+                best.update({
+                    "val_mse": val_mse_f,
+                    "train_mse": train_mse_f,
+                    "z_std": z.detach().clone(),
+                    "iters": itercount["n"],
+                    "restart": k,
+                    "a": (torch.nn.functional.softplus(a_param).item() if (a_param is not None and ensure_positive_scale) else (a_param.item() if a_param is not None else None)),
+                    "b": ((max_bias_abs * torch.tanh(b_param)).item() if (b_param is not None and bound_bias) else (b_param.item() if b_param is not None else None)),
+                })
 
         elif optimizer == "adam":
-            opt = torch.optim.Adam([z], lr=adam_lr)
+            opt = torch.optim.Adam(params, lr=adam_lr)
             iters = 0
             for epoch in range(adam_epochs):
                 # mini-batch over train_idx
@@ -188,15 +340,58 @@ def fit_goal_latent(
                 for bs in range(0, len(perm), batch_size):
                     idx = perm[bs:bs + batch_size]
                     opt.zero_grad(set_to_none=True)
-                    loss, _ = _loss(z, x_use, xp_use, r_t, lam, eps, idx)
+                    # Map a_raw->a if needed
+                    if calibrate in ("scale", "affine") and ensure_positive_scale:
+                        a_use = torch.nn.functional.softplus(a_param)
+                    elif calibrate in ("scale", "affine"):
+                        a_use = a_param
+                    else:
+                        a_use = None
+                    b_use = b_param
+                    if calibrate == "affine" and bound_bias and b_param is not None:
+                        b_use = max_bias_abs * torch.tanh(b_param)
+                    loss, _ = _loss(
+                        z, x_use, xp_use, r_t, lam, eps, idx,
+                        calibrate=calibrate, a_param=a_use, b_param=b_use, lam_a=lam_a, lam_b=lam_b,
+                    )
+                    if enforce_sign_consistency and calibrate != "none":
+                        core_mb = _pred_diff_norm(z, x_use[idx], xp_use[idx], eps)
+                        pred_mb = core_mb if calibrate == "none" else (a_use * core_mb + (b_use if calibrate == "affine" else 0.0))
+                        ref = r_t[idx] if sign_ref == "r" else core_mb
+                        sign_mismatch = torch.relu(-(pred_mb * ref))
+                        loss = loss + sign_penalty * torch.mean(sign_mismatch)
                     loss.backward()
                     opt.step()
                     iters += 1
 
             with torch.no_grad():
-                _, train_mse = _loss(z, x_use, xp_use, r_t, lam=0.0, eps=eps, idx=train_idx)
+                if calibrate in ("scale", "affine") and ensure_positive_scale:
+                    a_use = torch.nn.functional.softplus(a_param)
+                elif calibrate in ("scale", "affine"):
+                    a_use = a_param
+                else:
+                    a_use = None
+                if calibrate in ("scale", "affine") and ensure_positive_scale:
+                    a_use = torch.nn.functional.softplus(a_param)
+                elif calibrate in ("scale", "affine"):
+                    a_use = a_param
+                else:
+                    a_use = None
+                b_use = b_param
+                if calibrate == "affine" and bound_bias and b_param is not None:
+                    b_use = max_bias_abs * torch.tanh(b_param)
+                _, train_mse = _loss(
+                    z, x_use, xp_use, r_t, lam_z=0.0, eps=eps, idx=train_idx,
+                    calibrate=calibrate, a_param=a_use, b_param=b_use,
+                )
                 if has_val:
-                    pred_val = _pred_diff_norm(z, x_use[val_idx], xp_use[val_idx], eps)
+                    core_val = _pred_diff_norm(z, x_use[val_idx], xp_use[val_idx], eps)
+                    if calibrate == "none":
+                        pred_val = core_val
+                    elif calibrate == "scale":
+                        pred_val = a_use * core_val
+                    else:
+                        pred_val = a_use * core_val + (b_use if b_use is not None else 0.0)
                     val_mse = torch.mean((r_t[val_idx] - pred_val) ** 2)
                 else:
                     val_mse = train_mse
@@ -204,8 +399,15 @@ def fit_goal_latent(
             train_mse_f = float(train_mse.detach().cpu())
             val_mse_f = float(val_mse.detach().cpu())
             if val_mse_f < best["val_mse"]:
-                best.update({"val_mse": val_mse_f, "train_mse": train_mse_f, "z_std": z.detach().clone(),
-                             "iters": iters, "restart": k})
+                best.update({
+                    "val_mse": val_mse_f,
+                    "train_mse": train_mse_f,
+                    "z_std": z.detach().clone(),
+                    "iters": iters,
+                    "restart": k,
+                    "a": (torch.nn.functional.softplus(a_param).item() if (a_param is not None and ensure_positive_scale) else (a_param.item() if a_param is not None else None)),
+                    "b": ((max_bias_abs * torch.tanh(b_param)).item() if (b_param is not None and bound_bias) else (b_param.item() if b_param is not None else None)),
+                })
         else:
             raise ValueError(f"Unknown optimizer: {optimizer}")
 
@@ -223,7 +425,15 @@ def fit_goal_latent(
         z_real = z_std
         z_std = None
 
-    return z_real, {"train_mse": best["train_mse"], "val_mse": best["val_mse"] if has_val else None, "iters": best["iters"], "restart": best["restart"]}
+    return z_real, {
+        "train_mse": best["train_mse"],
+        "val_mse": best["val_mse"] if has_val else None,
+        "iters": best["iters"],
+        "restart": best["restart"],
+        "scale": best["a"],
+        "bias": best["b"],
+        "calibrate": calibrate,
+    }
     # FitReport(
     #     z_star=z_real_np,
     #     train_mse=best["train_mse"],

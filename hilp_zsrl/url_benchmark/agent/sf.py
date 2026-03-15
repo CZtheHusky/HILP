@@ -179,6 +179,12 @@ class HILP(FeatureLearner):
 
         with torch.no_grad():
             phi1 = self.phi1(obs)
+            phi_feature = phi1 - self.running_mean
+            phi_feature = torch.norm(phi_feature, dim=-1)
+            phi_max = phi_feature.max()
+            phi_min = phi_feature.min()
+            phi_mean = phi_feature.mean()
+            phi_std = phi_feature.std()
             self.running_mean = 0.995 * self.running_mean + 0.005 * phi1.mean(dim=0)
             self.running_std = 0.995 * self.running_std + 0.005 * phi1.std(dim=0)
 
@@ -192,6 +198,10 @@ class HILP(FeatureLearner):
             'hilp/adv_max': adv.max().item(),
             'hilp/adv_min': adv.min().item(),
             'hilp/accept_prob': (adv >= 0).float().mean().item(),
+            'hilp/phi_norm': phi_mean.mean().item(),
+            'hilp/phi_std': phi_std.mean().item(),
+            'hilp/phi_max': phi_max.item(),
+            'hilp/phi_min': phi_min.item(),
         }
 
 
@@ -434,8 +444,8 @@ class SFAgent:
     def __init__(self, **kwargs: tp.Any):
         cfg = SFAgentConfig(**kwargs)
         self.cfg = cfg
-        assert len(cfg.action_shape) == 1
-        self.action_dim = cfg.action_shape[0]
+        # assert len(cfg.action_shape) == 1
+        self.action_dim = cfg.action_shape[-1]
         self.solved_meta: tp.Any = None
 
         # models
@@ -445,7 +455,7 @@ class SFAgent:
         else:
             self.aug = nn.Identity()
             self.encoder = nn.Identity()
-            self.obs_dim = cfg.obs_shape[0]
+            self.obs_dim = cfg.obs_shape[-1]
         if cfg.feature_learner == "identity":
             cfg.z_dim = self.obs_dim
             self.cfg.z_dim = self.obs_dim
@@ -524,12 +534,16 @@ class SFAgent:
         with torch.no_grad():
             z_g = self.feature_learner.feature_net(desired_goal)
             z_s = self.feature_learner.feature_net(obs)
-
-        z = (z_g - z_s)
+        if self.cfg.feature_type == 'state':
+            z = z_g
+        elif self.cfg.feature_type == 'diff':
+            z = z_g - z_s
+        z_raw = z.clone()
         z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
         z = z.squeeze(0).cpu().numpy()
         meta = OrderedDict()
         meta['z'] = z
+        meta['z_raw'] = z_raw.squeeze(0).cpu().numpy()
         return meta
 
     def infer_meta_from_obs_and_rewards(self, obs: torch.Tensor, reward: torch.Tensor, next_obs: torch.Tensor, feature_type: str = None):
@@ -545,6 +559,7 @@ class SFAgent:
             else:
                 phi = torch.cat([self.feature_learner.feature_net(obs), self.feature_learner.feature_net(next_obs)], dim=-1)
         z = torch.linalg.lstsq(phi, reward).solution
+        z_raw = z.clone()
         with torch.no_grad():
             r_vec = reward.view(-1)  # (N,)
             y_hat = phi @ z  # (N,)
@@ -592,6 +607,7 @@ class SFAgent:
         z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=0)
         meta = OrderedDict()
         meta['z'] = z.squeeze().cpu().numpy()
+        meta['z_raw'] = z_raw.squeeze().cpu().numpy()
         return meta, diag
 
     def sample_z(self, size):
@@ -909,12 +925,8 @@ class SFAgent:
             metrics['Q1_actor'] = Q1_actor.mean().item()
             metrics['Q2_actor'] = Q2_actor.mean().item()
             metrics['Q_actor'] = Q_actor.mean().item()
-            metrics['z_norm'] = torch.norm(z_actor, dim=-1).mean().item()
             metrics['sf_loss'] = sf_loss.item()
             metrics['Q1_Q2_diff'] = torch.abs(next_Q1 - next_Q2).mean().item()  # 双网络差异
-            metrics['Q1_critic'] = Q1.mean().item()
-            metrics['Q2_critic'] = Q2.mean().item()
-            metrics['Q_target'] = target_Q.mean().item()
             if isinstance(self.sf_opt, torch.optim.Adam):
                 metrics["sf_opt_lr"] = self.sf_opt.param_groups[0]["lr"]
         # optimize actor
@@ -974,9 +986,62 @@ class SFAgent:
         future_obs = self.aug_and_encode(future_obs)
         next_obs = next_obs.detach()
 
-        z_actor = self.sample_z(obs, future_obs, obs.shape[0])
+        z_actor = self.sample_z(obs.shape[0])
         z_actor = z_actor.to(self.cfg.device)
+
+        if self.cfg.mix_ratio > 0:
+            perm = torch.randperm(obs.shape[0])
+            with torch.no_grad():
+                if self.cfg.feature_type == 'state':
+                    desired_obs = next_obs[perm]
+                    phi = self.feature_learner.feature_net(desired_obs)
+                elif self.cfg.feature_type == 'diff':
+                    desired_obs = obs[perm]
+                    desired_next_obs = next_obs[perm]
+                    phi = self.feature_learner.feature_net(desired_next_obs) - self.feature_learner.feature_net(desired_obs)
+                else:
+                    desired_obs = obs[perm]
+                    desired_next_obs = next_obs[perm]
+                    phi = torch.cat([self.feature_learner.feature_net(desired_obs), self.feature_learner.feature_net(desired_next_obs)], dim=-1)
+            # compute inverse of cov of phi
+            cov = torch.matmul(phi.T, phi) / phi.shape[0]
+            inv_cov = torch.linalg.pinv(cov)
+
+            mix_idxs: tp.Any = np.where(np.random.uniform(size=self.cfg.batch_size) < self.cfg.mix_ratio)[0]
+            with torch.no_grad():
+                new_z = phi[mix_idxs]
+
+            new_z = torch.matmul(new_z, inv_cov)  # batch_size x z_dim
+            new_z = math.sqrt(self.cfg.z_dim) * F.normalize(new_z, dim=1)
+            try:
+                z_actor[mix_idxs] = new_z
+            except Exception as e:
+                print(f"z shape: {z_actor.shape}")
+                print(f"mix_idxs max : {np.max(mix_idxs)}")
+                print(f"mix_idxs min : {np.min(mix_idxs)}")
+                print(f"new_z shape: {new_z.shape}")
+                print(f"Error in mix_idxs: {mix_idxs}")
+                print(f"Error in new_z: {new_z}")
+                print(f"Error in z_actor: {z_actor}")
+                raise e
 
         metrics.update(self.update_policy(obs=obs, action=action, discount=discount, next_obs=next_obs, future_obs=future_obs, z_actor=z_actor, update_all=update_all))
         utils.soft_update_params(self.successor_net, self.successor_target_net, self.cfg.sf_target_tau)
         return metrics
+
+    @torch.no_grad()
+    def act_inference(self, obs, z_actor) -> tp.Any:
+        obs = torch.as_tensor(obs, device=self.cfg.device, dtype=torch.float32)
+        h = self.encoder(obs)
+        z = torch.as_tensor(z_actor, device=self.cfg.device)
+        if self.cfg.boltzmann:
+            dist = self.actor(h, z)
+        else:
+            stddev = utils.schedule(self.cfg.stddev_schedule, step=None)
+            dist = self.actor(h, z, stddev)
+        action = dist.mean
+        return action.cpu().numpy()
+
+    @torch.no_grad()
+    def evaluation(self, env_func, env_kwargs, replay_loader, num_episodes):
+        pass

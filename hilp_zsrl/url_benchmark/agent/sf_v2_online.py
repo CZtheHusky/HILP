@@ -70,6 +70,8 @@ class SFV2OnlineAgentConfig:
     goal_type: str = "delta"  # 'delta', 'state'
     hilp_discount: float = 0.98
     hilp_expectile: float = 0.5
+    fit_standardize: bool = False
+    fit_calibrate: str = 'affine'  # "none", "scale", "affine"
 
 
 cs = ConfigStore.instance()
@@ -154,6 +156,7 @@ class HILP(FeatureLearner):
         weight = torch.where(adv >= 0, expectile, (1 - expectile))
         return weight * (diff ** 2)
 
+
     def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
         goals = future_obs
         rewards = (torch.linalg.norm(obs - goals, dim=-1) < 1e-6).float()
@@ -182,6 +185,12 @@ class HILP(FeatureLearner):
 
         with torch.no_grad():
             phi1 = self.phi1(obs)
+            phi_feature = phi1 - self.running_mean
+            phi_feature = torch.norm(phi_feature, dim=-1)
+            phi_max = phi_feature.max()
+            phi_min = phi_feature.min()
+            phi_mean = phi_feature.mean()
+            phi_std = phi_feature.std()
             self.running_mean = 0.995 * self.running_mean + 0.005 * phi1.mean(dim=0)
             self.running_std = 0.995 * self.running_std + 0.005 * phi1.std(dim=0)
 
@@ -195,8 +204,11 @@ class HILP(FeatureLearner):
             'hilp/adv_max': adv.max().item(),
             'hilp/adv_min': adv.min().item(),
             'hilp/accept_prob': (adv >= 0).float().mean().item(),
+            'hilp/phi_norm': phi_mean.mean().item(),
+            'hilp/phi_std': phi_std.mean().item(),
+            'hilp/phi_max': phi_max.item(),
+            'hilp/phi_min': phi_min.item(),
         }
-
 
 class Laplacian(FeatureLearner):
     def forward(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, future_obs: torch.Tensor):
@@ -539,10 +551,12 @@ class SFV2OnlineAgent:
             z = z_g
         else:
             raise ValueError(f"Invalid goal type: {self.cfg.goal_type}")
+        z_raw = z.clone()
         z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
         z = z.squeeze(0).cpu().numpy()
         meta = OrderedDict()
         meta['z'] = z
+        meta['z_raw'] = z_raw.squeeze(0).cpu().numpy()
         return meta
 
     def infer_meta_from_obs_and_rewards(self, obs: torch.Tensor, reward: torch.Tensor, next_obs: torch.Tensor, feature_type: str = None):
@@ -560,12 +574,15 @@ class SFV2OnlineAgent:
             lbfgs_max_iter=200,
             restarts=8,               
             use_lstsq_init=True,
-            standardize=True,
+            standardize=self.cfg.fit_standardize,
+            calibrate=self.cfg.fit_calibrate,
             device=self.cfg.device
         )
-        # z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=0)
+        z_raw = z.clone()
+        z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=0)
         meta = OrderedDict()
         meta['z'] = z.squeeze().cpu().numpy()
+        meta['z_raw'] = z_raw.squeeze().cpu().numpy()
         return meta, diag
 
     @torch.no_grad()

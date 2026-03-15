@@ -1,6 +1,6 @@
 import platform
 import os
-
+from dm_control.suite.wrappers import action_scale
 if 'mac' in platform.platform():
     pass
 else:
@@ -15,12 +15,14 @@ for fp in [base, base / "url_benchmark"]:
     assert fp.exists()
     if str(fp) not in sys.path:
         sys.path.append(str(fp))
+import math
 import shutil
 import time
 import logging
 import torch
 import warnings
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 logger = logging.getLogger(__name__)
 torch.backends.cudnn.benchmark = True
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -31,7 +33,6 @@ from collections import deque
 import tempfile
 import typing as tp
 from pathlib import Path
-import math
 import torch.nn.functional as F
 import hydra
 from hydra.core.config_store import ConfigStore
@@ -53,6 +54,36 @@ from tqdm import trange
 import traceback
 from url_benchmark.utils.humanoid_utils import _safe_set_viewer_cam, get_cosine_sim, collect_nonzero_losses, calc_phi_loss_upper, calc_z_vector_matrixes, plot_matrix_heatmaps, compute_global_color_limits, plot_tripanel_heatmaps_with_line, plot_per_step_z
 from url_benchmark.dmc_utils.gym_vector_env import make_gym_async_vectorized
+
+def generate_cosine_variant(phi_goal: np.ndarray, cos_target: float, device: str = 'cuda') -> tp.Tuple[torch.Tensor, torch.Tensor]:
+    base_tensor = torch.as_tensor(phi_goal, dtype=torch.float32, device=device)
+    norm = torch.norm(base_tensor)
+    if norm < 1e-8:
+        # Degenerate input: fall back to a fixed direction and return a valid (phi_goal, z_actor)
+        fallback = torch.zeros_like(base_tensor)
+        if fallback.numel() > 0:
+            fallback.view(-1)[0] = 1.0
+        z_actor = math.sqrt(fallback.shape[-1]) * F.normalize(fallback, dim=-1)
+        return fallback, z_actor
+    unit_base = base_tensor / norm
+    if abs(abs(cos_target) - 1.0) < 1e-6:
+        base_tensor = base_tensor * (1.0 if cos_target >= 0 else -1.0)
+        z_actor = math.sqrt(base_tensor.shape[-1]) * F.normalize(base_tensor, dim=-1)
+        return base_tensor, z_actor
+    ortho = torch.randn_like(base_tensor)
+    ortho -= torch.dot(ortho, unit_base) * unit_base
+    ortho_norm = torch.norm(ortho)
+    if ortho_norm < 1e-8:
+        ortho = torch.zeros_like(base_tensor)
+        ortho[0] = 1.0
+        ortho -= torch.dot(ortho, unit_base) * unit_base
+        ortho_norm = torch.norm(ortho)
+    ortho_unit = ortho / ortho_norm
+    sin_component = math.sqrt(max(0.0, 1.0 - cos_target ** 2))
+    rotated = cos_target * unit_base + sin_component * ortho_unit
+    phi_goal = rotated * norm
+    z_actor = math.sqrt(phi_goal.shape[-1]) * F.normalize(phi_goal, dim=-1)
+    return phi_goal, z_actor
 
 def rescale_to_unit_range(data_list):
     """Rescale each episode's data to [0, 1] range for comparison"""
@@ -147,6 +178,7 @@ class Config:
     replay_buffer_dir: str = omgcf.SI("../../../../datasets")
     resume_from: tp.Optional[str] = None
     eval_only: bool = False
+    extensive_eval: bool = False
 
 
 ConfigStore.instance().store(name="workspace_config", node=Config)
@@ -189,7 +221,7 @@ class DmcReward(BaseReward):
 
 def make_agent(
         obs_type: str, image_wh, obs_spec, action_spec, num_expl_steps: int, cfg: omgcf.DictConfig
-) -> tp.Union[agents.SFV2OnlineAgent]:
+) -> tp.Union[agents.SFV2OnlineAgent, agents.SFAgent]:
     cfg.obs_type = obs_type
     cfg.image_wh = image_wh
     cfg.obs_shape = obs_spec.shape
@@ -212,14 +244,17 @@ def _init_eval_meta(workspace, replay_loader, custom_reward: BaseReward = None, 
         batch_size += batch.next_obs.size(0)
     obs, reward, next_obs = torch.cat(obs_list, 0), torch.cat(reward_list, 0), torch.cat(next_obs_list, 0)
     obs_t, reward_t, next_obs_t = obs[:num_steps], reward[:num_steps], next_obs[:num_steps]
-    return workspace.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t, feature_type)
+    return workspace.agent.infer_meta_from_obs_and_rewards(obs_t, reward_t, next_obs_t)
 
 
 class Workspace:
     _CHECKPOINTED_KEYS = ('agent', 'global_step', 'phi_step', "policy_step")
     def __init__(self, cfg: Config) -> None:
         if cfg.resume_from is not None:
-            self.work_dir = Path(cfg.resume_from)
+            if cfg.resume_from.endswith('.pt'):
+                self.work_dir = Path(cfg.resume_from).parent.parent
+            else:
+                self.work_dir = Path(cfg.resume_from)
         else:
             self.work_dir = Path.cwd()
         print(f'Workspace: {self.work_dir}')
@@ -258,7 +293,6 @@ class Workspace:
                                 self.train_env.action_space,
                                 cfg.num_seed_frames // cfg.action_repeat,
                                 cfg.agent)
-        self.cfg['work_dir'] = self.work_dir
         if cfg.use_wandb:
             exp_name = ''
             exp_name += f'sd{cfg.seed:03d}_'
@@ -270,8 +304,10 @@ class Workspace:
                 cfg.run_group, cfg.agent.name, self.domain,
             ])
             wandb_output_dir = tempfile.mkdtemp()
+            config_dict = omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+            config_dict['work_dir'] = self.work_dir
             wandb.init(project='hilp_zsrl', group=cfg.run_group, name=exp_name,
-                       config=omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
+                       config=config_dict,
                        dir=wandb_output_dir)
 
         self.replay_loader = ReplayBuffer(p_currgoal=cfg.p_currgoal, p_randomgoal=cfg.p_randomgoal, max_episodes=cfg.replay_buffer_episodes, discount=cfg.discount, future=cfg.future, dummy_steps=0, is_mismatched=False)
@@ -287,11 +323,19 @@ class Workspace:
         self.policy_step = 0
         self.global_step = 0
         self.eval_rewards_history: tp.List[float] = []
-        self._checkpoint_filepath = self.work_dir / "models" / "latest.pt"
-        if self._checkpoint_filepath.exists():
-            self.load_checkpoint(self._checkpoint_filepath)
-        elif cfg.load_model is not None:
-            self.load_checkpoint(cfg.load_model, exclude=["replay_loader"])
+        if cfg.resume_from is not None:
+            if cfg.resume_from.endswith('.pt'):
+                self._checkpoint_filepath = cfg.resume_from
+            else:
+                ckpt_path = self.work_dir / "models"
+                models = [filen for filen in os.listdir(ckpt_path) if filen.endswith('.pt')]
+                if len(models) == 1 and "latest" in models[0]:
+                    self._checkpoint_filepath = os.path.join(self.work_dir, "models", "latest.pt")
+                else:
+                    models.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                    self._checkpoint_filepath = os.path.join(self.work_dir, "models", models[-1])
+            if os.path.exists(self._checkpoint_filepath):
+                self.load_checkpoint(self._checkpoint_filepath)
 
         self.replay_loader._frame_stack = cfg.frame_stack if cfg.obs_type == 'pixels' else None
 
@@ -344,33 +388,48 @@ class Workspace:
 
 
     def eval_sum(self, replay_loader):
-        try:
-            self.potential_eval(replay_loader, 'random')
-        except Exception as e:
-            print("Potential eval failed: random")
-            print(traceback.format_exc())
-        try:
-            self.potential_eval(replay_loader, 'fit')
-        except Exception as e:
-            print("Potential eval failed: fit")
-            print(traceback.format_exc())
-        try:
-            self.potential_eval(replay_loader, 'argmax')
-        except Exception as e:
-            print("Potential eval failed: argmax")
-            print(traceback.format_exc())
+        if self.cfg.extensive_eval:
+            self.potential_eval_extensive(replay_loader)
+        else:
+            try:
+                self.potential_eval(replay_loader, 'random')
+            except Exception as e:
+                print("Potential eval failed: random")
+                print(traceback.format_exc())
+            try:
+                self.potential_eval(replay_loader, 'fit')
+            except Exception as e:
+                print("Potential eval failed: fit")
+                print(traceback.format_exc())
+            try:
+                self.potential_eval(replay_loader, 'argmax')
+            except Exception as e:
+                print("Potential eval failed: argmax")
+                print(traceback.format_exc())
     
     def train(self):
         if self.cfg.eval_only:
-            self.eval_sum(self.replay_loader)
+            if self.cfg.resume_from.endswith('.pt'):
+                self.prepare_phi_dataset(is_init=False)
+                self.eval_sum(self.phi_dataset)
+            else:
+                ckpt_path = self.work_dir / "models"
+                models = [filen for filen in os.listdir(ckpt_path)]
+                models.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                for modeln in models:
+                    self.load_checkpoint(os.path.join(self.work_dir, "models", modeln))
+                    if hasattr(self, 'phi_dataset'):
+                        del self.phi_dataset
+                    self.prepare_phi_dataset(is_init=False)
+                    self.eval_sum(self.phi_dataset)
             return
-        self.global_progress_bar = trange(self.cfg.num_grad_steps, position=0, initial=self.global_step, leave=True, desc="Training Global")
         if self.cfg.resume_from is None:
             self.train_phi(is_init=True)
         elif not self.cfg.resume_from.endswith('phi_pretrained_tmp.pt'):
             self.train_phi(is_init=False)
+        self.global_progress_bar = trange(self.cfg.num_grad_steps, position=0, initial=self.global_step, leave=True, desc="Training Global")
         while True:
-            self.eval_sum(self.replay_loader)
+            self.eval_sum(self.phi_dataset)
             self.train_policy()
             self.train_phi()
             if self.global_step >= self.cfg.num_grad_steps:
@@ -398,7 +457,7 @@ class Workspace:
             print("Random goal evaluating")
         elif eval_type == "fit":
             meta, diag = _init_eval_meta(self, replay_loader, custom_reward, feature_type=eval_type)
-            phi_goal = torch.as_tensor(meta['z']).to(self.cfg.device)
+            phi_goal = torch.as_tensor(meta['z_raw']).to(self.cfg.device)
             goal = None
             current_goal_path = self.work_dir / self.cfg.task / 'fit_potential_test'
             print("Fit goal evaluating")
@@ -437,8 +496,6 @@ class Workspace:
                 ds_raw_reward.append(ds_rewards.reshape(-1).tolist())
                 if self.cfg.use_wandb:
                     wandb.log({
-                        f'{prefix}/goal_ep_idx': ep_idx,
-                        f'{prefix}/goal_step_idx': step_idx,
                         f'{prefix}/ds_partial_return': ds_partial_return,
                     }, step=self.global_frame)
             # rollout aiming at goal
@@ -448,8 +505,6 @@ class Workspace:
             current_phi = []
             t = 0
             while not time_step.last():
-                # recompute z as in normal goal_eval for hilp
-                meta = self.agent.get_goal_meta(goal_array=goal, obs_array=time_step.observation, phi_goal=phi_goal)
                 with torch.no_grad(), utils.eval_mode(self.agent):
                     action, phi = self.agent.act(time_step.observation, meta, self.global_step, eval_mode=True)
                     current_phi.append(phi)
@@ -476,7 +531,7 @@ class Workspace:
                 step += 1
             if video_enabled:
                 videos.append(self.video_recorder.frames)
-            self.video_recorder.save(f'{prefix}_{self.global_frame}.mp4')
+            self.video_recorder.save(f'{prefix}_{self.global_frame}_{episode}.mp4')
             try:
                 hilbert_traj = torch.cat(current_phi, axis=0)
                 last_z = hilbert_traj[-1]
@@ -564,6 +619,451 @@ class Workspace:
             video = record_video(f'{prefix}_TrajVideo_{self.global_frame}', videos, skip_frames=2)
             wandb.log({f'{prefix}/TrajVideo': video}, step=self.global_frame)
 
+
+    @torch.no_grad()
+    def potential_eval_extensive(self, replay_loader):
+        """Goal-reaching evaluation with cosine-perturbed z. Runs in batches to cap parallel envs."""
+        cosine_target = [0.99, 0.95, 0.9, 0.8, 0.5, 0.25, 0, -0.25, -0.5, -0.8, -0.9, -0.95, -1]
+        custom_reward = self._make_custom_reward()
+        sample_num = 10
+        variant_sample_num = 10  # 5 variants per base actor
+        resample_num = 1
+
+        # Collect base actors and phi goals
+        z_fit_actors: tp.List[torch.Tensor] = []
+        z_fit_phi_goals: tp.List[torch.Tensor] = []
+        z_argmax_actors: tp.List[torch.Tensor] = []
+        z_argmax_phi_goals: tp.List[torch.Tensor] = []
+        fit_variants: tp.Dict[str, tp.List[torch.Tensor]] = {str(target): [] for target in cosine_target}
+        argmax_variants: tp.Dict[str, tp.List[torch.Tensor]] = {str(target): [] for target in cosine_target}
+
+        fit_diags: tp.List[dict] = []
+        for _ in range(sample_num):
+            # fit sample
+            meta, fit_diagnostics = _init_eval_meta(self, replay_loader, custom_reward)
+            z_fit_actors.append(torch.as_tensor(meta['z'], device=self.cfg.device))
+            z_fit_phi_goals.append(torch.as_tensor(meta['z_raw'], device=self.cfg.device))
+            # record diagnostics per fit z
+            try:
+                if isinstance(fit_diagnostics, dict):
+                    fit_diags.append(fit_diagnostics)
+                else:
+                    fit_diags.append({"raw": fit_diagnostics})
+            except Exception:
+                fit_diags.append({})
+            # argmax sample
+            goal_np, _, _, _ = self.get_argmax_goal_potential(replay_loader, custom_reward, return_indices=True)
+            obs_zero = np.zeros_like(goal_np)
+            meta = self.agent.get_goal_meta(goal_array=goal_np, obs_array=obs_zero)
+            z_argmax_actors.append(torch.as_tensor(meta['z'], device=self.cfg.device))
+            phi_raw = meta['z_raw']
+            z_argmax_phi_goals.append(torch.as_tensor(phi_raw, device=self.cfg.device))
+
+        # Pairwise cosine similarity within groups; compute now, log later with rewards
+        fit_sim = None
+        argmax_sim = None
+        try:
+            if len(z_fit_actors) > 0 and len(z_argmax_actors) > 0:
+                def cosine_matrix(vectors: tp.List[torch.Tensor]) -> np.ndarray:
+                    Z = torch.stack(vectors, dim=0)  # (N, D)
+                    Z = Z.to(dtype=torch.float32)
+                    Z = Z / (Z.norm(dim=1, keepdim=True) + 1e-8)
+                    sim = (Z @ Z.t()).clamp(-1, 1)
+                    return sim.detach().cpu().numpy()
+
+                fit_sim = cosine_matrix(z_fit_actors)
+                argmax_sim = cosine_matrix(z_argmax_actors)
+        except Exception as e:
+            logger.warning(f"Cosine matrix computation failed: {e}")
+
+        # Create cosine variants (5 random variants per target, per base)
+        for fit_phi_goal in z_fit_phi_goals:
+            for target in cosine_target:
+                for _ in range(variant_sample_num):
+                    _, variant_z_actor = generate_cosine_variant(fit_phi_goal, target, device=self.cfg.device)
+                    fit_variants[str(target)].append(variant_z_actor)
+        for argmax_phi_goal in z_argmax_phi_goals:
+            for target in cosine_target:
+                for _ in range(variant_sample_num):
+                    _, variant_z_actor = generate_cosine_variant(argmax_phi_goal, target, device=self.cfg.device)
+                    argmax_variants[str(target)].append(variant_z_actor)
+
+        # Assemble z vectors and index groups
+        z_actors_summon: tp.List[torch.Tensor] = []
+        z_actors_summon.extend(z_fit_actors)
+        z_fit_indexes = np.arange(len(z_fit_actors))
+        indexes_collections: tp.Dict[str, np.ndarray] = {"fit_raw": z_fit_indexes}
+        for target in cosine_target:
+            current_num = len(z_actors_summon)
+            z_actors_summon.extend(fit_variants[str(target)])
+            tmp_indexes = np.arange(current_num, len(z_actors_summon))
+            indexes_collections[f"fit_{target}"] = tmp_indexes
+        current_num = len(z_actors_summon)
+        z_actors_summon.extend(z_argmax_actors)
+        z_argmax_indexes = np.arange(len(z_argmax_actors)) + current_num
+        indexes_collections["argmax_raw"] = z_argmax_indexes
+        for target in cosine_target:
+            current_num = len(z_actors_summon)
+            z_actors_summon.extend(argmax_variants[str(target)])
+            tmp_indexes = np.arange(current_num, len(z_actors_summon))
+            indexes_collections[f"argmax_{target}"] = tmp_indexes
+
+        z_actors_summon = torch.stack(z_actors_summon, dim=0).to(self.cfg.device)
+        total_envs = z_actors_summon.shape[0]
+        max_envs_per_batch = 400
+        all_rewards = np.zeros((resample_num, total_envs,), dtype=np.float32)
+        # Create a single vectorized env with max_envs_per_batch and reuse it across chunks
+        eval_env = make_gym_async_vectorized(
+            name=self.cfg.task,
+            num_envs=max_envs_per_batch,
+            obs_type=self.cfg.obs_type,
+            frame_stack=self.cfg.frame_stack,
+            action_repeat=self.cfg.action_repeat,
+            seed=self.cfg.seed,
+            image_wh=self.cfg.image_wh,
+        )
+        for i in range(resample_num):
+            # Evaluate in chunks to limit memory usage
+            for start in range(0, total_envs, max_envs_per_batch):
+                end = min(start + max_envs_per_batch, total_envs)
+                batch_z = z_actors_summon[start:end]
+                batch_size = batch_z.shape[0]
+                print(f"Initialize Environment, batch {start}:{end} (size={batch_size}), ep: {i} total: {total_envs}")
+                obs, info = eval_env.reset()
+                done = np.zeros((max_envs_per_batch,), dtype=bool)
+                batch_rewards = np.zeros((max_envs_per_batch,), dtype=np.float32)
+                # Rollout until all envs are terminated or truncated
+                if batch_z.shape[0] < max_envs_per_batch:
+                    z_placeholder = torch.zeros((max_envs_per_batch - batch_z.shape[0],) + batch_z.shape[1:], device=batch_z.device, dtype=batch_z.dtype)
+                    batch_z = torch.cat([batch_z, z_placeholder], dim=0)
+                while not np.all(done):
+                    with torch.no_grad(), utils.eval_mode(self.agent):
+                        actions = self.agent.act_inference(obs, batch_z)
+                    obs, rew, term, trunc, infos = eval_env.step(actions)
+                    batch_rewards += rew
+                    done = term | trunc
+                all_rewards[i, start:end] = batch_rewards[:end - start]
+        all_rewards = np.mean(all_rewards, axis=0)  # (total_envs,)
+        eval_env.close()
+        print("Logging to wandb")
+        # Log per-sample fit diagnostics as line charts
+        try:
+            if self.cfg.use_wandb and len(fit_diags) > 0:
+                # Aggregate simple series across samples
+                def _extract(key: str):
+                    vals = []
+                    for d in fit_diags:
+                        v = d.get(key, np.nan)
+                        try:
+                            vals.append(float(v))
+                        except Exception:
+                            vals.append(np.nan)
+                    return vals
+                train_mse_series = _extract("train_mse")
+                val_mse_series = _extract("val_mse")
+                scale_series = []
+                bias_series = []
+                # handle possible alternative keys
+                for d in fit_diags:
+                    a = d.get("scale", d.get("a", np.nan))
+                    b = d.get("bias", d.get("b", np.nan))
+                    try:
+                        scale_series.append(float(a))
+                    except Exception:
+                        scale_series.append(np.nan)
+                    try:
+                        bias_series.append(float(b))
+                    except Exception:
+                        bias_series.append(np.nan)
+
+                x = list(range(len(fit_diags)))
+                fig_diag = make_subplots(rows=2, cols=1, specs=[[{}], [{"secondary_y": True}]],
+                                         subplot_titles=("fit diagnostics: MSE across samples",
+                                                         "fit diagnostics: scale (left) & bias (right)"))
+                # Top: MSEs
+                if any([not np.isnan(v) for v in train_mse_series]):
+                    fig_diag.add_trace(go.Scatter(x=x, y=train_mse_series, mode="lines+markers", name="train_mse"), row=1, col=1)
+                if any([not np.isnan(v) for v in val_mse_series]):
+                    fig_diag.add_trace(go.Scatter(x=x, y=val_mse_series, mode="lines+markers", name="val_mse"), row=1, col=1)
+                fig_diag.update_yaxes(title_text="MSE", row=1, col=1)
+                fig_diag.update_xaxes(title_text="sample idx", row=1, col=1)
+                # Bottom: scale and bias
+                if any([not np.isnan(v) for v in scale_series]):
+                    fig_diag.add_trace(go.Scatter(x=x, y=scale_series, mode="lines+markers", name="scale(a)"), row=2, col=1, secondary_y=False)
+                    fig_diag.update_yaxes(title_text="scale (a)", row=2, col=1, secondary_y=False)
+                if any([not np.isnan(v) for v in bias_series]):
+                    fig_diag.add_trace(go.Scatter(x=x, y=bias_series, mode="lines+markers", name="bias(b)"), row=2, col=1, secondary_y=True)
+                    fig_diag.update_yaxes(title_text="bias (b)", row=2, col=1, secondary_y=True)
+                fig_diag.update_xaxes(title_text="sample idx", row=2, col=1)
+                fig_diag.update_layout(height=700, title_text="fit z diagnostics across samples")
+                wandb.log({"extensive_plots/fit_diagnostics_lines": fig_diag}, step=self.global_frame)
+        except Exception as e:
+            logger.warning(f"Logging fit diagnostics failed: {e}")
+        heatmap_colorscale = [[0.0, 'blue'], [0.5, 'white'], [1.0, 'red']]
+        # Combined figure: top row heatmaps, bottom row reward lines aligned with heatmaps order
+        try:
+            if self.cfg.use_wandb and fit_sim is not None and argmax_sim is not None:
+                fig2 = make_subplots(
+                    rows=2, cols=2,
+                    specs=[[{"type": "heatmap"}, {"type": "heatmap"}],
+                           [{"secondary_y": True}, {"secondary_y": True}]],
+                    subplot_titles=(
+                        f"z_fit_actors cosine (N={len(z_fit_actors)})",
+                        f"z_argmax_actors cosine (N={len(z_argmax_actors)})",
+                        "z_fit_actors rewards (left) & cosine to best (right)",
+                        "z_argmax_actors rewards (left) & cosine to best (right)",
+                    )
+                )
+                # Heatmaps (top row)
+                fig2.add_trace(
+                    go.Heatmap(z=fit_sim, zmin=-1, zmax=1, colorscale=heatmap_colorscale, colorbar=dict(title='cos')),
+                    row=1, col=1
+                )
+                fig2.add_trace(
+                    go.Heatmap(z=argmax_sim, zmin=-1, zmax=1, colorscale=heatmap_colorscale, showscale=False),
+                    row=1, col=2
+                )
+                # Reward lines (bottom row), aligned to the order in heatmaps
+                if "fit_raw" in indexes_collections:
+                    fit_idxs = indexes_collections["fit_raw"]
+                    fit_rewards = [float(x) for x in all_rewards[fit_idxs]]
+                    # Add rewards on primary y-axis
+                    fig2.add_trace(
+                        go.Scatter(x=list(range(len(fit_rewards))), y=fit_rewards, mode="lines+markers", name="fit_rewards"),
+                        row=2, col=1, secondary_y=False
+                    )
+                    # Cosine sim to best-reward z on secondary y-axis
+                    try:
+                        best_i = int(np.argmax(fit_rewards))
+                        fit_cos_to_best = fit_sim[best_i].tolist()
+                        fig2.add_trace(
+                            go.Scatter(x=list(range(len(fit_cos_to_best))), y=fit_cos_to_best, mode="lines+markers", name="fit_cos_to_best"),
+                            row=2, col=1, secondary_y=True
+                        )
+                        fig2.update_yaxes(title_text="episode reward", row=2, col=1, secondary_y=False)
+                        fig2.update_yaxes(title_text="cosine sim", range=[-1, 1], row=2, col=1, secondary_y=True)
+                    except Exception as e:
+                        logger.warning(f"Plotting fit cosine-to-best failed: {e}")
+                if "argmax_raw" in indexes_collections:
+                    arg_idxs = indexes_collections["argmax_raw"]
+                    arg_rewards = [float(x) for x in all_rewards[arg_idxs]]
+                    # Add rewards on primary y-axis
+                    fig2.add_trace(
+                        go.Scatter(x=list(range(len(arg_rewards))), y=arg_rewards, mode="lines+markers", name="argmax_rewards"),
+                        row=2, col=2, secondary_y=False
+                    )
+                    # Cosine sim to best-reward z on secondary y-axis
+                    try:
+                        best_j = int(np.argmax(arg_rewards))
+                        argmax_cos_to_best = argmax_sim[best_j].tolist()
+                        fig2.add_trace(
+                            go.Scatter(x=list(range(len(argmax_cos_to_best))), y=argmax_cos_to_best, mode="lines+markers", name="argmax_cos_to_best"),
+                            row=2, col=2, secondary_y=True
+                        )
+                        fig2.update_yaxes(title_text="episode reward", row=2, col=2, secondary_y=False)
+                        fig2.update_yaxes(title_text="cosine sim", range=[-1, 1], row=2, col=2, secondary_y=True)
+                    except Exception as e:
+                        logger.warning(f"Plotting argmax cosine-to-best failed: {e}")
+                fig2.update_layout(height=900, title_text="Cosine heatmaps and aligned rewards")
+                wandb.log({"extensive_plots/z_group_cosine_and_rewards": fig2}, step=self.global_frame)
+        except Exception as e:
+            logger.warning(f"Logging combined cosine and rewards figure failed: {e}")
+
+        # New: fit-argmx group (fit + argmax) heatmap and bottom dual-axis line (rewards & cosine to best)
+        try:
+            if self.cfg.use_wandb and len(z_fit_actors) > 0 and len(z_argmax_actors) > 0:
+                # Build fit-argmx group vectors and rewards using only RAW groups (exclude cosine variants)
+                big_vecs: tp.List[torch.Tensor] = []
+                big_vecs.extend(z_fit_actors)
+                big_vecs.extend(z_argmax_actors)
+
+                def cosine_matrix_from_list(vectors: tp.List[torch.Tensor]) -> np.ndarray:
+                    Z = torch.stack(vectors, dim=0).to(dtype=torch.float32)
+                    Z = Z / (Z.norm(dim=1, keepdim=True) + 1e-8)
+                    return (Z @ Z.t()).clamp(-1, 1).detach().cpu().numpy()
+
+                big_sim = cosine_matrix_from_list(big_vecs)
+                # Gather rewards in the same order as big_vecs
+                if "fit_raw" in indexes_collections and "argmax_raw" in indexes_collections:
+                    fit_idxs = indexes_collections["fit_raw"]
+                    arg_idxs = indexes_collections["argmax_raw"]
+                    big_rewards = np.concatenate([all_rewards[fit_idxs], all_rewards[arg_idxs]], axis=0)
+                else:
+                    # Fallback: infer by lengths
+                    big_rewards = all_rewards[:len(big_vecs)]
+
+                best_idx = int(np.argmax(big_rewards))
+                cos_to_best = big_sim[best_idx].tolist()
+
+                fig_big = make_subplots(
+                    rows=2, cols=1,
+                    specs=[[{"type": "heatmap"}], [{"secondary_y": True}]],
+                    subplot_titles=(
+                        f"fit-argmx group cosine (N={len(big_vecs)})",
+                        "fit-argmx group rewards (left) & cosine to best (right)",
+                    )
+                )
+                # Top heatmap with requested colorscale
+                fig_big.add_trace(
+                    go.Heatmap(z=big_sim, zmin=-1, zmax=1, colorscale=heatmap_colorscale, colorbar=dict(title='cos')),
+                    row=1, col=1
+                )
+                # Bottom dual-axis line
+                xs = list(range(len(big_rewards)))
+                fig_big.add_trace(
+                    go.Scatter(x=xs, y=[float(x) for x in big_rewards], mode="lines+markers", name="episode reward"),
+                    row=2, col=1, secondary_y=False
+                )
+                fig_big.add_trace(
+                    go.Scatter(x=xs, y=cos_to_best, mode="lines+markers", name="cosine to best"),
+                    row=2, col=1, secondary_y=True
+                )
+                fig_big.update_yaxes(title_text="episode reward", row=2, col=1, secondary_y=False)
+                fig_big.update_yaxes(title_text="cosine sim", range=[-1, 1], row=2, col=1, secondary_y=True)
+                fig_big.update_layout(height=900, title_text="fit-argmx group: cosine heatmap and aligned rewards")
+                wandb.log({"extensive_plots/fit-argmax_group_cosine_and_rewards": fig_big}, step=self.global_frame)
+        except Exception as e:
+            logger.warning(f"Logging fit-argmx group figure failed: {e}")
+        # Log per-group stats (max, min, std); mean is visualized in the plot below
+        # stats_log = {}
+        # for key, idxs in indexes_collections.items():
+        #     vals = all_rewards[idxs]
+        #     stats_log[f"extensive/{key}_max"] = float(np.max(vals))
+        #     stats_log[f"extensive/{key}_min"] = float(np.min(vals))
+        #     stats_log[f"extensive/{key}_std"] = float(np.std(vals))
+        # wandb.log(stats_log, step=self.global_frame)
+
+        # Build box plots: per-cosine group distribution of episode rewards
+        def build_box_data(prefix: str):
+            data = []  # list of (label, values)
+            xs_all = []
+            raw_key = f"{prefix}_raw"
+            if raw_key in indexes_collections:
+                vals = all_rewards[indexes_collections[raw_key]]
+                data.append(("1.0", vals.tolist()))
+                xs_all.append(1.0)
+            for ct in cosine_target:
+                key = f"{prefix}_{ct}"
+                if key in indexes_collections:
+                    vals = all_rewards[indexes_collections[key]]
+                    data.append((str(ct), vals.tolist()))
+                    xs_all.append(float(ct))
+            # Order categories by numeric cosine value
+            order = np.argsort(np.array(xs_all)) if len(xs_all) > 0 else []
+            if len(order) > 0:
+                data = [data[i] for i in order]
+            cats = [lbl for lbl, _ in data]
+            return data, cats
+
+        def log_box(name: str, data_and_cats):
+            data, cats = data_and_cats
+            if len(data) == 0:
+                return
+            fig = go.Figure()
+            means = []
+            for lbl, vals in data:
+                means.append(float(np.mean(vals)))
+                fig.add_trace(go.Box(
+                    x=[lbl] * len(vals),
+                    y=vals,
+                    name=lbl,
+                    boxmean=True,
+                    boxpoints=False
+                ))
+            # Connect means with a line over categorical x-axis
+            fig.add_trace(go.Scatter(
+                x=cats,
+                y=means,
+                mode="lines+markers",
+                name="mean",
+                line=dict(color="black", width=2)
+            ))
+            fig.update_layout(
+                title=f"{name}: cosine similarity vs episode reward (box + mean line)",
+                xaxis_title="cosine similarity",
+                yaxis_title="episode reward",
+                xaxis=dict(categoryorder='array', categoryarray=cats)
+            )
+            wandb.log({f"extensive_plots/{name}_cos_vs_reward": fig}, step=self.global_frame)
+
+        fit_data = build_box_data('fit')
+        argmax_data = build_box_data('argmax')
+        if len(fit_data[0]) > 0:
+            print("Logging box fit")
+            log_box("fit", fit_data)
+        if len(argmax_data[0]) > 0:
+            print("Logging box argmax")
+            log_box("argmax", argmax_data)
+
+        # Combined grouped box plot: fit vs argmax in one figure without interference
+        try:
+            if self.cfg.use_wandb:
+                # Build maps for fast lookup
+                fit_map = {lbl: vals for lbl, vals in fit_data[0]}
+                arg_map = {lbl: vals for lbl, vals in argmax_data[0]}
+                # Union categories and sort by numeric value
+                cat_set = set(list(fit_map.keys()) + list(arg_map.keys()))
+                if len(cat_set) > 0:
+                    cats_sorted = sorted(cat_set, key=lambda s: float(s))
+                    fig3 = go.Figure()
+                    # Add side-by-side boxes using offsetgroup
+                    for cat in cats_sorted:
+                        if cat in fit_map:
+                            fig3.add_trace(go.Box(
+                                x=[cat] * len(fit_map[cat]),
+                                y=fit_map[cat],
+                                name=f"fit {cat}",
+                                legendgroup="fit",
+                                offsetgroup="fit",
+                                marker_color="#1f77b4",
+                                boxmean=True,
+                                boxpoints=False,
+                                showlegend=False  # reduce legend clutter per-category
+                            ))
+                        if cat in arg_map:
+                            fig3.add_trace(go.Box(
+                                x=[cat] * len(arg_map[cat]),
+                                y=arg_map[cat],
+                                name=f"argmax {cat}",
+                                legendgroup="argmax",
+                                offsetgroup="argmax",
+                                marker_color="#ff7f0e",
+                                boxmean=True,
+                                boxpoints=False,
+                                showlegend=False
+                            ))
+                    # Mean trend lines for both groups
+                    fit_means_x, fit_means_y = [], []
+                    arg_means_x, arg_means_y = [], []
+                    for cat in cats_sorted:
+                        if cat in fit_map and len(fit_map[cat]) > 0:
+                            fit_means_x.append(cat)
+                            fit_means_y.append(float(np.mean(fit_map[cat])))
+                        if cat in arg_map and len(arg_map[cat]) > 0:
+                            arg_means_x.append(cat)
+                            arg_means_y.append(float(np.mean(arg_map[cat])))
+                    if len(fit_means_x) > 0:
+                        fig3.add_trace(go.Scatter(
+                            x=fit_means_x, y=fit_means_y, mode="lines+markers",
+                            name="fit mean", legendgroup="fit", line=dict(color="#1f77b4", width=2)
+                        ))
+                    if len(arg_means_x) > 0:
+                        fig3.add_trace(go.Scatter(
+                            x=arg_means_x, y=arg_means_y, mode="lines+markers",
+                            name="argmax mean", legendgroup="argmax", line=dict(color="#ff7f0e", width=2)
+                        ))
+                    fig3.update_layout(
+                        title="fit vs argmax: cosine similarity vs episode reward (grouped boxes + mean lines)",
+                        xaxis_title="cosine similarity",
+                        yaxis_title="episode reward",
+                        xaxis=dict(categoryorder='array', categoryarray=cats_sorted),
+                        boxmode='group'
+                    )
+                    wandb.log({"extensive_plots/fit_argmax_cos_vs_reward_grouped_box": fig3}, step=self.global_frame)
+        except Exception as e:
+            logger.warning(f"Logging grouped box figure failed: {e}")
+
+
     def save_checkpoint(self, fp: tp.Union[Path, str], exclude: tp.Sequence[str] = ()) -> None:
         logger.info(f"Saving checkpoint to {fp}")
         exclude = list(exclude)
@@ -628,8 +1128,10 @@ class Workspace:
                 val._max_episodes = len(val._storage["discount"])
                 self.replay_loader = val
             else:
-                assert hasattr(self, name)
-                setattr(self, name, val)
+                if hasattr(self, name):
+                    setattr(self, name, val)
+                else:
+                    print("Warning: %s not found in self" % name)
 
     def finalize(self) -> None:
         print("Running final test", flush=True)
@@ -681,9 +1183,10 @@ class Workspace:
     
     def init_phi_dataset(self):
         if not hasattr(self, 'phi_dataset'):       
+            obs_horizon = self.cfg.agent.obs_horizon if hasattr(self.cfg.agent, 'obs_horizon') else 1
             self.phi_dataset = PhiWalkerDataset(
                 data_dir=os.path.join(self.work_dir, "phi_dataset"),
-                obs_horizon=self.cfg.agent.obs_horizon,
+                obs_horizon=obs_horizon,
                 total_episodes=self.cfg.phi_total_episodes,
                 discount=self.cfg.discount,
                 goal_future=self.cfg.future,
@@ -726,6 +1229,7 @@ class Workspace:
             "batch_size": self.cfg.batch_size,
             "shuffle": True,
             "num_workers": self.cfg.num_workers,
+            "drop_last": True,
         }
         self.phi_dataloader = InfiniteDataLoaderWrapper(self.phi_dataset, dataloader_cfg)
         end_time = time.time()
@@ -754,13 +1258,16 @@ class Workspace:
             'physics': np.empty((self.cfg.num_train_envs, self.cfg.num_episode_steps, *physics.shape[1:]), dtype=physics.dtype),
         }
         t = 0
-        z = self.agent.sample_z(obs=phi_obs, future_obs=phi_future_obs, size=self.cfg.num_train_envs, random_sample=random_sample)
-        if z.shape[0] < self.cfg.num_train_envs:
-            delta_num = self.cfg.num_train_envs - z.shape[0]
-            d = z.shape[1]
-            z_r = torch.randn((delta_num, d), dtype=torch.float32, device=z.device)
-            z_r = math.sqrt(d) * F.normalize(z_r, dim=1)
-            z = torch.cat([z, z_r], axis=0)
+        if self.cfg.agent.name == 'sf':
+            z = self.agent.sample_z(size=self.cfg.num_train_envs)
+        else:
+            z = self.agent.sample_z(obs=phi_obs, future_obs=phi_future_obs, size=self.cfg.num_train_envs, random_sample=random_sample)
+            if z.shape[0] < self.cfg.num_train_envs:
+                delta_num = self.cfg.num_train_envs - z.shape[0]
+                d = z.shape[1]
+                z_r = torch.randn((delta_num, d), dtype=torch.float32, device=z.device)
+                z_r = math.sqrt(d) * F.normalize(z_r, dim=1)
+                z = torch.cat([z, z_r], axis=0)
 
         while t < self.cfg.num_episode_steps:
             # Random actions by default; integrate policy here if desired
@@ -795,6 +1302,7 @@ class Workspace:
             "batch_size": self.cfg.num_train_envs,
             "shuffle": True,
             "num_workers": self.cfg.num_workers,
+            "drop_last": True,
         }
         if hasattr(self, "phi_dataset"):
             policy_phi_dataloader = InfiniteDataLoaderWrapper(self.phi_dataset, loader_cfg)

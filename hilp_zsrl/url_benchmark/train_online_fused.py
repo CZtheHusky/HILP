@@ -100,7 +100,10 @@ ConfigStore.instance().store(name="workspace_config", node=OnlineSyncConfig)
 class OnlineSyncWorkspace(Workspace):
     def __init__(self, cfg: OnlineSyncConfig) -> None:
         if cfg.resume_from is not None:
-            self.work_dir = Path(cfg.resume_from)
+            if cfg.resume_from.endswith('.pt'):
+                self.work_dir = Path(cfg.resume_from).parent.parent
+            else:
+                self.work_dir = Path(cfg.resume_from)
         else:
             self.work_dir = Path.cwd()
         print(f'Workspace: {self.work_dir}')
@@ -150,8 +153,10 @@ class OnlineSyncWorkspace(Workspace):
                 cfg.run_group, cfg.agent.name, self.domain,
             ])
             wandb_output_dir = tempfile.mkdtemp()
+            config_dict = omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+            config_dict['work_dir'] = self.work_dir
             wandb.init(project='hilp_zsrl', group=cfg.run_group, name=exp_name,
-                       config=omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
+                       config=config_dict,
                        dir=wandb_output_dir)
 
         cam_id = 0 if 'quadruped' not in self.domain else 2
@@ -160,17 +165,26 @@ class OnlineSyncWorkspace(Workspace):
         self.timer = utils.Timer()
         self.global_step = 0
         self.eval_rewards_history: tp.List[float] = []
-        self._checkpoint_filepath = self.work_dir / "models" / "latest.pt"
-        if self._checkpoint_filepath.exists():
-            self.load_checkpoint(self._checkpoint_filepath)
-        elif cfg.load_model is not None:
-            self.load_checkpoint(cfg.load_model, exclude=["replay_loader"])
+        if cfg.resume_from is not None:
+            if cfg.resume_from.endswith('.pt'):
+                self._checkpoint_filepath = cfg.resume_from
+            else:
+                ckpt_path = self.work_dir / "models"
+                models = [filen for filen in os.listdir(ckpt_path) if filen.endswith('.pt')]
+                if len(models) == 1 and "latest" in models[0]:
+                    self._checkpoint_filepath = os.path.join(self.work_dir, "models", "latest.pt")
+                else:
+                    models.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                    self._checkpoint_filepath = os.path.join(self.work_dir, "models", models[-1])
+            if os.path.exists(self._checkpoint_filepath):
+                self.load_checkpoint(self._checkpoint_filepath)
 
     def init_phi_dataset(self):
-        if not hasattr(self, 'phi_dataset'):       
+        if not hasattr(self, 'phi_dataset'):      
+            obs_horizon = self.cfg.agent.obs_horizon if hasattr(self.cfg.agent, 'obs_horizon') else 1 
             self.phi_dataset = PhiWalkerDataset(
                 data_dir=os.path.join(self.work_dir, "phi_dataset"),
-                obs_horizon=self.cfg.agent.obs_horizon,
+                obs_horizon=obs_horizon,
                 total_episodes=self.cfg.phi_total_episodes,
                 discount=self.cfg.discount,
                 goal_future=self.cfg.future,
@@ -180,14 +194,28 @@ class OnlineSyncWorkspace(Workspace):
     
     def train(self):
         if self.cfg.eval_only:
-            self.eval_sum(self.phi_dataset)
+            if self.cfg.resume_from.endswith('.pt'):
+                self.prepare_phi_dataset(is_init=False)
+                assert self.phi_dataset.random_sample, "Random sampling is required for phi dataset"
+                self.eval_sum(self.phi_dataset)
+            else:
+                ckpt_path = self.work_dir / "models"
+                models = [filen for filen in os.listdir(ckpt_path)]
+                models.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                for modeln in models:
+                    self.load_checkpoint(os.path.join(self.work_dir, "models", modeln))
+                    if hasattr(self, 'phi_dataset'):
+                        del self.phi_dataset
+                    self.prepare_phi_dataset(is_init=False)
+                    assert self.phi_dataset.random_sample, "Random sampling is required for phi dataset"
+                    self.eval_sum(self.phi_dataset)
             return
         self.global_progress_bar = trange(self.cfg.num_grad_steps, position=0, initial=self.global_step, leave=True, desc="Training Global")
         if not hasattr(self, 'phi_dataloader'):
             self.prepare_phi_dataset(is_init=True)
             assert self.phi_dataset.random_sample, "Random sampling is required for phi dataset"
         while True:
-            # self.eval_sum(self.phi_dataset)
+            self.eval_sum(self.phi_dataset)
             self.train_policy()
             if self.global_step >= self.cfg.num_grad_steps:
                 print("Training completed.")
